@@ -112,28 +112,57 @@ devflow config set K V        defaults: DEVFLOW_AGENT, DEVFLOW_CPU/MEMORY/DISK, 
 ```
 
 `devflow up --agent codex` runs Codex instead of Claude; `--agent both` gives
-you a tmux window for each. `up` on an existing sandbox just reattaches —
-it's idempotent.
+you a tmux window for each (and OMC can even drive Codex workers: `omc team
+2:codex "review the auth flow"`). `up` on an existing sandbox just reattaches
+— it's idempotent.
 
-## What's inside the sandbox (the harness)
+## The multi-agent harness
 
-Every sandbox gets an opinionated, tweakable setup:
+Every sandbox ships a real multi-agent setup, not just a bare CLI. devflow
+installs the community-standard harnesses (both by Yeachan-Heo, both actively
+maintained and the by-consensus picks for their CLIs):
+
+- **[oh-my-claudecode](https://github.com/Yeachan-Heo/oh-my-claudecode)**
+  (~37k★) with Claude Code — 29 specialized agents (**architect, designer,
+  security-reviewer**, test-engineer, debugger, planner, executor, critic…),
+  38 skills, and a HUD statusline. Say `autopilot: build X` for an autonomous
+  end-to-end build, `/team 3:executor "fix all type errors"` for parallel
+  workers, `ralph`/`ultrawork` keywords for don't-stop / max-parallelism
+  modes. Installed via npm + `omc setup --no-plugin` (the documented
+  script-safe path).
+- **[oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex)** (~31k★) with
+  Codex — 34-agent catalog (architect, designer, security-reviewer,
+  performance-reviewer…), `$ultragoal` / `$team` workflows, git-worktree
+  workers, and an `omx` launcher with HUD. Installed via npm + `omx setup
+  --scope user --merge-agents`.
+- **devflow's own trio, always present**: `dv-engineer`, `dv-designer`,
+  `dv-security` — native Claude Code subagents in `~/.claude/agents/`, so
+  you have an engineer/designer/security-expert team even with
+  `--harness core` (zero third-party deps). Claude auto-delegates to them by
+  description, or call them explicitly: `@agent-dv-security review this diff`.
+
+Control it with `--harness auto|omc|omx|both|core` (default `auto`: omc for
+claude, omx for codex, both for `--agent both`) or `devflow config set
+DEVFLOW_HARNESS core`. Harness installs are best-effort: if npm or a package
+ever misbehaves, provisioning warns and continues — the core trio and the
+plain agents always work. (Looking for enterprise-scale swarms instead?
+[Ruflo](https://github.com/ruvnet/ruflo), ex-claude-flow, is the usual
+answer; devflow deliberately ships the lighter teams-first harnesses.)
+
+Plus the base setup every sandbox gets:
 
 - **tmux session `dv`** — `agent` window (auto-launches the agent, resumes
   prior conversations) + `shell` window. Mouse on, 100k scrollback. SSH
   logins auto-attach; detaching leaves everything running.
-- **Claude Code**: runs `--dangerously-skip-permissions` (the *sandbox* is
-  the safety boundary), a statusline (`☁ sandbox · model · dir · branch ·
-  ctx%`), and a `~/.claude/CLAUDE.md` that teaches the agent sandbox
+- **Claude Code**: `--dangerously-skip-permissions` (the *sandbox* is the
+  safety boundary), a statusline, and `~/.claude/CLAUDE.md` sandbox
   etiquette: commit early, push feature branches, `gh pr create`, re-orient
-  with `git status` after a resume.
+  after a resume, delegate to the subagent team.
 - **Codex**: `approval_policy = "never"`, `sandbox_mode =
-  "danger-full-access"` (again — Daytona is the sandbox), workdir pre-trusted,
-  matching `~/.codex/AGENTS.md`.
-- **Tools**: `gh`, `tmux`, `jq`, `ripgrep`, plus whatever the base image has
-  (the Daytona default image includes python, node, and more). `claude` and
-  `codex` install as native binaries — no Node required.
-- Aliases: `dv-work` (cd to the repo), `yolo` (claude, no prompts).
+  "danger-full-access"`, workdir pre-trusted, matching `~/.codex/AGENTS.md`.
+- **Tools**: `gh`, `tmux`, `jq`, `ripgrep`; `claude`/`codex` as native
+  binaries (no Node needed — node is bootstrapped via nvm only when a
+  harness needs it). Aliases: `dv-work`, `yolo`.
 
 Everything is written only if absent, so your own dotfiles win if you bake a
 custom snapshot.

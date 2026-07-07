@@ -89,7 +89,7 @@ fresh_env
 
 run_devflow version
 assert_rc "version exits 0" "$RC" 0
-assert_contains "version prints version" "$OUT" "devflow 0.1."
+assert_contains "version prints version" "$OUT" "devflow 0."
 
 run_devflow help
 assert_rc "help exits 0" "$RC" 0
@@ -131,8 +131,11 @@ assert_file_contains "probe cached in config" "$T_CONFIG/config" "DEVFLOW_EXEC_S
 assert_file_contains "phase tools ran" "$T_LOG" "DV_PHASE='tools'"
 assert_file_contains "phase auth ran" "$T_LOG" "DV_PHASE='auth'"
 assert_file_contains "phase workspace ran" "$T_LOG" "DV_PHASE='workspace'"
+assert_file_contains "phase harness ran" "$T_LOG" "DV_PHASE='harness'"
 assert_file_contains "phase carries repo" "$T_LOG" "DV_REPO='tester/alpha'"
 assert_file_contains "phase carries name" "$T_LOG" "DV_NAME='dv-alpha'"
+assert_file_contains "claude agent gets omc harness" "$T_LOG" "DV_HARNESS='omc'"
+assert_file_contains "harness label set" "$T_LOG" "--label devflow.harness=omc"
 
 SECRETS="$(extract_pushed_file /tmp/.dv-secrets.env)"
 assert_contains "secrets: claude creds mode" "$SECRETS" "DV_CLAUDE_MODE=creds"
@@ -152,6 +155,13 @@ assert_contains "provisioner has claude install" "$PROVISION" "claude.ai/install
 assert_contains "provisioner has codex musl" "$PROVISION" "unknown-linux-musl"
 assert_contains "provisioner writes codex config" "$PROVISION" 'approval_policy = "never"'
 assert_contains "provisioner sets token env var" "$PROVISION" "CLAUDE_CODE_OAUTH_TOKEN"
+assert_contains "provisioner installs omc" "$PROVISION" "oh-my-claude-sisyphus@latest"
+assert_contains "provisioner runs omc setup headless" "$PROVISION" "omc setup --no-plugin --force --quiet"
+assert_contains "provisioner installs omx" "$PROVISION" "oh-my-codex@latest"
+assert_contains "provisioner runs omx setup" "$PROVISION" "omx setup --scope user --merge-agents --force"
+assert_contains "provisioner ships dv-engineer" "$PROVISION" "name: dv-engineer"
+assert_contains "provisioner ships dv-designer" "$PROVISION" "name: dv-designer"
+assert_contains "provisioner ships dv-security" "$PROVISION" "name: dv-security"
 
 # ===========================================================================
 echo "# 3..lifecycle (ls / existing / peek / stop / attach / rm)"
@@ -263,6 +273,19 @@ run_devflow up tester/alpha --agent codex --no-attach
 assert_rc "codex agent up exits 0" "$RC" 0
 assert_file_contains "codex agent label" "$T_LOG" "--label devflow.agent=codex"
 assert_file_contains "codex agent phase" "$T_LOG" "DV_AGENT='codex'"
+assert_file_contains "codex agent gets omx harness" "$T_LOG" "DV_HARNESS='omx'"
+
+run_devflow up tester/beta --harness core --no-attach
+assert_rc "harness core up exits 0" "$RC" 0
+assert_file_contains "core harness phase" "$T_LOG" "DV_HARNESS='core'"
+
+run_devflow up tester/beta --harness bogus --no-attach
+assert_rc "invalid harness rejected" "$RC" 1
+assert_contains "invalid harness message" "$OUT" "invalid --harness"
+
+run_devflow up tester/alpha --agent both --no-attach --fresh
+assert_rc "both agents up exits 0" "$RC" 0
+assert_file_contains "both agents get both harnesses" "$T_LOG" "DV_HARNESS='both'"
 
 # ===========================================================================
 echo "# 8..payload self-checks"

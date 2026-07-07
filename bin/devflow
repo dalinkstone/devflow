@@ -12,7 +12,7 @@
 set -u
 set -o pipefail
 
-DEVFLOW_VERSION="0.1.1"
+DEVFLOW_VERSION="0.2.0"
 
 # ----------------------------------------------------------------------------
 # Config (precedence: environment > config file > built-in default)
@@ -24,7 +24,7 @@ SECRETS_FILE="$CONFIG_DIR/secrets"
 GH_PIN_VERSION="2.96.0"          # fallback for in-sandbox gh install
 CODEX_PIN_TAG="rust-v0.142.5"    # fallback for in-sandbox codex install
 
-_CONFIG_KEYS="DEVFLOW_AGENT DEVFLOW_CPU DEVFLOW_MEMORY DEVFLOW_DISK DEVFLOW_AUTO_STOP DEVFLOW_TARGET DEVFLOW_SNAPSHOT DEVFLOW_CLAUDE_AUTH DEVFLOW_EXEC_STYLE DEVFLOW_WORKROOT"
+_CONFIG_KEYS="DEVFLOW_AGENT DEVFLOW_CPU DEVFLOW_MEMORY DEVFLOW_DISK DEVFLOW_AUTO_STOP DEVFLOW_TARGET DEVFLOW_SNAPSHOT DEVFLOW_CLAUDE_AUTH DEVFLOW_EXEC_STYLE DEVFLOW_WORKROOT DEVFLOW_HARNESS"
 
 load_config() {
   # 1) preserve values that came from the caller's environment
@@ -53,8 +53,24 @@ load_config() {
   : "${DEVFLOW_CLAUDE_AUTH:=auto}"      # auto | token | creds
   : "${DEVFLOW_EXEC_STYLE:=}"           # join | argv | "" = auto-probe
   : "${DEVFLOW_WORKROOT:=work}"         # dir under $HOME in the sandbox
+  : "${DEVFLOW_HARNESS:=auto}"          # auto | omc | omx | both | core
   : "${DEVFLOW_CLAUDE_TOKEN:=}"
   return 0
+}
+
+resolve_harness() { # AGENT REQUESTED -> effective harness
+  local agent="$1" req="$2"
+  case "$req" in
+    auto)
+      case "$agent" in
+        claude) printf 'omc' ;;
+        codex)  printf 'omx' ;;
+        both)   printf 'both' ;;
+        *)      printf 'core' ;;
+      esac ;;
+    none) printf 'core' ;;
+    *)    printf '%s' "$req" ;;
+  esac
 }
 
 config_set() { # config_set FILE KEY VALUE
@@ -328,12 +344,14 @@ export PATH="$HOME/.local/bin:$DV_BIN:$PATH"
 : "${DV_NAME:=sandbox}"
 : "${DV_TASK_B64:=}"
 : "${DV_WORKROOT:=work}"
+: "${DV_HARNESS:=core}"   # core | omc | omx | both
 
 log()  { printf '[devflow] %s\n' "$*"; }
 fail() { printf '[devflow] ERROR: %s\n' "$*" >&2; exit 1; }
 
 mkdir -p "$DV_DIR" "$DV_BIN" "$DV_STAGE" "$HOME/.local/bin"
 chmod 700 "$DV_DIR" "$DV_STAGE"
+cd "$HOME" || true   # tools that drop state in cwd (omx setup) must land in $HOME
 
 SUDO=""
 if [ "$(id -u)" != "0" ] && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
@@ -387,9 +405,45 @@ load_secrets() {
   fi
 }
 
+ensure_npm() { # make npm usable (nvm-installed or fresh nvm install); rc 1 if impossible
+  ensure_node_path
+  if ! command -v npm >/dev/null 2>&1; then
+    log "installing node 22 via nvm (needed for the multi-agent harness)…"
+    export NVM_DIR="$HOME/.nvm"
+    if [ ! -s "$NVM_DIR/nvm.sh" ]; then
+      curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash > "$DV_DIR/nvm-install.log" 2>&1 || true
+    fi
+    # shellcheck disable=SC1091
+    [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" >/dev/null 2>&1
+    command -v nvm >/dev/null 2>&1 && nvm install 22 >> "$DV_DIR/nvm-install.log" 2>&1
+    ensure_node_path
+  fi
+  command -v npm >/dev/null 2>&1 || return 1
+  # non-root global installs need a user-writable prefix (skip under nvm,
+  # which manages its own prefix and rejects overrides)
+  local proot
+  proot="$(npm root -g 2>/dev/null || true)"
+  if [ -n "$proot" ] && [ ! -w "$(dirname "$proot")" ] && [ "$(id -u)" != "0" ]; then
+    npm config set prefix "$HOME/.local" >/dev/null 2>&1 || true
+  fi
+  # nvm's bin dir is invisible to non-interactive login shells (ubuntu's
+  # .bashrc returns early), so expose the runtime on a stable PATH
+  link_global_bin node
+  link_global_bin npm
+  link_global_bin npx
+  return 0
+}
+
+link_global_bin() { # expose an npm-global binary at ~/.local/bin
+  local src
+  src="$(npm prefix -g 2>/dev/null)/bin/$1"
+  [ -x "$src" ] && [ "$src" != "$HOME/.local/bin/$1" ] && ln -sf "$src" "$HOME/.local/bin/$1"
+  return 0
+}
+
 # ============================ phase: tools ===================================
 phase_tools() {
-  log "phase 1/3 tools: checking base packages…"
+  log "phase 1/4 tools: checking base packages…"
   local missing=""
   for t in tmux git curl; do command -v "$t" >/dev/null 2>&1 || missing="$missing $t"; done
   if [ -n "$missing" ]; then
@@ -465,7 +519,7 @@ phase_tools() {
 
 # ============================ phase: auth ====================================
 phase_auth() {
-  log "phase 2/3 auth: applying subscription credentials…"
+  log "phase 2/4 auth: applying subscription credentials…"
   load_secrets
   umask 077
   mkdir -p "$HOME/.claude" "$HOME/.codex"
@@ -511,7 +565,7 @@ phase_auth() {
 
 # ============================ phase: workspace ================================
 phase_workspace() {
-  log "phase 3/3 workspace: repo + harness + session…"
+  log "phase 3/4 workspace: repo + dotfiles + session…"
 
   # ---- repo ----
   local WORKDIR
@@ -607,6 +661,20 @@ devflow. Facts about this environment:
   `git status` and skim recent commits to re-establish context first.
 - Permission prompts are bypassed. Be deliberate with destructive commands;
   prefer reversible operations.
+
+## Multi-agent
+
+Specialized subagents are installed — delegate instead of doing everything
+in one context:
+
+- `dv-engineer` (implementation), `dv-designer` (UX/API design),
+  `dv-security` (security review) are always available. Use dv-security
+  proactively after changes that touch auth, input handling, or secrets.
+- If oh-my-claudecode is installed (check: `/help` lists `/autopilot`),
+  prefer its workflows for big tasks: `/autopilot "…"` for autonomous
+  builds, `/team N:executor "…"` for parallel work, `/ultrawork` for
+  max-effort passes; its roster includes architect, designer,
+  security-reviewer, test-engineer, and more.
 DV_CLAUDEMD
   fi
 
@@ -636,6 +704,10 @@ configured; commit early and often since only pushed work survives sandbox
 deletion. You run with full autonomy (no approval prompts) — be deliberate
 with destructive commands. You may be detached from and resumed at any time;
 on resume, check `git status` first.
+
+If oh-my-codex is installed (the `omx` command exists), its workflows and
+agent teams are available — prefer `$ultragoal`-style structured workflows
+for large tasks, and consult its skills before hand-rolling orchestration.
 DV_AGENTSMD
   fi
 
@@ -727,8 +799,11 @@ has_claude_history() {
 
 case "$AGENT" in
   codex)
+    # prefer the oh-my-codex launcher when the harness installed it
     if [ -n "$TASK" ]; then exec codex "$TASK"; fi
-    codex resume --last 2>/dev/null || exec codex
+    if codex resume --last 2>/dev/null; then exit 0; fi
+    if command -v omx >/dev/null 2>&1; then exec omx; fi
+    exec codex
     ;;
   claude|*)
     if [ -n "$TASK" ]; then
@@ -801,13 +876,143 @@ DV_STATUSLINE
   log "workspace ready: agent=$DV_AGENT repo=${DV_REPO:-none} workdir=$WORKDIR"
 }
 
+# ============================ phase: harness ==================================
+install_dv_subagents() {
+  # devflow-native mini-team for Claude Code (always installed; dv- prefix
+  # avoids collisions with oh-my-claudecode's own roster)
+  mkdir -p "$HOME/.claude/agents"
+
+  if [ ! -f "$HOME/.claude/agents/dv-engineer.md" ]; then
+    cat > "$HOME/.claude/agents/dv-engineer.md" <<'DV_AG_ENG'
+---
+name: dv-engineer
+description: Senior implementation engineer. Use for writing, refactoring, and debugging code once an approach is decided — turns a plan or bug report into working, tested changes.
+---
+
+You are a senior software engineer working inside a disposable cloud sandbox.
+You own implementation quality: correct, minimal, idiomatic changes that match
+the surrounding codebase.
+
+- Read the relevant code before changing it; follow the repo's existing
+  patterns, naming, and tooling.
+- Prefer the smallest change that fully solves the problem. No drive-by
+  refactors unless asked.
+- Run the project's tests/linters after changes; fix what you break. If there
+  are no tests, add focused ones for the behavior you changed.
+- Commit logically-scoped changes with clear messages as you go.
+- Report back: what changed, why, how it was verified, and any follow-ups.
+DV_AG_ENG
+  fi
+
+  if [ ! -f "$HOME/.claude/agents/dv-designer.md" ]; then
+    cat > "$HOME/.claude/agents/dv-designer.md" <<'DV_AG_DES'
+---
+name: dv-designer
+description: Product/UX and API designer. Use before building user-facing surfaces or public interfaces — turns requirements into concrete flows, layouts, naming, and API shapes.
+---
+
+You are a pragmatic product designer who thinks in user flows and interface
+contracts (UI and API alike).
+
+- Start from the user's job-to-be-done; enumerate the primary flow and the two
+  most likely edge flows before proposing surfaces.
+- For UI: propose hierarchy, states (empty/loading/error), and copy. Favor
+  conventions of the project's existing stack over novelty.
+- For APIs/CLIs: design the smallest coherent surface; name things the way the
+  codebase already names things; show example calls before writing code.
+- Deliver artifacts the engineer can build from directly: annotated flows,
+  component/endpoint lists, example payloads — not vague principles.
+DV_AG_DES
+  fi
+
+  if [ ! -f "$HOME/.claude/agents/dv-security.md" ]; then
+    cat > "$HOME/.claude/agents/dv-security.md" <<'DV_AG_SEC'
+---
+name: dv-security
+description: Security reviewer. Use proactively after changes touching auth, input handling, secrets, network, file access, or dependencies — finds and explains real vulnerabilities with fixes.
+---
+
+You are an application security reviewer. Hunt for vulnerabilities that are
+actually exploitable in this codebase — not theoretical checklist items.
+
+- Priorities: injection (SQL/shell/template), authn/authz gaps, secret
+  handling and logging, unsafe deserialization, path traversal, SSRF, unsafe
+  defaults, and dependency risk.
+- For each finding: the exact location, a concrete attack scenario, severity,
+  and the minimal fix. Verify the fix compiles/tests when you apply one.
+- Distinguish "exploitable now" from "hardening"; lead with the former.
+- End with a short verdict: safe to ship, or blockers listed in order.
+DV_AG_SEC
+  fi
+}
+
+phase_harness() {
+  log "phase 4/4 harness: multi-agent setup ($DV_HARNESS)…"
+
+  case "$DV_HARNESS" in
+    omc|omx|both)
+      if ! ensure_npm; then
+        log "warn: npm unavailable — skipped $DV_HARNESS install (core harness still active)"
+        DV_HARNESS=core
+      fi
+      ;;
+  esac
+
+  if [ "$DV_HARNESS" = "omc" ] || [ "$DV_HARNESS" = "both" ]; then
+    if ! command -v omc >/dev/null 2>&1; then
+      log "installing oh-my-claudecode (this can take a minute)…"
+      npm install -g oh-my-claude-sisyphus@latest > "$DV_DIR/omc-install.log" 2>&1 \
+        || log "warn: omc npm install failed (see ~/.devflow/omc-install.log)"
+      ensure_node_path
+      link_global_bin omc
+      link_global_bin oh-my-claudecode
+      link_global_bin omc-cli
+    fi
+    if command -v omc >/dev/null 2>&1; then
+      if omc setup --no-plugin --force --quiet </dev/null >> "$DV_DIR/omc-install.log" 2>&1; then
+        log "omc ready: /autopilot, /ultrawork, /team (architect, designer, security-reviewer, +26 more)"
+      else
+        log "warn: omc setup failed:"
+        tail -n 6 "$DV_DIR/omc-install.log" 2>/dev/null | sed 's/^/[devflow]   /'
+      fi
+    fi
+  fi
+
+  if [ "$DV_HARNESS" = "omx" ] || [ "$DV_HARNESS" = "both" ]; then
+    if ! command -v omx >/dev/null 2>&1; then
+      log "installing oh-my-codex…"
+      npm install -g oh-my-codex@latest > "$DV_DIR/omx-install.log" 2>&1 \
+        || log "warn: omx npm install failed (see ~/.devflow/omx-install.log)"
+      ensure_node_path
+      link_global_bin omx
+    fi
+    if command -v omx >/dev/null 2>&1; then
+      if omx setup --scope user --merge-agents --force </dev/null >> "$DV_DIR/omx-install.log" 2>&1; then
+        log "omx ready: launch codex sessions with 'omx' (\$ultragoal keywords, agent teams)"
+      else
+        log "warn: omx setup failed:"
+        tail -n 6 "$DV_DIR/omx-install.log" 2>/dev/null | sed 's/^/[devflow]   /'
+      fi
+    fi
+  fi
+
+  # after omc setup: its installer syncs ~/.claude/agents and drops unknown
+  # files, so the devflow-native trio must be (re)installed last
+  install_dv_subagents
+  log "core team ready: dv-engineer / dv-designer / dv-security"
+
+  printf '%s' "$DV_HARNESS" > "$DV_DIR/harness"
+  log "harness done."
+}
+
 load_secrets   # defaults + secrets file if present (tools needs pins/token too)
 
 case "$DV_PHASE" in
   tools)     phase_tools ;;
   auth)      phase_auth ;;
   workspace) phase_workspace ;;
-  all)       phase_tools; phase_auth; phase_workspace ;;
+  harness)   phase_harness ;;
+  all)       phase_tools; phase_auth; phase_workspace; phase_harness ;;
   *)         fail "unknown phase: $DV_PHASE" ;;
 esac
 DVPROV_EOF
@@ -825,26 +1030,29 @@ upload_provisioner() { # NAME [WITH_SECRETS]
   dt_run "$name" 'mkdir -p "$HOME/.devflow/stage" && chmod 700 "$HOME/.devflow" "$HOME/.devflow/stage" && mv -f /tmp/.dv-provision.sh "$HOME/.devflow/stage/provision.sh" && { [ ! -f /tmp/.dv-secrets.env ] || mv -f /tmp/.dv-secrets.env "$HOME/.devflow/stage/secrets.env"; }' 120 >/dev/null
 }
 
-run_phase() { # NAME PHASE AGENT REPO BRANCH TASK_B64
-  local name="$1" phase="$2" agent="$3" repo="$4" branch="$5" task_b64="$6"
-  dt_run "$name" "DV_PHASE='$phase' DV_AGENT='$agent' DV_REPO='$repo' DV_BRANCH='$branch' DV_NAME='$name' DV_TASK_B64='$task_b64' DV_WORKROOT='$DEVFLOW_WORKROOT' bash \"\$HOME/.devflow/stage/provision.sh\"" 0
+run_phase() { # NAME PHASE AGENT REPO BRANCH TASK_B64 [HARNESS]
+  local name="$1" phase="$2" agent="$3" repo="$4" branch="$5" task_b64="$6" harness="${7:-core}"
+  dt_run "$name" "DV_PHASE='$phase' DV_AGENT='$agent' DV_REPO='$repo' DV_BRANCH='$branch' DV_NAME='$name' DV_TASK_B64='$task_b64' DV_WORKROOT='$DEVFLOW_WORKROOT' DV_HARNESS='$harness' bash \"\$HOME/.devflow/stage/provision.sh\"" 0
 }
 
-provision_sandbox() { # NAME AGENT REPO BRANCH TASK
-  local name="$1" agent="$2" repo="$3" branch="$4" task="$5" task_b64=""
+provision_sandbox() { # NAME AGENT REPO BRANCH TASK HARNESS
+  local name="$1" agent="$2" repo="$3" branch="$4" task="$5" harness="$6" task_b64=""
   [ -n "$task" ] && task_b64="$(printf '%s' "$task" | b64_encode)"
 
   step "uploading provisioner + syncing subscription auth…"
   upload_provisioner "$name" 1
 
   step "installing tools (tmux, gh, claude, codex — output appears when done)…"
-  run_phase "$name" tools "$agent" "$repo" "$branch" "$task_b64"
+  run_phase "$name" tools "$agent" "$repo" "$branch" "$task_b64" "$harness"
 
   step "applying auth…"
-  run_phase "$name" auth "$agent" "$repo" "$branch" "$task_b64"
+  run_phase "$name" auth "$agent" "$repo" "$branch" "$task_b64" "$harness"
 
   step "setting up workspace + starting agent session…"
-  run_phase "$name" workspace "$agent" "$repo" "$branch" "$task_b64"
+  run_phase "$name" workspace "$agent" "$repo" "$branch" "$task_b64" "$harness"
+
+  step "installing multi-agent harness ($harness)…"
+  run_phase "$name" harness "$agent" "$repo" "$branch" "$task_b64" "$harness"
 }
 
 ensure_running() { # NAME — start if stopped/archived
@@ -897,11 +1105,12 @@ resolve_name() { # [ARG] -> NAME (auto-picks when unambiguous)
 cmd_up() {
   local repo="" name="" branch="" agent="$DEVFLOW_AGENT" task="" attach=1 fresh=0 blank=0
   local cpu="$DEVFLOW_CPU" memory="$DEVFLOW_MEMORY" disk="$DEVFLOW_DISK" auto_stop="$DEVFLOW_AUTO_STOP"
-  local snapshot="$DEVFLOW_SNAPSHOT" explicit_resources=0
+  local snapshot="$DEVFLOW_SNAPSHOT" explicit_resources=0 harness="$DEVFLOW_HARNESS"
 
   while [ $# -gt 0 ]; do
     case "$1" in
       -a|--agent)   need_val "$1" "${2:-}"; agent="$2"; shift 2 ;;
+      -H|--harness) need_val "$1" "${2:-}"; harness="$2"; shift 2 ;;
       -n|--name)    need_val "$1" "${2:-}"; name="$2"; shift 2 ;;
       -b|--branch)  need_val "$1" "${2:-}"; branch="$2"; shift 2 ;;
       -m|--task)    need_val "$1" "${2:-}"; task="$2"; shift 2 ;;
@@ -921,6 +1130,8 @@ cmd_up() {
   done
 
   case "$agent" in claude|codex|both|none) ;; *) die "invalid --agent '$agent' (claude|codex|both|none)" ;; esac
+  case "$harness" in auto|omc|omx|both|core|none) ;; *) die "invalid --harness '$harness' (auto|omc|omx|both|core|none)" ;; esac
+  harness="$(resolve_harness "$agent" "$harness")"
 
   need_cmd daytona "brew install daytonaio/cli/daytona"
   need_cmd jq "brew install jq"
@@ -967,13 +1178,14 @@ cmd_up() {
     fi
   fi
 
-  say "spinning up ${C_BOLD}$name${C_RESET}  ${C_DIM}agent=$agent repo=${repo:-none} ${cpu}cpu/${memory}mb/${disk}gb auto-stop=${auto_stop}m${C_RESET}"
+  say "spinning up ${C_BOLD}$name${C_RESET}  ${C_DIM}agent=$agent harness=$harness repo=${repo:-none} ${cpu}cpu/${memory}mb/${disk}gb auto-stop=${auto_stop}m${C_RESET}"
   auth_summary
 
   # --- create ---
   local create_args
   create_args=(create "--name=$name" "--auto-stop=$auto_stop"
-               --label devflow=1 --label "devflow.agent=$agent")
+               --label devflow=1 --label "devflow.agent=$agent"
+               --label "devflow.harness=$harness")
   [ -n "$repo" ] && create_args+=(--label "devflow.repo=$repo")
   if [ -n "$snapshot" ]; then
     create_args+=("--snapshot=$snapshot")
@@ -988,7 +1200,7 @@ cmd_up() {
   wait_for_state "$name" started 300
   ok "sandbox running"
 
-  provision_sandbox "$name" "$agent" "$repo" "$branch" "$task"
+  provision_sandbox "$name" "$agent" "$repo" "$branch" "$task" "$harness"
   ok "provisioned"
 
   if [ -n "$task" ]; then
@@ -1271,6 +1483,7 @@ cmd_doctor() {
   echo
   printf '%s\n' "${C_BOLD}defaults${C_RESET}"
   check_row "agent" ok "$DEVFLOW_AGENT"
+  check_row "harness" ok "$DEVFLOW_HARNESS (auto → omc for claude, omx for codex)"
   check_row "resources" ok "${DEVFLOW_CPU}cpu / ${DEVFLOW_MEMORY}mb / ${DEVFLOW_DISK}gb"
   check_row "auto-stop" ok "${DEVFLOW_AUTO_STOP}m (0 = runs until 'devflow stop')"
   [ -n "$DEVFLOW_SNAPSHOT" ] && check_row "snapshot" ok "$DEVFLOW_SNAPSHOT"
@@ -1382,6 +1595,13 @@ RUN mkdir -p "$HOME/.local/bin" && \
     find /tmp -maxdepth 1 -name 'codex*' -type f -exec cp {} "$HOME/.local/bin/codex" \; && \
     chmod +x "$HOME"/.local/bin/* && \
     "$HOME/.local/bin/claude" --version && "$HOME/.local/bin/codex" --version && "$HOME/.local/bin/gh" --version
+# node + the oh-my-* multi-agent harnesses, prebaked for instant session starts
+RUN export NVM_DIR="$HOME/.nvm" && \
+    curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash && \
+    . "$NVM_DIR/nvm.sh" && nvm install 22 && \
+    npm config set prefix "$HOME/.local" && \
+    npm install -g oh-my-claude-sisyphus@latest oh-my-codex@latest && \
+    "$HOME/.local/bin/omc" --version && "$HOME/.local/bin/omx" --version
 CMD ["sleep", "infinity"]
 DV_DOCKERFILE
 }
@@ -1422,6 +1642,10 @@ ${C_BOLD}devflow up${C_RESET} [REPO] [flags] — create (or reattach to) a cloud
                       or get a picker of your GitHub repos
 
   -a, --agent A       claude | codex | both | none     (default: $DEVFLOW_AGENT)
+  -H, --harness H     multi-agent harness: auto | omc | omx | both | core
+                      (default: $DEVFLOW_HARNESS — auto matches the agent:
+                      oh-my-claudecode for claude, oh-my-codex for codex;
+                      core = devflow's built-in dv-engineer/designer/security)
   -m, --task "…"      hand the agent a task right away; add --no-attach to
                       fire-and-forget, then 'devflow peek' to check on it
   -b, --branch B      checkout (or create) branch B
@@ -1444,6 +1668,10 @@ ${C_BOLD}start here${C_RESET}
   devflow setup                 one-time: accounts + auth (no API keys needed)
   devflow up [REPO]             spin up Claude Code / Codex on a repo & attach
   devflow up -m "fix bug X" --no-attach    fire-and-forget, close your laptop
+
+  every sandbox gets a multi-agent harness: oh-my-claudecode (/autopilot,
+  /team, 29 agents) with claude, oh-my-codex with codex, plus devflow's own
+  dv-engineer / dv-designer / dv-security subagents. tune: --harness
 
 ${C_BOLD}daily driving${C_RESET}
   devflow attach [NAME]   (a)   reattach from anywhere — tmux keeps it alive

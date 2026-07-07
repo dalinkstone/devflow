@@ -54,7 +54,7 @@ run_phase() {
   sudo -u daytona -H env \
     DV_PHASE="$1" DV_AGENT=none DV_REPO=octocat/Hello-World DV_BRANCH= \
     DV_NAME=dv-dockertest DV_TASK_B64="$(printf 'fix the flaky test' | base64 | tr -d '\n')" \
-    DV_WORKROOT=work \
+    DV_WORKROOT=work DV_HARNESS=both \
     bash /home/daytona/.devflow/stage/provision.sh
 }
 
@@ -64,6 +64,8 @@ echo "=== phase: auth ==="
 run_phase auth
 echo "=== phase: workspace ==="
 run_phase workspace
+echo "=== phase: harness ==="
+run_phase harness
 
 echo "=== assertions ==="
 H=/home/daytona
@@ -112,6 +114,17 @@ check "provisioned marker"        "test -f $H/.devflow/provisioned"
 check "tmux session dv exists"    'tmux has-session -t dv'
 check "tmux window agent"         'tmux list-windows -t dv | grep -q agent'
 check "tmux window shell"         'tmux list-windows -t dv | grep -q shell'
+
+check "dv-engineer subagent"      "grep -q 'name: dv-engineer' $H/.claude/agents/dv-engineer.md"
+check "dv-designer subagent"      "grep -q 'name: dv-designer' $H/.claude/agents/dv-designer.md"
+check "dv-security subagent"      "grep -q 'name: dv-security' $H/.claude/agents/dv-security.md"
+check "node available for harness" 'command -v node && command -v npm'
+check "omc installed"             'command -v omc'
+check "omc roster installed"      "ls $H/.claude/agents/ | wc -l | grep -qE '^[2-9][0-9]'"
+check "omx installed"             'command -v omx'
+check "omx healthy"               'omx list >/dev/null'
+check "omx setup merged AGENTS"   "grep -q 'OMX:AGENTS' $H/.codex/AGENTS.md"
+check "harness marker"            "grep -q both $H/.devflow/harness"
 
 SL_OUT="$(printf '{"model":{"display_name":"Fable"},"workspace":{"current_dir":"/home/daytona/work/Hello-World"},"context_window":{"used_percentage":42}}' \
   | sudo -u daytona -H bash -lc "$H/.devflow/bin/dv-statusline")"
