@@ -6,7 +6,7 @@ follow the checklists literally.
 ## Repo layout
 
 ```
-bin/devflow                     the entire CLI (single file, ~1600 lines)
+bin/devflow                     the entire CLI (one self-contained file)
 install.sh                      curl|bash installer (also works from checkout)
 Formula/devflow.rb              Homebrew formula (this repo doubles as the tap)
 Makefile                        install / lint / test / test-docker
