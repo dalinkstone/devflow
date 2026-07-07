@@ -6,8 +6,8 @@
 class Devflow < Formula
   desc "Agentic cloud dev sessions: Claude Code / Codex in Daytona sandboxes, on your subscriptions"
   homepage "https://github.com/dalinkstone/devflow"
-  url "https://github.com/dalinkstone/devflow/archive/refs/tags/v0.1.1.tar.gz"
-  sha256 "54ac5daeb4a0704ecf10a4c99ef80fbc6c80d2ef8b7c3ad6ec250da66814ec6a"
+  url "https://github.com/dalinkstone/devflow/archive/refs/tags/v0.2.0.tar.gz"
+  sha256 "db422f3e55b32275544257596d6fe827940bb0cfbf8b4766bb8f42943980c150"
   license "MIT"
   head "https://github.com/dalinkstone/devflow.git", branch: "main"
 
