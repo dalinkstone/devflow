@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Fake macOS `security` for devflow tests (keychain lookup).
+set -u
+[ -n "${FAKE_LOG:-}" ] && printf 'security %s\n' "$*" >> "$FAKE_LOG"
+for a in "$@"; do
+  if [ "$a" = "-w" ]; then
+    printf '{"claudeAiOauth":{"accessToken":"sk-ant-oat01-FAKEACCESS","refreshToken":"sk-ant-ort01-FAKEREFRESH","expiresAt":9999999999,"subscriptionType":"max"}}'
+    exit 0
+  fi
+done
+exit 1

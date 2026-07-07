@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Fake gh CLI for devflow tests.
+set -u
+[ -n "${FAKE_LOG:-}" ] && printf 'gh %s\n' "$*" >> "$FAKE_LOG"
+
+case "${1:-} ${2:-}" in
+  "auth token")  echo "gho_FAKETOKEN123"; exit 0 ;;
+  "auth status") exit 0 ;;
+  "api user")    echo "tester"; exit 0 ;;
+  "repo list")
+    printf 'tester/alpha\tfirst repo\n'
+    printf 'tester/beta\tsecond repo\n'
+    exit 0 ;;
+  *) exit 0 ;;
+esac

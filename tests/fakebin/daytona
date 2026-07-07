@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# Fake daytona CLI for devflow tests.
+# Records every invocation to $FAKE_LOG; keeps sandbox state in $FAKE_STATE_DIR.
+# FAKE_EXEC_STYLE=argv|join controls how `exec -- args` are interpreted,
+# mirroring the two possible behaviors of the real CLI.
+set -u
+
+: "${FAKE_LOG:?FAKE_LOG must be set}"
+: "${FAKE_STATE_DIR:?FAKE_STATE_DIR must be set}"
+: "${FAKE_EXEC_STYLE:=argv}"
+mkdir -p "$FAKE_STATE_DIR"
+
+printf 'daytona %s\n' "$*" >> "$FAKE_LOG"
+
+sbx_file() { printf '%s/%s.json' "$FAKE_STATE_DIR" "$1"; }
+
+cmd="${1:-}"; shift || true
+
+case "$cmd" in
+  organization)
+    [ "${FAKE_UNAUTH:-0}" = "1" ] && { echo "Unauthorized" >&2; exit 1; }
+    echo "org-default"
+    exit 0
+    ;;
+
+  create)
+    name=""; labels="{}"; cpu=1; memory=1024; disk=3; auto_stop=15; snapshot=""; target=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --name=*) name="${1#--name=}"; shift ;;
+        --auto-stop=*) auto_stop="${1#--auto-stop=}"; shift ;;
+        --cpu=*) cpu="${1#--cpu=}"; shift ;;
+        --memory=*) memory="${1#--memory=}"; shift ;;
+        --disk=*) disk="${1#--disk=}"; shift ;;
+        --snapshot=*) snapshot="${1#--snapshot=}"; shift ;;
+        --target=*) target="${1#--target=}"; shift ;;
+        --label) kv="$2"; k="${kv%%=*}"; v="${kv#*=}"
+                 labels="$(printf '%s' "$labels" | jq --arg k "$k" --arg v "$v" '. + {($k): $v}')"
+                 shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    [ -n "$name" ] || { echo "create: missing --name" >&2; exit 1; }
+    jq -n --arg name "$name" --argjson labels "$labels" \
+          --argjson cpu "$cpu" --argjson memory "$memory" --argjson disk "$disk" \
+          --arg autoStop "$auto_stop" --arg snapshot "$snapshot" --arg target "$target" \
+          '{id: ("id-" + $name), name: $name, state: "started", labels: $labels,
+            cpu: $cpu, memory: $memory, disk: $disk,
+            autoStopInterval: $autoStop, snapshot: $snapshot, target: $target}' \
+      > "$(sbx_file "$name")"
+    echo "Sandbox $name created"
+    exit 0
+    ;;
+
+  info)
+    name="${1:-}"
+    f="$(sbx_file "$name")"
+    [ -f "$f" ] || { echo "sandbox not found: $name" >&2; exit 1; }
+    cat "$f"
+    exit 0
+    ;;
+
+  list)
+    files=$(ls "$FAKE_STATE_DIR"/*.json 2>/dev/null || true)
+    if [ -z "$files" ]; then echo "[]"; else jq -s '.' "$FAKE_STATE_DIR"/*.json; fi
+    exit 0
+    ;;
+
+  start)
+    name="${1:-}"; f="$(sbx_file "$name")"
+    [ -f "$f" ] || { echo "not found" >&2; exit 1; }
+    jq '.state = "started"' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+    echo "started $name"
+    exit 0
+    ;;
+
+  stop)
+    name="${1:-}"; f="$(sbx_file "$name")"
+    [ -f "$f" ] || { echo "not found" >&2; exit 1; }
+    jq '.state = "stopped"' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+    echo "stopped $name"
+    exit 0
+    ;;
+
+  delete)
+    name="${1:-}"
+    rm -f "$(sbx_file "$name")"
+    echo "deleted $name"
+    exit 0
+    ;;
+
+  ssh)
+    echo "FAKE-SSH ${1:-}"
+    exit 0
+    ;;
+
+  snapshot)
+    echo "snapshot ok"
+    exit 0
+    ;;
+
+  exec)
+    name="${1:-}"; shift || true
+    # swallow --timeout N / --cwd X
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --timeout|--cwd) shift 2 ;;
+        --) shift; break ;;
+        *) shift ;;
+      esac
+    done
+    f="$(sbx_file "$name")"
+    [ -f "$f" ] || { echo "exec: sandbox not found: $name" >&2; exit 1; }
+    state="$(jq -r .state "$f")"
+    [ "$state" = "started" ] || { echo "exec: sandbox not started" >&2; exit 1; }
+
+    if [ "$FAKE_EXEC_STYLE" = "argv" ]; then
+      # argv preserved: emulate a few commands the probe/devflow relies on
+      printf 'EXEC[%s] %s\n' "$name" "$*" >> "$FAKE_LOG"
+      case "${1:-}" in
+        printf) shift; fmt="$1"; shift; printf "$fmt" "$@"; exit 0 ;;
+        echo)   shift; echo "$@"; exit 0 ;;
+        bash)
+          # bash -lc SCRIPT
+          script="${3:-}"
+          ;;
+        *) script="$*" ;;
+      esac
+    else
+      # join style: args joined with spaces, run through remote sh -c
+      joined="$*"
+      printf 'EXEC[%s] %s\n' "$name" "$joined" >> "$FAKE_LOG"
+      case "$joined" in
+        "printf %s x y") printf 'xy'; exit 0 ;;   # printf gets two args: "x" "y"
+        "printf %s 'x y'") printf 'x y'; exit 0 ;;
+        echo*) printf '%s\n' "${joined#echo }" | tr -d "'"; exit 0 ;;
+      esac
+      # strip the self-quoted "bash -lc '…'" wrapper for content matching
+      script="$joined"
+    fi
+
+    case "$script" in
+      *capture-pane*) echo "⏺ fake agent output line"; echo "❯ waiting for input"; exit 0 ;;
+      *dv-ensure*)    exit 0 ;;
+      *provision.sh*) echo "[devflow] fake provision phase ran"; exit 0 ;;
+      *)              exit 0 ;;
+    esac
+    ;;
+
+  version) echo "Daytona CLI version v0.0.0-fake"; exit 0 ;;
+  *) exit 0 ;;
+esac

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Fake curl for devflow tests (only the Daytona ssh-access API is exercised).
+set -u
+[ -n "${FAKE_LOG:-}" ] && printf 'curl %s\n' "$*" >> "$FAKE_LOG"
+for a in "$@"; do
+  case "$a" in
+    *"/ssh-access"*)
+      printf '{"token":"faketok123","sshCommand":"ssh faketok123@ssh.app.daytona.io"}'
+      exit 0 ;;
+  esac
+done
+exit 22
