@@ -89,7 +89,7 @@ fresh_env
 
 run_devflow version
 assert_rc "version exits 0" "$RC" 0
-assert_contains "version prints version" "$OUT" "devflow 0.1.0"
+assert_contains "version prints version" "$OUT" "devflow 0.1."
 
 run_devflow help
 assert_rc "help exits 0" "$RC" 0

@@ -12,7 +12,7 @@
 set -u
 set -o pipefail
 
-DEVFLOW_VERSION="0.1.0"
+DEVFLOW_VERSION="0.1.1"
 
 # ----------------------------------------------------------------------------
 # Config (precedence: environment > config file > built-in default)
@@ -1236,7 +1236,7 @@ check_row() { # LABEL STATUS DETAIL
 }
 
 cmd_doctor() {
-  say "devflow $DEVFLOW_VERSION — environment check"
+  say "$DEVFLOW_VERSION — environment check"
   echo
   printf '%s\n' "${C_BOLD}local tools${C_RESET}"
   local spec c fix
@@ -1279,7 +1279,7 @@ cmd_doctor() {
 }
 
 cmd_setup() {
-  say "devflow $DEVFLOW_VERSION setup — cloud agent sessions on your subscriptions"
+  say "$DEVFLOW_VERSION setup — cloud agent sessions on your subscriptions"
   mkdir -p "$CONFIG_DIR"; chmod 700 "$CONFIG_DIR"
   echo
 
