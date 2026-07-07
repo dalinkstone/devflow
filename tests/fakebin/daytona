@@ -126,6 +126,30 @@ case "$cmd" in
           ;;
         *) script="$*" ;;
       esac
+      # materialize devflow's chunked file pushes into a fake sandbox fs,
+      # so tests can assert on the exact bytes that would land remotely
+      FS="$FAKE_STATE_DIR/fs"
+      case "$script" in
+        *"printf %s '"*"' > '"*".b64'"*|*"printf %s '"*"' >> '"*".b64'"*)
+          part="$(printf '%s' "$script" | sed -n "s/^.*printf %s '\([A-Za-z0-9+\/=]*\)'.*$/\1/p")"
+          dest="$(printf '%s' "$script" | sed -n "s/^.*> *'\(\/[^']*\.b64\)'.*$/\1/p")"
+          if [ -n "$dest" ]; then
+            mkdir -p "$FS$(dirname "$dest")"
+            case "$script" in
+              *"printf %s '"*"' >> '"*) printf '%s' "$part" >> "$FS$dest" ;;
+              *)                        printf '%s' "$part" >  "$FS$dest" ;;
+            esac
+          fi
+          exit 0 ;;
+        *"base64 -d '"*".b64'"*)
+          src="$(printf '%s' "$script" | sed -n "s/^.*base64 -d '\(\/[^']*\.b64\)'.*$/\1/p")"
+          if [ -n "$src" ] && [ -f "$FS$src" ]; then
+            mkdir -p "$FS$(dirname "${src%.b64}")"
+            base64 --decode < "$FS$src" > "$FS${src%.b64}" 2>/dev/null \
+              || base64 -d < "$FS$src" > "$FS${src%.b64}"
+          fi
+          exit 0 ;;
+      esac
     else
       # join style: args joined with spaces, run through remote sh -c
       joined="$*"

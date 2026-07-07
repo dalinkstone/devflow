@@ -16,7 +16,11 @@ t_ok()   { TESTN=$((TESTN+1)); PASS=$((PASS+1)); printf 'ok %d - %s\n' "$TESTN" 
 t_fail() { TESTN=$((TESTN+1)); FAIL=$((FAIL+1)); printf 'not ok %d - %s\n' "$TESTN" "$1"; [ -n "${2:-}" ] && printf '    # %s\n' "$2"; }
 
 assert_contains() { # NAME HAYSTACK NEEDLE
-  if printf '%s' "$2" | grep -qF -- "$3"; then t_ok "$1"; else t_fail "$1" "missing: $3"; fi
+  if printf '%s' "$2" | grep -qF -- "$3"; then
+    t_ok "$1"
+  else
+    t_fail "$1" "missing: $3 | got: $(printf '%s' "$2" | tr '\n' ' ' | head -c 200)"
+  fi
 }
 assert_not_contains() {
   if printf '%s' "$2" | grep -qF -- "$3"; then t_fail "$1" "unexpected: $3"; else t_ok "$1"; fi
@@ -73,12 +77,8 @@ run_devflow() { # args… (stdin=/dev/null, captures stdout+stderr, sets RC/OUT)
   return 0
 }
 
-extract_pushed_file() { # REMOTE_PATH -> decoded content (from chunked upload log)
-  grep -F "$1.b64" "$T_LOG" \
-    | grep -o "printf %s '[A-Za-z0-9+/=]*'" \
-    | sed "s/printf %s '//; s/'$//" \
-    | tr -d '\n' \
-    | base64 --decode 2>/dev/null
+extract_pushed_file() { # REMOTE_PATH -> decoded content (materialized by the fake)
+  cat "$T_STATE/fs$1" 2>/dev/null
 }
 
 # ===========================================================================
