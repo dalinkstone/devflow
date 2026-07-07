@@ -229,6 +229,20 @@ New sandboxes then boot with claude/codex/gh/tmux already in place.
 - Something else → `devflow ssh NAME` and poke around, or
   `devflow exec NAME -- cat .devflow/claude-install.log`.
 
+## Documentation
+
+Full docs live in [`docs/`](docs/README.md) — written to be equally usable by
+humans and coding agents:
+
+- **[Usage](docs/usage.md)** — every command, flag, config key; auth model;
+  costs; troubleshooting
+- **[Architecture](docs/architecture.md)** — how the CLI, provisioner phases,
+  exec-style probe, and auth injection actually work
+- **[Development](docs/development.md)** — repo layout, the test gate,
+  hard invariants, known traps, how-to recipes
+- **[Releasing](docs/releasing.md)** — the exact tag → formula-pin → release
+  runbook
+
 ## Development
 
 ```bash
@@ -239,6 +253,7 @@ make test-docker  # runs the real provisioner in an Ubuntu container
 
 Single file: [`bin/devflow`](bin/devflow). The sandbox provisioner and the
 snapshot Dockerfile are embedded in it (`devflow __provision-script`,
-`devflow __dockerfile`).
+`devflow __dockerfile`). Agents: start at [`CLAUDE.md`](CLAUDE.md) /
+[`AGENTS.md`](AGENTS.md).
 
 MIT © dalinkstone
