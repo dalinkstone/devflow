@@ -12,7 +12,7 @@
 set -u
 set -o pipefail
 
-DEVFLOW_VERSION="0.2.0"
+DEVFLOW_VERSION="0.3.0"
 
 # ----------------------------------------------------------------------------
 # Config (precedence: environment > config file > built-in default)
@@ -24,7 +24,7 @@ SECRETS_FILE="$CONFIG_DIR/secrets"
 GH_PIN_VERSION="2.96.0"          # fallback for in-sandbox gh install
 CODEX_PIN_TAG="rust-v0.142.5"    # fallback for in-sandbox codex install
 
-_CONFIG_KEYS="DEVFLOW_AGENT DEVFLOW_CPU DEVFLOW_MEMORY DEVFLOW_DISK DEVFLOW_AUTO_STOP DEVFLOW_TARGET DEVFLOW_SNAPSHOT DEVFLOW_CLAUDE_AUTH DEVFLOW_EXEC_STYLE DEVFLOW_WORKROOT DEVFLOW_HARNESS"
+_CONFIG_KEYS="DEVFLOW_AGENT DEVFLOW_CPU DEVFLOW_MEMORY DEVFLOW_DISK DEVFLOW_AUTO_STOP DEVFLOW_TARGET DEVFLOW_SNAPSHOT DEVFLOW_CLAUDE_AUTH DEVFLOW_EXEC_STYLE DEVFLOW_WORKROOT DEVFLOW_HARNESS DEVFLOW_NTFY_URL DEVFLOW_NTFY_TOPIC DEVFLOW_AUTO_HANDOFF"
 
 load_config() {
   # 1) preserve values that came from the caller's environment
@@ -54,6 +54,9 @@ load_config() {
   : "${DEVFLOW_EXEC_STYLE:=}"           # join | argv | "" = auto-probe
   : "${DEVFLOW_WORKROOT:=work}"         # dir under $HOME in the sandbox
   : "${DEVFLOW_HARNESS:=auto}"          # auto | omc | omx | both | core
+  : "${DEVFLOW_NTFY_URL:=https://ntfy.sh}"  # push server (self-hostable)
+  : "${DEVFLOW_NTFY_TOPIC:=}"           # private topic; set by 'mobile --setup-push'
+  : "${DEVFLOW_AUTO_HANDOFF:=}"         # ""=off | auto|push|op|bw|note — send reconnect line after every 'up'
   : "${DEVFLOW_CLAUDE_TOKEN:=}"
   return 0
 }
@@ -946,6 +949,32 @@ DV_AG_SEC
   fi
 }
 
+# Shared npm-harness installer: install the package if its main bin is
+# missing, symlink bins where non-interactive shells can see them, then run
+# the tool's own idempotent setup. Everything best-effort: failures warn into
+# the per-tool log and the session stays usable on the core harness.
+install_harness_tool() { # LABEL NPM_PKG MAIN_BIN SETUP_CMD READY_MSG [EXTRA_BINS…]
+  local label="$1" pkg="$2" mainbin="$3" setup_cmd="$4" ready="$5" b
+  shift 5
+  if ! command -v "$mainbin" >/dev/null 2>&1; then
+    log "installing $label…"
+    npm install -g "$pkg@latest" > "$DV_DIR/$mainbin-install.log" 2>&1 \
+      || log "warn: $mainbin npm install failed (see ~/.devflow/$mainbin-install.log)"
+    ensure_node_path
+    link_global_bin "$mainbin"
+    for b in "$@"; do link_global_bin "$b"; done
+  fi
+  if command -v "$mainbin" >/dev/null 2>&1; then
+    # shellcheck disable=SC2086  # setup_cmd is a controlled argv string
+    if $setup_cmd </dev/null >> "$DV_DIR/$mainbin-install.log" 2>&1; then
+      log "$ready"
+    else
+      log "warn: $mainbin setup failed:"
+      tail -n 6 "$DV_DIR/$mainbin-install.log" 2>/dev/null | sed 's/^/[devflow]   /'
+    fi
+  fi
+}
+
 phase_harness() {
   log "phase 4/4 harness: multi-agent setup ($DV_HARNESS)…"
 
@@ -959,41 +988,18 @@ phase_harness() {
   esac
 
   if [ "$DV_HARNESS" = "omc" ] || [ "$DV_HARNESS" = "both" ]; then
-    if ! command -v omc >/dev/null 2>&1; then
-      log "installing oh-my-claudecode (this can take a minute)…"
-      npm install -g oh-my-claude-sisyphus@latest > "$DV_DIR/omc-install.log" 2>&1 \
-        || log "warn: omc npm install failed (see ~/.devflow/omc-install.log)"
-      ensure_node_path
-      link_global_bin omc
-      link_global_bin oh-my-claudecode
-      link_global_bin omc-cli
-    fi
-    if command -v omc >/dev/null 2>&1; then
-      if omc setup --no-plugin --force --quiet </dev/null >> "$DV_DIR/omc-install.log" 2>&1; then
-        log "omc ready: /autopilot, /ultrawork, /team (architect, designer, security-reviewer, +26 more)"
-      else
-        log "warn: omc setup failed:"
-        tail -n 6 "$DV_DIR/omc-install.log" 2>/dev/null | sed 's/^/[devflow]   /'
-      fi
-    fi
+    install_harness_tool "oh-my-claudecode (this can take a minute)" \
+      oh-my-claude-sisyphus omc \
+      "omc setup --no-plugin --force --quiet" \
+      "omc ready: /autopilot, /ultrawork, /team (architect, designer, security-reviewer, +26 more)" \
+      oh-my-claudecode omc-cli
   fi
 
   if [ "$DV_HARNESS" = "omx" ] || [ "$DV_HARNESS" = "both" ]; then
-    if ! command -v omx >/dev/null 2>&1; then
-      log "installing oh-my-codex…"
-      npm install -g oh-my-codex@latest > "$DV_DIR/omx-install.log" 2>&1 \
-        || log "warn: omx npm install failed (see ~/.devflow/omx-install.log)"
-      ensure_node_path
-      link_global_bin omx
-    fi
-    if command -v omx >/dev/null 2>&1; then
-      if omx setup --scope user --merge-agents --force </dev/null >> "$DV_DIR/omx-install.log" 2>&1; then
-        log "omx ready: launch codex sessions with 'omx' (\$ultragoal keywords, agent teams)"
-      else
-        log "warn: omx setup failed:"
-        tail -n 6 "$DV_DIR/omx-install.log" 2>/dev/null | sed 's/^/[devflow]   /'
-      fi
-    fi
+    install_harness_tool "oh-my-codex" \
+      oh-my-codex omx \
+      "omx setup --scope user --merge-agents --force" \
+      "omx ready: launch codex sessions with 'omx' (\$ultragoal keywords, agent teams)"
   fi
 
   # after omc setup: its installer syncs ~/.claude/agents and drops unknown
@@ -1203,6 +1209,8 @@ cmd_up() {
   provision_sandbox "$name" "$agent" "$repo" "$branch" "$task" "$harness"
   ok "provisioned"
 
+  [ -n "$DEVFLOW_AUTO_HANDOFF" ] && { auto_handoff "$name" || true; }
+
   if [ -n "$task" ]; then
     say "the agent is on it. it keeps working even when you're not attached."
     step "peek progress:  ${C_BOLD}devflow peek $name${C_RESET}"
@@ -1239,18 +1247,14 @@ cmd_ssh() {
   exec daytona ssh "$name"
 }
 
-cmd_ssh_command() { # print a plain `ssh` command usable from any machine
+# Mint a tokenized `ssh …@ssh.app.daytona.io` line via Daytona's ssh-access
+# API. Prints ONLY the ssh line on stdout (so it's safe in $(…)); dies on
+# stderr on any failure. Caller handles resolve_name + ensure_running.
+# Shared by `ssh-command` and `mobile`.
+mint_ssh_command() { # NAME EXPIRES_MIN -> ssh line on stdout
+  local name="$1" expires="$2"
   need_cmd jq "brew install jq"
   need_cmd curl "install curl"
-  local name="" expires=1440
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --expires) need_val "$1" "${2:-}"; expires="$2"; shift 2 ;;
-      *) name="$1"; shift ;;
-    esac
-  done
-  name="$(resolve_name "$name")" || exit 1
-  ensure_running "$name"
 
   local api_key="${DAYTONA_API_KEY:-}" api_url="${DAYTONA_API_URL:-https://app.daytona.io/api}" cfg=""
   if [ -z "$api_key" ]; then
@@ -1283,8 +1287,360 @@ cmd_ssh_command() { # print a plain `ssh` command usable from any machine
     sshcmd="ssh $token@ssh.app.daytona.io"
   fi
   [ -n "$sshcmd" ] || die "unexpected ssh-access response — fall back to: devflow ssh $name"
+  printf '%s\n' "$sshcmd"
+}
+
+cmd_ssh_command() { # print a plain `ssh` command usable from any machine
+  local name="" expires=1440
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --expires) need_val "$1" "${2:-}"; expires="$2"; shift 2 ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+  name="$(resolve_name "$name")" || exit 1
+  ensure_running "$name"
+  local sshcmd
+  sshcmd="$(mint_ssh_command "$name" "$expires")" || exit 1
   say "valid for ${expires}m — run from any machine with plain ssh:"
   printf '%s\n' "$sshcmd"
+}
+
+# Print FILE minus the managed block delimited by BEGIN/END marker lines.
+strip_managed_block() { # FILE BEGIN END
+  [ -f "$1" ] || return 0
+  awk -v b="$2" -v e="$3" '$0==b{skip=1} !skip{print} $0==e{skip=0}' "$1"
+}
+
+# Managed ~/.ssh/config Host block: after this, plain `ssh dv-NAME` works —
+# and so does anything built on ssh config: VS Code / Cursor Remote-SSH,
+# scp, rsync. Idempotent (re-run replaces the block, e.g. after token
+# expiry); --remove deletes it and touches nothing else in the file.
+cmd_ssh_config() {
+  local name="" expires=1440 cfgfile="$HOME/.ssh/config" remove=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --expires) need_val "$1" "${2:-}"; expires="$2"; shift 2 ;;
+      --file)    need_val "$1" "${2:-}"; cfgfile="$2"; shift 2 ;;
+      --remove)  remove=1; shift ;;
+      -h|--help) printf 'devflow ssh-config [NAME] [--expires MIN] [--file PATH] [--remove] — managed Host block: plain `ssh NAME` + editor Remote-SSH\n'; return 0 ;;
+      *)         name="$1"; shift ;;
+    esac
+  done
+
+  if [ "$remove" = 1 ]; then
+    # no resolve/mint — must work even after the sandbox is gone
+    [ -n "$name" ] || die "usage: devflow ssh-config NAME --remove"
+    local tmp_rm
+    tmp_rm="$(mktemp "${TMPDIR:-/tmp}/devflow.XXXXXX")"
+    strip_managed_block "$cfgfile" "# >>> devflow $name >>>" "# <<< devflow $name <<<" > "$tmp_rm"
+    mv "$tmp_rm" "$cfgfile"
+    chmod 600 "$cfgfile" 2>/dev/null || true
+    ok "removed Host $name from $cfgfile"
+    return 0
+  fi
+
+  name="$(resolve_name "$name")" || exit 1
+  ensure_running "$name"
+  local sshcmd uri target user host port=22
+  sshcmd="$(mint_ssh_command "$name" "$expires")" || exit 1
+  uri="$(ssh_uri_from_command "$sshcmd")"
+  [ -n "$uri" ] || die "couldn't parse user@host from: $sshcmd"
+  target="${uri#ssh://}"
+  user="${target%%@*}"
+  host="${target#*@}"
+  case "$host" in *:*) port="${host##*:}"; host="${host%%:*}" ;; esac
+
+  local begin="# >>> devflow $name >>>" end="# <<< devflow $name <<<" tmp
+  mkdir -p "$(dirname "$cfgfile")"
+  chmod 700 "$(dirname "$cfgfile")" 2>/dev/null || true
+  tmp="$(mktemp "${TMPDIR:-/tmp}/devflow.XXXXXX")"
+  strip_managed_block "$cfgfile" "$begin" "$end" > "$tmp"
+  {
+    printf '%s\n' "$begin"
+    printf 'Host %s\n' "$name"
+    printf '  HostName %s\n' "$host"
+    printf '  Port %s\n' "$port"
+    printf '  User %s\n' "$user"
+    printf '  StrictHostKeyChecking accept-new\n'
+    printf '%s\n' "$end"
+  } >> "$tmp"
+  mv "$tmp" "$cfgfile"
+  chmod 600 "$cfgfile"
+
+  ok "ssh config written: ${C_BOLD}Host $name${C_RESET} → $cfgfile ${C_DIM}(token valid ${expires}m)${C_RESET}"
+  step "terminal:        ${C_BOLD}ssh $name${C_RESET}   (lands in the live tmux agent)"
+  step "VS Code/Cursor:  Remote-SSH: Connect to Host… → $name ${C_DIM}(or: code --remote ssh-remote+$name /home/daytona/$DEVFLOW_WORKROOT)${C_RESET}"
+  step "after expiry, refresh with:  ${C_BOLD}devflow ssh-config $name --expires 10080${C_RESET}"
+}
+
+# --- phone hand-off helpers (devflow mobile) --------------------------------
+
+# ssh://user@host[:port] URI from an `ssh …` command line. Mobile SSH apps
+# (Termius, Blink, ConnectBot, …) register the ssh:// scheme, so a QR of the
+# URI opens the session in one camera-tap. Prints nothing if the command has
+# no user@host target.
+ssh_uri_from_command() { # SSHCMD
+  local w target="" port="" prev=""
+  # shellcheck disable=SC2086  # word-splitting the command line is the point
+  for w in $1; do
+    case "$w" in *@*) target="$w" ;; esac
+    [ "$prev" = "-p" ] && port="$w"
+    prev="$w"
+  done
+  [ -n "$target" ] || return 0
+  printf 'ssh://%s%s' "$target" "${port:+:$port}"
+}
+
+# Render PAYLOAD as a terminal QR via qrencode — generated locally, so the
+# token never touches a third-party service. Quiet rc-1 when qrencode is
+# missing or fails; the caller prints its own fallback hint.
+emit_qr() { # PAYLOAD -> indented QR on stdout
+  have_cmd qrencode || return 1
+  local qrtype=UTF8 out
+  [ -n "$C_BOLD" ] && qrtype=ANSIUTF8   # paints true black/white, any theme
+  out="$(qrencode -t "$qrtype" "$1" 2>/dev/null)" || return 1
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out" | sed 's/^/  /'
+}
+
+copy_to_clipboard() { # TEXT -> rc 0 if a clipboard tool took it
+  if have_cmd pbcopy;  then printf '%s' "$1" | pbcopy 2>/dev/null && return 0; fi
+  if have_cmd wl-copy; then printf '%s' "$1" | wl-copy 2>/dev/null && return 0; fi
+  if have_cmd xclip;   then printf '%s' "$1" | xclip -selection clipboard 2>/dev/null && return 0; fi
+  return 1
+}
+
+open_file() { # FILE -> open in the OS default app (best-effort)
+  if have_cmd open; then open "$1" 2>/dev/null
+  elif have_cmd xdg-open; then xdg-open "$1" 2>/dev/null
+  else return 1; fi
+}
+
+# Self-contained HTML "reconnect pass" for when the phone isn't at hand at
+# mint time: print it, AirDrop it later, or park it in a synced folder and
+# open it from the phone's Files app. 0600 — it embeds a live token.
+write_mobile_pass() { # FILE NAME SSHCMD URI EXPIRES_MIN
+  local file="$1" name="$2" sshcmd="$3" uri="$4" expires="$5"
+  local svg="" qrblock minted
+  if [ -n "$uri" ] && have_cmd qrencode; then
+    svg="$(qrencode -t SVG -s 8 -o - "$uri" 2>/dev/null)" || svg=""
+  fi
+  if [ -n "$svg" ]; then
+    qrblock="<div class=\"qr\">$svg</div>"
+  else
+    qrblock="<p class=\"dim\"><em>(no QR — qrencode wasn't available when this pass was minted)</em></p>"
+  fi
+  minted="$(date)"
+  ( umask 177
+    cat > "$file" <<DV_MOBILE_PASS
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>devflow reconnect pass — $name</title>
+<style>
+  body{font-family:-apple-system,system-ui,sans-serif;max-width:34em;margin:3em auto;padding:0 1em;color:#111;background:#fff}
+  h1{font-size:1.3em}
+  code{font-family:ui-monospace,Menlo,monospace;background:#f4f4f4;padding:.5em .7em;border-radius:6px;display:block;word-break:break-all;font-size:1.05em}
+  .qr{margin:1.2em 0}
+  .dim{color:#666;font-size:.9em}
+  .warn{color:#8a4b00;background:#fff4e0;padding:.6em .8em;border-radius:6px;font-size:.9em}
+</style>
+<h1>devflow reconnect pass — $name</h1>
+<p class="dim">minted $minted · token valid $expires minutes · any SSH login lands in the
+live tmux agent (detach: Ctrl-b d)</p>
+$qrblock
+<p>scan with a phone camera (opens in Termius / Blink / ConnectBot), or run:</p>
+<code>$sshcmd</code>
+<p class="dim">no SSH app? browser terminal: <a href="https://app.daytona.io">app.daytona.io</a> → $name → Terminal</p>
+<p class="warn">this file contains a live SSH token — treat it like a password; it expires
+on its own, but delete it after use anyway.</p>
+DV_MOBILE_PASS
+  ) || die "could not write $file"
+  chmod 600 "$file" 2>/dev/null || true
+}
+
+# One-time pairing for the push channel: mint a private high-entropy ntfy
+# topic (the topic IS the password — ntfy's documented model), store it in
+# the 0600 secrets file, and walk the phone through subscribing. Works for
+# every laptop/phone combo: curl on macOS/Linux, ntfy app on Android/iOS.
+setup_push_channel() {
+  need_cmd curl "install curl"
+  local topic="${DEVFLOW_NTFY_TOPIC:-}"
+  if [ -z "$topic" ]; then
+    topic="devflow-$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
+    config_set "$SECRETS_FILE" DEVFLOW_NTFY_TOPIC "$topic"
+    DEVFLOW_NTFY_TOPIC="$topic"
+  fi
+  say "push channel — one-time phone setup (works Android + iPhone, from macOS + Linux)"
+  printf '\n'
+  step "1) install the ${C_BOLD}ntfy${C_RESET} app — Android: Play/F-Droid · iPhone: App Store (free, open source)"
+  step "2) in the app: Subscribe to topic — scan this or type it:"
+  emit_qr "$DEVFLOW_NTFY_URL/$topic" || true
+  printf '     %s%s/%s%s\n' "$C_BOLD" "$DEVFLOW_NTFY_URL" "$topic" "$C_RESET"
+  printf '     %sthe topic name is the password — anyone who has it can read your pushes (kept 0600 in devflow secrets)%s\n' "$C_DIM" "$C_RESET"
+  step "3) repeat on any other phone/tablet — same topic, they all get the pushes"
+  printf '\n'
+  if curl -fsS -X POST -H "X-Title: devflow" \
+       -d "push channel works — 'devflow mobile --send push' lands here from any of your machines" \
+       "$DEVFLOW_NTFY_URL/$topic" >/dev/null 2>&1; then
+    ok "test notification sent — it should be on your phone now"
+  else
+    warn "test push failed — check network, then: devflow mobile --send push"
+  fi
+  step "self-hosting? point it at your server:  devflow config set DEVFLOW_NTFY_URL https://ntfy.example.com"
+}
+
+handoff_body() { # NAME SSHCMD URI EXPIRES_MIN -> message body on stdout
+  printf 'devflow reconnect — %s\n%s\n' "$1" "$2"
+  [ -n "$3" ] && printf 'one-tap: %s\n' "$3"
+  printf 'minted %s · valid %sm · lands in the live tmux agent (detach: Ctrl-b d)\nno SSH app? https://app.daytona.io → %s → Terminal' "$(date)" "$4" "$1"
+}
+
+# Send the reconnect info through a channel that already syncs to the phone —
+# no phone-in-hand needed at mint time; it's waiting there when you pick it
+# up. Channels: ntfy push (any laptop → any phone, tap opens the SSH app),
+# 1Password CLI (op), Bitwarden CLI (bw, needs BW_SESSION), Apple Notes via
+# iCloud (osascript). auto = first available in that order. Prints the
+# channel label on success; dies with a fix-it hint on an explicit target,
+# falls through silently in auto mode.
+send_handoff() { # TARGET(auto|push|op|bw|note) TITLE BODY URI -> channel label on stdout
+  local target="$1" title="$2" body="$3" uri="$4"
+  if [ "$target" = push ] || { [ "$target" = auto ] && [ -n "${DEVFLOW_NTFY_TOPIC:-}" ]; }; then
+    if [ "$target" = push ] && [ -z "${DEVFLOW_NTFY_TOPIC:-}" ]; then
+      die "push channel not set up — run: devflow mobile --setup-push"
+    fi
+    need_cmd curl "install curl"
+    # X-Click: tapping the notification opens the SSH app via the ssh:// URI
+    if curl -fsS -X POST -H "X-Title: $title" -H "X-Click: ${uri:-https://app.daytona.io}" \
+         -d "$body" "$DEVFLOW_NTFY_URL/$DEVFLOW_NTFY_TOPIC" >/dev/null 2>&1; then
+      printf 'push (ntfy)'; return 0
+    fi
+    [ "$target" = push ] && die "push failed — check network / DEVFLOW_NTFY_URL ($DEVFLOW_NTFY_URL)"
+  fi
+  if [ "$target" = op ] || { [ "$target" = auto ] && have_cmd op; }; then
+    [ "$target" = op ] && need_cmd op "brew install 1password-cli"
+    local operr=""
+    if operr="$(op item create --category "Secure Note" --title "$title" "notesPlain=$body" 2>&1 >/dev/null)"; then
+      printf '1Password'; return 0
+    fi
+    [ "$target" = op ] && die "op item create failed: ${operr:-unknown error} — try 'op signin' (or enable the 1Password app's CLI integration)"
+  fi
+  if [ "$target" = bw ] || { [ "$target" = auto ] && have_cmd bw && [ -n "${BW_SESSION:-}" ]; }; then
+    [ "$target" = bw ] && need_cmd bw "brew install bitwarden-cli"
+    local enc=""
+    if enc="$(bw --nointeraction get template item 2>/dev/null \
+          | jq --arg t "$title" --arg n "$body" '.type=2 | .secureNote={type:0} | .name=$t | .notes=$n' 2>/dev/null \
+          | bw --nointeraction encode 2>/dev/null)" \
+        && [ -n "$enc" ] && bw --nointeraction create item "$enc" >/dev/null 2>&1; then
+      printf 'Bitwarden'; return 0
+    fi
+    [ "$target" = bw ] && die "bw create failed — unlock first: export BW_SESSION=\"\$(bw unlock --raw)\""
+  fi
+  if [ "$target" = note ] || { [ "$target" = auto ] && [ "$(uname 2>/dev/null)" = Darwin ] && have_cmd osascript; }; then
+    [ "$target" = note ] && need_cmd osascript "Apple Notes hand-off is macOS-only"
+    local body_html
+    body_html="$(printf '%s\n' "$body" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' | awk '{printf "%s<br>", $0}')"
+    if osascript - "$title" "$body_html" >/dev/null 2>&1 <<'DV_NOTE_AS'
+on run argv
+  tell application "Notes" to make new note with properties {name:(item 1 of argv), body:(item 2 of argv)}
+end run
+DV_NOTE_AS
+    then printf 'Apple Notes (iCloud)'; return 0; fi
+    [ "$target" = note ] && die "couldn't create the note — allow Terminal to control Notes (System Settings → Privacy & Security → Automation)"
+  fi
+  die "no hand-off channel available — install the 1Password CLI (op) or Bitwarden CLI (bw + BW_SESSION), or use Apple Notes on macOS. Zero-prep fallbacks: app.daytona.io from any browser, or 'devflow mobile --out FILE'"
+}
+
+# DEVFLOW_AUTO_HANDOFF: fire-and-forget hand-off at the end of every `up` —
+# the reconnect line lands on the phone without being asked, so forgetting to
+# run `devflow mobile` before leaving costs nothing. Best-effort by design:
+# a failed mint/send warns and never blocks the session.
+auto_handoff() { # NAME
+  local name="$1" sshcmd="" uri="" body="" chan=""
+  sshcmd="$(mint_ssh_command "$name" 1440 2>/dev/null)" \
+    || { warn "auto-handoff: couldn't mint an ssh token — run 'devflow mobile' manually"; return 1; }
+  uri="$(ssh_uri_from_command "$sshcmd")"
+  body="$(handoff_body "$name" "$sshcmd" "$uri" 1440)"
+  chan="$(send_handoff "$DEVFLOW_AUTO_HANDOFF" "devflow · $name" "$body" "$uri" 2>/dev/null)" \
+    || { warn "auto-handoff: send failed (channel: $DEVFLOW_AUTO_HANDOFF) — run 'devflow mobile --send'"; return 1; }
+  ok "auto-handoff: reconnect line sent via $chan"
+}
+
+cmd_mobile() { # hand the session to your phone: camera-scannable QR + ssh line + fallbacks
+  local name="" expires=1440 want_qr=1 want_copy=1 want_open=0 outfile="" send_target=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --expires)   need_val "$1" "${2:-}"; expires="$2"; shift 2 ;;
+      --out)       need_val "$1" "${2:-}"; outfile="$2"; shift 2 ;;
+      --open)      want_open=1; shift ;;
+      --send)      send_target=auto
+                   case "${2:-}" in push|op|bw|note) send_target="$2"; shift ;; esac
+                   shift ;;
+      --setup-push) setup_push_channel; return $? ;;
+      --no-qr)     want_qr=0; shift ;;
+      --no-copy)   want_copy=0; shift ;;
+      -h|--help)   printf 'devflow mobile [NAME] [--expires MIN] [--send [push|op|bw|note]] [--setup-push] [--out FILE [--open]] [--no-qr] [--no-copy] — hand the session to your phone\n'; return 0 ;;
+      *)           name="$1"; shift ;;
+    esac
+  done
+  [ "$want_open" = 1 ] && [ -z "$outfile" ] && die "--open requires --out FILE"
+  name="$(resolve_name "$name")" || exit 1
+  ensure_running "$name"
+  local sshcmd
+  sshcmd="$(mint_ssh_command "$name" "$expires")" || exit 1
+
+  local uri="" copied=0
+  uri="$(ssh_uri_from_command "$sshcmd")"
+  [ -n "$outfile" ] && write_mobile_pass "$outfile" "$name" "$sshcmd" "$uri" "$expires"
+  local sent_via=""
+  if [ -n "$send_target" ]; then
+    local body
+    body="$(handoff_body "$name" "$sshcmd" "$uri" "$expires")"
+    sent_via="$(send_handoff "$send_target" "devflow · $name" "$body" "$uri")" || exit 1
+  fi
+  [ "$want_copy" = 1 ] && copy_to_clipboard "$sshcmd" && copied=1
+
+  say "reconnect to ${C_BOLD}$name${C_RESET} from your phone or any other machine"
+  printf '\n'
+  if [ "$want_qr" = 1 ]; then
+    local qr=""
+    [ -n "$uri" ] && qr="$(emit_qr "$uri")" || true
+    if [ -n "$qr" ]; then
+      step "point your phone's camera at the QR — one tap opens the live session"
+      printf '     %sworks with any ssh:// app: Termius · Blink · ConnectBot (Termux: use the line below)%s\n' "$C_DIM" "$C_RESET"
+      printf '\n%s\n\n' "$qr"
+    else
+      warn "no QR — install qrencode (brew install qrencode / apt install qrencode); the paths below still work"
+    fi
+  fi
+  step "1) Any SSH app — Android: Termux · iOS: Blink/Termius · Mac/Linux: built-in ssh"
+  printf '     %s%s%s\n' "$C_BOLD" "$sshcmd" "$C_RESET"
+  [ "$copied" = 1 ] && printf '     %s→ already on your clipboard (Universal Clipboard pastes it on a nearby iPhone/iPad)%s\n' \
+         "$C_DIM" "$C_RESET"
+  printf '     %svalid %sm (pass --expires MIN for longer) · lands straight in the live agent · detach: Ctrl-b d%s\n' \
+         "$C_DIM" "$expires" "$C_RESET"
+  printf '\n'
+  step "2) Full devflow — Android (Termux / UserLAnd Ubuntu) or another Mac/Linux"
+  printf '     %scurl -fsSL https://raw.githubusercontent.com/dalinkstone/devflow/main/install.sh | bash%s\n' "$C_DIM" "$C_RESET"
+  printf '     %sdaytona login && devflow attach %s%s   (also restarts it if stopped)\n' "$C_DIM" "$name" "$C_RESET"
+  printf '\n'
+  step "3) Just a browser — https://app.daytona.io → $name → open its Terminal"
+  printf '\n'
+  if [ -n "$sent_via" ]; then
+    ok "sent via ${C_BOLD}$sent_via${C_RESET} — it's already waiting on your phone"
+  fi
+  if [ -n "$outfile" ]; then
+    ok "reconnect pass saved: ${C_BOLD}$outfile${C_RESET} — AirDrop it later, park it in a synced folder, or print it"
+    printf '     %scontains the live token (chmod 600) — treat it like a password%s\n' "$C_DIM" "$C_RESET"
+    if [ "$want_open" = 1 ]; then
+      open_file "$outfile" || warn "couldn't auto-open $outfile"
+    fi
+  fi
+  if [ -z "$sent_via" ] && [ -z "$outfile" ]; then
+    step "phone not on you right now?  ${C_BOLD}devflow mobile --send${C_RESET} → push notification / password manager / Apple Notes ${C_DIM}(one-time: --setup-push)${C_RESET}"
+  fi
+  step "peek without attaching:  ${C_BOLD}devflow peek $name${C_RESET}"
 }
 
 cmd_exec() {
@@ -1452,13 +1808,23 @@ cmd_doctor() {
   echo
   printf '%s\n' "${C_BOLD}local tools${C_RESET}"
   local spec c fix
-  for spec in "daytona|brew install daytonaio/cli/daytona" "jq|brew install jq" "git|xcode-select --install / apt install git" "gh|brew install gh" "fzf|brew install fzf (optional: nicer pickers)"; do
+  for spec in "daytona|brew install daytonaio/cli/daytona" "jq|brew install jq" "git|xcode-select --install / apt install git" "gh|brew install gh" "fzf|brew install fzf (optional: nicer pickers)" "qrencode|brew install qrencode (optional: scan-to-phone QR in 'devflow mobile')"; do
     c="${spec%%|*}"; fix="${spec#*|}"
     if have_cmd "$c"; then check_row "$c" ok "$(command -v "$c")"
     else
-      case "$c" in fzf) check_row "$c" warn "missing — $fix" ;; *) check_row "$c" fail "missing — $fix" ;; esac
+      case "$c" in fzf|qrencode) check_row "$c" warn "missing — $fix" ;; *) check_row "$c" fail "missing — $fix" ;; esac
     fi
   done
+  local handoff=""
+  [ -n "${DEVFLOW_NTFY_TOPIC:-}" ] && handoff="push (ntfy)"
+  have_cmd op && handoff="${handoff:+$handoff · }1Password"
+  have_cmd bw && handoff="${handoff:+$handoff · }Bitwarden"
+  [ "$(uname 2>/dev/null)" = Darwin ] && have_cmd osascript && handoff="${handoff:+$handoff · }Apple Notes"
+  if [ -n "$handoff" ]; then
+    check_row "phone hand-off" ok "devflow mobile --send → $handoff"
+  else
+    check_row "phone hand-off" warn "none — run 'devflow mobile --setup-push' (any phone), or brew install 1password-cli"
+  fi
   echo
   printf '%s\n' "${C_BOLD}accounts${C_RESET}"
   if have_cmd daytona && dt_auth_check; then
@@ -1486,6 +1852,7 @@ cmd_doctor() {
   check_row "harness" ok "$DEVFLOW_HARNESS (auto → omc for claude, omx for codex)"
   check_row "resources" ok "${DEVFLOW_CPU}cpu / ${DEVFLOW_MEMORY}mb / ${DEVFLOW_DISK}gb"
   check_row "auto-stop" ok "${DEVFLOW_AUTO_STOP}m (0 = runs until 'devflow stop')"
+  [ -n "$DEVFLOW_AUTO_HANDOFF" ] && check_row "auto-handoff" ok "$DEVFLOW_AUTO_HANDOFF (every 'up' sends the reconnect line to your phone)"
   [ -n "$DEVFLOW_SNAPSHOT" ] && check_row "snapshot" ok "$DEVFLOW_SNAPSHOT"
   echo
   say "ready? try:  ${C_BOLD}devflow up${C_RESET}"
@@ -1498,7 +1865,7 @@ cmd_setup() {
 
   step "1/5 dependencies…"
   local missing="" c
-  for c in daytona jq git gh; do have_cmd "$c" || missing="$missing $c"; done
+  for c in daytona jq git gh qrencode; do have_cmd "$c" || missing="$missing $c"; done
   if [ -n "$missing" ]; then
     if have_cmd brew; then
       if confirm "install missing tools via Homebrew:$missing?"; then
@@ -1642,7 +2009,7 @@ ${C_BOLD}devflow up${C_RESET} [REPO] [flags] — create (or reattach to) a cloud
                       or get a picker of your GitHub repos
 
   -a, --agent A       claude | codex | both | none     (default: $DEVFLOW_AGENT)
-  -H, --harness H     multi-agent harness: auto | omc | omx | both | core
+  -H, --harness H     multi-agent harness: auto | omc | omx | both | core (none≡core)
                       (default: $DEVFLOW_HARNESS — auto matches the agent:
                       oh-my-claudecode for claude, oh-my-codex for codex;
                       core = devflow's built-in dv-engineer/designer/security)
@@ -1684,6 +2051,11 @@ ${C_BOLD}daily driving${C_RESET}
 ${C_BOLD}more${C_RESET}
   devflow ssh [NAME]            SSH in (lands in tmux; detach: Ctrl-b d)
   devflow ssh-command [NAME]    print a plain ssh command for any machine
+  devflow ssh-config [NAME]     managed ~/.ssh/config Host block — plain
+                                `ssh NAME`, VS Code/Cursor Remote-SSH, scp
+  devflow mobile [NAME]         hand the session to your phone — camera QR +
+                                ssh line; --send pushes it to the phone
+                                (ntfy notification / 1Password / Apple Notes)
   devflow exec NAME -- CMD      run a one-off command in a sandbox
   devflow token                 store a 1-year Claude subscription token
   devflow snapshot build        prebake a snapshot for instant starts
@@ -1708,6 +2080,8 @@ main() {
     attach|a|open)        cmd_attach "$@" ;;
     ssh)                  cmd_ssh "$@" ;;
     ssh-command|ssh-cmd)  cmd_ssh_command "$@" ;;
+    ssh-config|sshconfig) cmd_ssh_config "$@" ;;
+    mobile|phone|qr)      cmd_mobile "$@" ;;
     exec)                 cmd_exec "$@" ;;
     peek|watch)           cmd_peek "$@" ;;
     ls|list|ps)           cmd_ls "$@" ;;

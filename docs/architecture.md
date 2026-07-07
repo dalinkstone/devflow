@@ -17,7 +17,8 @@ user ──▶ bin/devflow (bash, single file)
 ```
 
 devflow deliberately has **no runtime dependency on the Daytona REST API**
-except one endpoint (`ssh-access`, used by `devflow ssh-command`); everything
+except one endpoint (`ssh-access`, used by `devflow ssh-command` and
+`devflow mobile`); everything
 else goes through the `daytona` CLI so auth/transport stay Daytona's problem.
 
 ## bin/devflow file map (one file, ordered sections)
@@ -113,7 +114,28 @@ All phases are safe to re-run. `devflow sync` re-uploads and runs only `auth`.
 - Tier 1/2 egress whitelist covers github.com, *.githubusercontent.com, npm,
   pypi, claude.ai, *.anthropic.com, *.openai.com, chatgpt.com.
 - Raw SSH: `POST /sandbox/{id}/ssh-access?expiresInMinutes=N` → token used as
-  the ssh **username** at `ssh.app.daytona.io:22` (that's `ssh-command`).
+  the ssh **username** at `ssh.app.daytona.io:22` (that's `ssh-command`, the
+  line `mobile` prints, and the `User` in the managed `~/.ssh/config` block
+  `ssh-config` writes — which is what makes plain `ssh NAME` and editor
+  Remote-SSH work). `mobile` also renders that token as an
+  `ssh://user@host` QR via local `qrencode` (optional dep, warn-and-continue
+  without it — phone cameras hand the URI to Termius/Blink/ConnectBot in one
+  tap) and best-effort copies the line to the clipboard (`pbcopy`/`wl-copy`/
+  `xclip`); `mobile --out` writes the same thing as a self-contained 0600
+  HTML pass (SVG QR) to AirDrop / park in a synced folder / print;
+  `mobile --send` hands the line to a channel that carries it to the phone
+  by itself: an ntfy push (opt-in `POST $DEVFLOW_NTFY_URL/$DEVFLOW_NTFY_TOPIC`,
+  default ntfy.sh, self-hostable; topic minted by `--setup-push`, stored in
+  secrets, topic-name-is-the-password model; `X-Click` carries the `ssh://`
+  URI so tapping the notification opens the SSH app; server caches ~12h) or
+  1Password / Bitwarden / Apple Notes through their local CLIs
+  (`op` / `bw` / `osascript`). `DEVFLOW_AUTO_HANDOFF` wires the same send
+  into the end of every `up` (best-effort, never blocks). The token never
+  leaves the machine except to Daytona itself — and whichever channel the
+  user explicitly points it at.
+  tmux auto-attach is wired into the sandbox's
+  `~/.profile`/`~/.bashrc`, so any interactive SSH login — CLI or raw token —
+  lands in the running agent; the client does nothing special.
 - Sandboxes are found/filtered via labels: `devflow=1`, `devflow.agent`,
   `devflow.repo`, `devflow.harness`.
 

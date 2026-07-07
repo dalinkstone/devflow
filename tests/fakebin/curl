@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Fake curl for devflow tests (only the Daytona ssh-access API is exercised).
+# Fake curl for devflow tests (Daytona ssh-access API + ntfy push endpoint).
 set -u
 [ -n "${FAKE_LOG:-}" ] && printf 'curl %s\n' "$*" >> "$FAKE_LOG"
 for a in "$@"; do
   case "$a" in
     *"/ssh-access"*)
       printf '{"token":"faketok123","sshCommand":"ssh faketok123@ssh.app.daytona.io"}'
+      exit 0 ;;
+    *"ntfy.sh/"*)
+      # ntfy push endpoint — accept silently (argv already logged above)
       exit 0 ;;
   esac
 done

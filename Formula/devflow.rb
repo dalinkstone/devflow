@@ -13,6 +13,7 @@ class Devflow < Formula
 
   depends_on "gh"
   depends_on "jq"
+  depends_on "qrencode"
 
   def install
     bin.install "bin/devflow"

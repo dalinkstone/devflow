@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Fake qrencode for devflow tests — logs argv and prints a deterministic
+# marker instead of a real QR. FAKE_QRENCODE_FAIL=1 simulates a broken
+# install (present on PATH but erroring), exercising the graceful fallback.
+set -u
+[ -n "${FAKE_LOG:-}" ] && printf 'qrencode %s\n' "$*" >> "$FAKE_LOG"
+[ -n "${FAKE_QRENCODE_FAIL:-}" ] && exit 1
+last=""
+for a in "$@"; do last="$a"; done
+printf 'FAKE-QR[%s]\n' "$last"

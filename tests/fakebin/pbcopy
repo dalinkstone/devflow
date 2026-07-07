@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Fake pbcopy for devflow tests — captures stdin so tests never touch the
+# real clipboard, and logs what would have been copied.
+set -u
+content="$(cat)"
+[ -n "${FAKE_LOG:-}" ] && printf 'pbcopy %s\n' "$content" >> "$FAKE_LOG"
+exit 0

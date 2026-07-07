@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Fake Bitwarden CLI for devflow tests — supports the exact template/encode/
+# create pipeline `mobile --send bw` uses; logs argv.
+set -u
+[ -n "${FAKE_LOG:-}" ] && printf 'bw %s\n' "$*" >> "$FAKE_LOG"
+case "$*" in
+  *"get template item"*) printf '{"type":1,"name":"","notes":null,"secureNote":null}' ;;
+  *encode*)              base64 ;;
+  *"create item"*)       : ;;
+esac
+exit 0

@@ -71,6 +71,7 @@ run_devflow() { # args… (stdin=/dev/null, captures stdout+stderr, sets RC/OUT)
       TERM=dumb NO_COLOR=1 \
       DEVFLOW_CONFIG_DIR="$T_CONFIG" \
       FAKE_LOG="$T_LOG" FAKE_STATE_DIR="$T_STATE" FAKE_EXEC_STYLE="$EXEC_STYLE" \
+      FAKE_QRENCODE_FAIL="${FAKE_QRENCODE_FAIL:-}" FAKE_OP_FAIL="${FAKE_OP_FAIL:-}" \
       CODEX_HOME="$T_HOME/.codex" \
       "$DEVFLOW" "$@" </dev/null 2>&1)"
   RC=$?
@@ -103,6 +104,7 @@ run_devflow doctor
 assert_rc "doctor exits 0" "$RC" 0
 assert_contains "doctor sees daytona" "$OUT" "daytona"
 assert_contains "doctor sees claude creds" "$OUT" "local credentials found"
+assert_contains "doctor shows phone hand-off channels" "$OUT" "phone hand-off"
 assert_contains "doctor sees codex auth" "$OUT" ".codex/auth.json present"
 
 # ===========================================================================
@@ -115,6 +117,7 @@ assert_rc "up exits 0" "$RC" 0
 assert_contains "up announces sandbox" "$OUT" "spinning up dv-alpha"
 assert_contains "up ran provision phases" "$OUT" "fake provision phase ran"
 assert_contains "up final hint" "$OUT" "devflow attach dv-alpha"
+assert_not_contains "up stays quiet without auto-handoff" "$OUT" "auto-handoff"
 
 assert_file_contains "create has name" "$T_LOG" "--name=dv-alpha"
 assert_file_contains "create disables auto-stop" "$T_LOG" "--auto-stop=0"
@@ -155,9 +158,9 @@ assert_contains "provisioner has claude install" "$PROVISION" "claude.ai/install
 assert_contains "provisioner has codex musl" "$PROVISION" "unknown-linux-musl"
 assert_contains "provisioner writes codex config" "$PROVISION" 'approval_policy = "never"'
 assert_contains "provisioner sets token env var" "$PROVISION" "CLAUDE_CODE_OAUTH_TOKEN"
-assert_contains "provisioner installs omc" "$PROVISION" "oh-my-claude-sisyphus@latest"
+assert_contains "provisioner installs omc" "$PROVISION" "oh-my-claude-sisyphus"
 assert_contains "provisioner runs omc setup headless" "$PROVISION" "omc setup --no-plugin --force --quiet"
-assert_contains "provisioner installs omx" "$PROVISION" "oh-my-codex@latest"
+assert_contains "provisioner installs omx" "$PROVISION" "oh-my-codex"
 assert_contains "provisioner runs omx setup" "$PROVISION" "omx setup --scope user --merge-agents --force"
 assert_contains "provisioner ships dv-engineer" "$PROVISION" "name: dv-engineer"
 assert_contains "provisioner ships dv-designer" "$PROVISION" "name: dv-designer"
@@ -200,6 +203,126 @@ assert_rc "ssh-command exits 0" "$RC" 0
 assert_contains "ssh-command prints ssh line" "$OUT" "ssh faketok123@ssh.app.daytona.io"
 assert_file_contains "ssh-command hit api" "$T_LOG" "/sandbox/id-dv-alpha/ssh-access?expiresInMinutes=1440"
 assert_file_contains "ssh-command used bearer key" "$T_LOG" "Bearer dtn_FAKEKEY"
+
+SSHCFG="$T_HOME/.ssh/config"
+
+run_devflow ssh-config dv-alpha
+assert_rc "ssh-config exits 0" "$RC" 0
+assert_contains "ssh-config announces the host" "$OUT" "Host dv-alpha"
+assert_file_contains "ssh-config wrote the Host block" "$SSHCFG" "Host dv-alpha"
+assert_file_contains "ssh-config wrote the gateway" "$SSHCFG" "HostName ssh.app.daytona.io"
+assert_file_contains "ssh-config wrote the tokened user" "$SSHCFG" "User faketok123"
+assert_contains "ssh-config file is 0600" "$(ls -l "$SSHCFG")" "-rw-------"
+
+printf 'Host keepme\n  HostName example.com\n' >> "$SSHCFG"
+run_devflow ssh-config dv-alpha --expires 60
+assert_rc "ssh-config refresh exits 0" "$RC" 0
+assert_eq "ssh-config is idempotent (one managed block)" "$(grep -c '>>> devflow dv-alpha >>>' "$SSHCFG")" "1"
+assert_file_contains "ssh-config refresh preserved user content" "$SSHCFG" "Host keepme"
+assert_file_contains "ssh-config refresh honored --expires" "$T_LOG" "ssh-access?expiresInMinutes=60"
+
+run_devflow ssh-config dv-alpha --remove
+assert_rc "ssh-config --remove exits 0" "$RC" 0
+assert_not_contains "--remove drops the managed block" "$(cat "$SSHCFG")" "devflow dv-alpha"
+assert_file_contains "--remove keeps user content" "$SSHCFG" "Host keepme"
+
+run_devflow mobile dv-alpha
+assert_rc "mobile exits 0" "$RC" 0
+assert_contains "mobile QRs the ssh:// URI (one-tap open on phones)" "$OUT" "FAKE-QR[ssh://faketok123@ssh.app.daytona.io]"
+assert_contains "mobile prints a ready ssh line" "$OUT" "ssh faketok123@ssh.app.daytona.io"
+assert_contains "mobile mentions the clipboard copy" "$OUT" "clipboard"
+assert_file_contains "mobile clipboard got the ssh line" "$T_LOG" "pbcopy ssh faketok123@ssh.app.daytona.io"
+assert_contains "mobile shows browser path" "$OUT" "app.daytona.io"
+assert_contains "mobile shows peek hint" "$OUT" "devflow peek dv-alpha"
+
+run_devflow mobile dv-alpha --expires 60
+assert_rc "mobile --expires exits 0" "$RC" 0
+assert_file_contains "mobile honors --expires" "$T_LOG" "ssh-access?expiresInMinutes=60"
+
+run_devflow mobile dv-alpha --no-qr --no-copy
+assert_rc "mobile --no-qr --no-copy exits 0" "$RC" 0
+assert_not_contains "--no-qr suppresses the QR" "$OUT" "FAKE-QR"
+assert_not_contains "--no-copy skips the clipboard" "$OUT" "clipboard"
+
+FAKE_QRENCODE_FAIL=1
+run_devflow mobile dv-alpha
+FAKE_QRENCODE_FAIL=""
+assert_rc "mobile survives a broken qrencode" "$RC" 0
+assert_contains "broken qrencode falls back to a hint" "$OUT" "install qrencode"
+assert_contains "broken qrencode still prints the ssh line" "$OUT" "ssh faketok123@ssh.app.daytona.io"
+
+run_devflow qr dv-alpha
+assert_rc "qr alias exits 0" "$RC" 0
+assert_contains "qr alias renders the QR" "$OUT" "FAKE-QR[ssh://faketok123@ssh.app.daytona.io]"
+
+run_devflow mobile dv-alpha --out pass.html --no-copy
+assert_rc "mobile --out exits 0" "$RC" 0
+assert_contains "mobile announces the saved pass" "$OUT" "reconnect pass saved"
+assert_file_contains "pass embeds the ssh line" "$T_CWD/pass.html" "ssh faketok123@ssh.app.daytona.io"
+assert_file_contains "pass embeds the QR svg" "$T_CWD/pass.html" "FAKE-QR[ssh://faketok123@ssh.app.daytona.io]"
+assert_file_contains "pass links the browser fallback" "$T_CWD/pass.html" "app.daytona.io"
+assert_contains "pass file is 0600" "$(ls -l "$T_CWD/pass.html" 2>/dev/null)" "-rw-------"
+
+run_devflow mobile dv-alpha --open
+assert_rc "--open without --out is rejected" "$RC" 1
+assert_contains "--open requires --out message" "$OUT" "--open requires --out"
+
+run_devflow mobile dv-alpha --send --no-qr --no-copy
+assert_rc "mobile --send auto exits 0" "$RC" 0
+assert_contains "--send auto lands in 1Password" "$OUT" "sent via 1Password"
+assert_file_contains "op got a Secure Note" "$T_LOG" "op item create --category Secure Note"
+assert_file_contains "op note carries the ssh line" "$T_LOG" "ssh faketok123@ssh.app.daytona.io"
+
+run_devflow mobile dv-alpha --send note --no-qr --no-copy
+assert_rc "--send note exits 0" "$RC" 0
+assert_contains "--send note lands in Apple Notes" "$OUT" "sent via Apple Notes"
+assert_file_contains "osascript makes a note" "$T_LOG" "make new note"
+assert_file_contains "note body carries the ssh line as html" "$T_LOG" "ssh faketok123@ssh.app.daytona.io<br>"
+
+run_devflow mobile dv-alpha --send bw --no-qr --no-copy
+assert_rc "--send bw exits 0" "$RC" 0
+assert_contains "--send bw lands in Bitwarden" "$OUT" "sent via Bitwarden"
+assert_file_contains "bw created an item" "$T_LOG" "bw --nointeraction create item"
+
+FAKE_OP_FAIL=1
+run_devflow mobile dv-alpha --send op --no-qr --no-copy
+FAKE_OP_FAIL=""
+assert_rc "--send op surfaces a failure" "$RC" 1
+assert_contains "--send op failure hints at signin" "$OUT" "op signin"
+
+run_devflow mobile dv-alpha --send push --no-qr --no-copy
+assert_rc "--send push before setup fails" "$RC" 1
+assert_contains "--send push points at setup" "$OUT" "devflow mobile --setup-push"
+
+run_devflow mobile --setup-push
+assert_rc "setup-push exits 0" "$RC" 0
+assert_contains "setup-push shows the subscribe url" "$OUT" "https://ntfy.sh/devflow-"
+assert_contains "setup-push renders a subscribe QR" "$OUT" "FAKE-QR[https://ntfy.sh/devflow-"
+assert_file_contains "setup-push stores the topic in secrets" "$T_CONFIG/secrets" "DEVFLOW_NTFY_TOPIC=devflow-"
+assert_file_contains "setup-push sent a test notification" "$T_LOG" "push channel works"
+
+run_devflow mobile --setup-push
+assert_rc "setup-push is idempotent" "$RC" 0
+assert_eq "setup-push keeps one topic" "$(grep -c 'DEVFLOW_NTFY_TOPIC=' "$T_CONFIG/secrets")" "1"
+
+run_devflow mobile dv-alpha --send push --no-qr --no-copy
+assert_rc "--send push exits 0" "$RC" 0
+assert_contains "--send push lands on ntfy" "$OUT" "sent via push (ntfy)"
+assert_file_contains "push carries a tap-to-open ssh:// click" "$T_LOG" "X-Click: ssh://faketok123@ssh.app.daytona.io"
+assert_file_contains "push body carries the ssh line" "$T_LOG" "ssh faketok123@ssh.app.daytona.io"
+
+run_devflow mobile dv-alpha --send --no-qr --no-copy
+assert_rc "--send auto with push configured exits 0" "$RC" 0
+assert_contains "--send auto now prefers push" "$OUT" "sent via push (ntfy)"
+
+run_devflow config set DEVFLOW_AUTO_HANDOFF push
+assert_rc "config set auto-handoff exits 0" "$RC" 0
+
+run_devflow up tester/beta --no-attach
+assert_rc "up with auto-handoff exits 0" "$RC" 0
+assert_contains "auto-handoff fires after up" "$OUT" "auto-handoff: reconnect line sent via push (ntfy)"
+assert_file_contains "auto-handoff pushed the new session" "$T_LOG" "devflow · dv-beta"
+run_devflow rm --force dv-beta   # keep the env's later rm/ls assertions honest
 
 run_devflow sync dv-alpha
 assert_rc "sync exits 0" "$RC" 0

@@ -106,6 +106,8 @@ devflow rm [NAME|--all]       delete
 devflow sync [NAME]           refresh subscription auth inside a sandbox
 devflow ssh [NAME]            plain SSH (still lands in tmux)
 devflow ssh-command [NAME]    print an `ssh token@ssh.app.daytona.io` line for machines without devflow
+devflow ssh-config [NAME]     managed ~/.ssh/config block: plain `ssh NAME` + VS Code/Cursor Remote-SSH
+devflow mobile [NAME]         hand the session to your phone: QR to camera-scan + ready ssh line
 devflow exec NAME -- CMD      one-off remote command
 devflow snapshot build        prebake a custom snapshot → sessions start in seconds
 devflow config set K V        defaults: DEVFLOW_AGENT, DEVFLOW_CPU/MEMORY/DISK, DEVFLOW_AUTO_STOP…
@@ -200,13 +202,56 @@ custom snapshot.
   (GitHub, npm/pip, Anthropic, OpenAI, …) — agents work fine, but arbitrary
   outbound hosts need Tier 3+.
 
-## From anywhere
+## From anywhere — including your phone
 
-Any machine with devflow + `daytona login` can `devflow attach` — state
-lives in the sandbox, not on your laptop. For a machine with only an ssh
-client, `devflow ssh-command` mints a tokenized `ssh
-<token>@ssh.app.daytona.io` line (default 24h validity). There's also a web
-terminal in the [Daytona dashboard](https://app.daytona.io) as a last resort.
+Start work on your laptop, close it, reconnect from a phone. Because tmux
+auto-attach lives in the sandbox's shell rc (not the client), **every** SSH
+login lands you back in the same running agent:
+
+```bash
+devflow up -m "fix the bug, open a PR" --no-attach   # laptop: start + walk away
+devflow mobile                                        # laptop: scan the QR with your phone
+```
+
+`devflow mobile` (alias: `devflow qr`) renders a QR code right in the
+terminal. Point your phone's camera at it and the session opens in your SSH
+app in one tap — the QR encodes a tokenized `ssh://` link, which Termius,
+Blink and ConnectBot all register. No emailing yourself tokens: the QR is
+generated locally by `qrencode` (a devflow brew dependency), so the token
+never touches a third-party service. The matching
+`ssh <token>@ssh.app.daytona.io` line is printed too — and auto-copied to
+your clipboard, so Universal Clipboard can paste it straight onto a nearby
+iPhone/iPad. Every path back in:
+
+- **any phone with an SSH app** — scan the QR (**Termius**/**Blink**/
+  **ConnectBot**). **Termux** has no `ssh://` handler — paste the printed
+  line there instead.
+- **phone with full devflow** — Termux or UserLAnd Ubuntu: `install.sh` +
+  `daytona login`, then `devflow attach`.
+- **another Mac/Linux** — paste the line, or install devflow + `daytona login`
+  for the richer client (it also restarts a stopped sandbox on `attach`).
+  `devflow ssh-config` goes further: a managed `~/.ssh/config` block so plain
+  `ssh dv-name`, **VS Code/Cursor Remote-SSH**, scp and rsync all just work.
+- **only a browser** — the web terminal in the
+  [Daytona dashboard](https://app.daytona.io), zero install.
+- **phone not on you right now** — `devflow mobile --send` delivers the line
+  to the phone by itself: a real **push notification** (open-source
+  [ntfy](https://ntfy.sh); one-time `--setup-push`, then it works from any
+  macOS/Linux laptop to any Android/iPhone — tapping the notification opens
+  the session in your SSH app), or your **1Password/Bitwarden** vault
+  (E2E-encrypted), or **Apple Notes** (Mac→iPhone). `--out pass.html` writes
+  a parkable HTML pass instead.
+
+Don't want to remember any of this? `devflow config set DEVFLOW_AUTO_HANDOFF
+push` — every `devflow up` then sends the reconnect line to your phone
+automatically, right after provisioning.
+
+Any machine with devflow + `daytona login` can `devflow attach` — state lives
+in the sandbox, not on your laptop. Minting the tokenized line/QR needs a
+Daytona API key, so run `devflow mobile` from a `daytona login`'d machine
+(the laptop) before you leave — `--expires 10080` mints a week-long token.
+Forgot entirely? Any browser + your Daytona login still gets you the
+dashboard web terminal.
 
 ## Faster starts
 

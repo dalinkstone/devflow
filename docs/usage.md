@@ -82,6 +82,7 @@ devflow up -m "fix the flaky login test, open a PR" --no-attach
 # …close your laptop…
 devflow peek          # later, from anywhere: is it done?
 devflow attach        # join the live session
+devflow mobile        # …or reconnect from your phone (see "Access paths")
 ```
 
 The agent keeps working while detached because the session lives in tmux
@@ -118,15 +119,131 @@ session still works (`--harness core` skips third-party entirely).
 ```bash
 devflow attach NAME        # daytona ssh + tmux auto-attach (primary)
 devflow ssh NAME           # same, explicit
+devflow mobile NAME        # phone hand-off: QR + every reconnect path (see below)
 devflow ssh-command NAME [--expires MIN]
                            # prints `ssh <token>@ssh.app.daytona.io` for
                            # machines with only an ssh client (default 24h)
+devflow ssh-config NAME [--expires MIN] [--remove]
+                           # managed ~/.ssh/config Host block: `ssh NAME`,
+                           # VS Code/Cursor Remote-SSH, scp/rsync — re-run
+                           # to refresh the token, --remove to clean up
 devflow exec NAME -- CMD   # one-off remote command (buffered output)
 devflow dashboard          # app.daytona.io (web terminal exists there too)
 ```
 
 From another machine: install devflow + `daytona login` (and that's all —
 attach/peek/stop need only Daytona auth).
+
+Why any of these land you in the live agent: the tmux auto-attach lives in the
+sandbox's `~/.profile`/`~/.bashrc`, not in the `devflow` client. So **every**
+interactive SSH login — `attach`, `ssh`, the raw `ssh <token>@…` line, or the
+dashboard web terminal — drops straight into the running `dv` tmux session and
+its agent. Detach with `Ctrl-b d`; the session keeps running.
+
+### Start on your laptop, finish from your phone
+
+The end-to-end flow — kick work off, close the laptop, reconnect from a phone
+or a second machine:
+
+```bash
+# 1. laptop: start the agent working and walk away
+devflow up -m "refactor the auth module, open a PR" --no-attach
+
+# 2. laptop, before you leave: put the session on your phone
+devflow mobile              # (alias: devflow qr; name optional with one sandbox)
+```
+
+`devflow mobile` renders a **QR code in the terminal** — point your phone's
+camera at it and the session opens in your SSH app in one tap. The QR encodes
+the tokenized session as an `ssh://` URI (Termius, Blink and ConnectBot all
+register that scheme) and is generated locally by `qrencode` (a devflow brew
+dependency; `apt install qrencode` elsewhere) — the token never touches a
+third-party service. The matching plain `ssh <token>@ssh.app.daytona.io` line
+is printed below the QR and auto-copied to your clipboard. Flags:
+`--expires 10080` mints a ~7-day token (default 24h), `--no-qr` / `--no-copy`
+opt out.
+
+| Device | How to get back in |
+|---|---|
+| **Android** | Point the camera (or Google Lens) at the QR → opens in **Termius**/**ConnectBot**. **Termux** has no `ssh://` handler — paste the printed line there instead. For the full CLI: Termux → `pkg install curl` → run devflow's `install.sh`, `daytona login`, `devflow attach`. A UserLAnd/Ubuntu shell works the same way. |
+| **iPhone/iPad** | Point the camera at the QR → one tap opens **Termius**/**Blink**. Or paste the line — the clipboard auto-copy plus Universal Clipboard means it's often already on the phone. |
+| **another Mac/Linux** | Paste the `ssh …` line into Terminal (it's on your clipboard) — or install devflow + `daytona login` + `devflow attach` for the richer client (peek, stop, restart-on-attach). For your editor: `devflow ssh-config NAME` → open the host in VS Code/Cursor Remote-SSH. |
+| **only a browser** | Open [app.daytona.io](https://app.daytona.io), pick the sandbox, open its Terminal. Zero install. |
+
+The QR / `ssh …` line needs nothing installed but an SSH app and works until
+the token expires. The full-devflow path is more capable (it restarts a
+stopped sandbox on `attach`, and gives you `peek`/`stop`/`ls`); it needs only
+`daytona login`, no re-auth of Claude/Codex. Either way you land in the same
+tmux agent that's been running the whole time.
+
+### No phone on you when you mint? Minted nothing at all?
+
+`devflow mobile --send` delivers the reconnect line to the phone through a
+channel that transports it on its own — nothing to scan, nothing to carry.
+Auto picks the first configured of: **push → 1Password → Bitwarden → Apple
+Notes**; force one with `--send push|op|bw|note`. `devflow doctor` shows
+which channels you have.
+
+- **Push notification (works for *every* laptop × phone combo)** — one-time
+  setup: `devflow mobile --setup-push` mints a private high-entropy topic
+  and shows a subscribe QR; install the free, open-source
+  [ntfy](https://ntfy.sh) app (Android: Play/F-Droid · iPhone: App Store)
+  and subscribe. From then on, `devflow mobile --send` from **any** macOS or
+  Linux machine raises a real push notification on the phone, and **tapping
+  it opens the session straight in your SSH app** — the notification's click
+  action carries the `ssh://` link, so consumption is programmatic, not
+  copy-paste. Trade-off to know: the line transits (and is cached ~12h by)
+  the push server. The topic name is the password (ntfy's documented model),
+  the token self-expires, and you can self-host:
+  `devflow config set DEVFLOW_NTFY_URL https://ntfy.example.com`.
+- **Password vault (also every combo, E2E-encrypted)** — **1Password**
+  (`op` CLI) or **Bitwarden** (`bw` CLI + `BW_SESSION`): the line lands as a
+  Secure Note in the vault app on any phone. The most secrets-appropriate
+  channel — use it if you already run a vault; the CLIs exist for macOS and
+  Linux alike.
+- **Apple Notes** — macOS laptop + iPhone only (iCloud carries it). Zero
+  install, but consumption is manual (open Notes, copy/tap). The
+  convenience corner, not the general answer.
+- **Park a pass file** — `devflow mobile --out pass.html` (add `--open`)
+  writes a self-contained HTML pass (SVG QR + line + expiry): AirDrop it
+  later or drop it in a folder your phone syncs. `chmod 600`, embeds the
+  live token.
+- **Mint nothing, use your logins** — from any browser on any device:
+  [app.daytona.io](https://app.daytona.io) → sandbox → Terminal (just your
+  Daytona login). Or any machine with devflow installed: `daytona login` +
+  `devflow attach`. Both need zero preparation on the laptop.
+
+Which channels cover which laptop/phone pair:
+
+| laptop \ phone | Android | iPhone |
+|---|---|---|
+| **macOS** | push · vault · QR-scan | push · vault · Apple Notes · QR-scan · clipboard |
+| **Ubuntu/Linux** | push · vault · QR-scan | push · vault · QR-scan |
+
+(QR-scan needs the phone in hand at mint time; everything else doesn't. The
+browser dashboard works from every cell with zero prep.)
+
+And to make forgetting impossible — **auto-handoff**:
+
+```bash
+devflow config set DEVFLOW_AUTO_HANDOFF push   # or: auto | op | bw | note
+```
+
+Every `devflow up` then mints a token and sends the reconnect line through
+that channel automatically, right after provisioning. Kick off a session and
+walk away — it's already on your phone, every time, without running
+`devflow mobile` at all. Best-effort: if minting or sending fails it warns
+and the session comes up normally.
+
+Tip: mint once with a long validity (`--expires 10080` = a week) and save the
+`ssh …` line as a host in an SSH app that syncs across your devices (Termius
+does) — a standing door back in from everything you own, no laptop needed.
+Longer validity means a bigger window if the token leaks; pick your trade-off.
+
+Note: `devflow mobile` / `ssh-command` mint the token from your Daytona API
+key, so run them from a machine that has `daytona login` (e.g. the laptop
+before you leave). On a phone with only an SSH app, scan a QR you minted
+earlier; on a phone with full devflow, just `devflow attach`.
 
 ## Auth upkeep
 
@@ -148,8 +265,11 @@ Keys (file: `~/.config/devflow/config`, env vars override the file):
 `DEVFLOW_AGENT`, `DEVFLOW_HARNESS`, `DEVFLOW_CPU`, `DEVFLOW_MEMORY` (MB),
 `DEVFLOW_DISK` (GB), `DEVFLOW_AUTO_STOP` (min), `DEVFLOW_TARGET` (us|eu),
 `DEVFLOW_SNAPSHOT`, `DEVFLOW_CLAUDE_AUTH` (auto|token|creds),
-`DEVFLOW_WORKROOT`, `DEVFLOW_EXEC_STYLE` (auto-probed; leave alone).
-Secret: `DEVFLOW_CLAUDE_TOKEN` in `~/.config/devflow/secrets` (0600).
+`DEVFLOW_AUTO_HANDOFF` (off|auto|push|op|bw|note — send the reconnect line
+to your phone after every `up`), `DEVFLOW_NTFY_URL` (push server,
+self-hostable), `DEVFLOW_WORKROOT`, `DEVFLOW_EXEC_STYLE` (auto-probed;
+leave alone). Secrets in `~/.config/devflow/secrets` (0600):
+`DEVFLOW_CLAUDE_TOKEN`, `DEVFLOW_NTFY_TOPIC`.
 
 ## Faster starts
 

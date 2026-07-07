@@ -32,6 +32,14 @@ case "$OS" in
   *) die "unsupported OS: $OS (devflow needs macOS or Linux)" ;;
 esac
 
+# Termux (Android): bionic libc — prefer its own pkg repo over generic
+# linux binaries, and never assume sudo.
+IS_TERMUX=0
+case "${PREFIX:-}" in *com.termux*) IS_TERMUX=1 ;; esac
+if [ "$IS_TERMUX" = 1 ] && ! have curl; then
+  die "Termux needs curl first:  pkg install curl"
+fi
+
 mkdir -p "$INSTALL_DIR"
 
 bold "devflow installer"
@@ -62,6 +70,7 @@ install_daytona() {
 }
 
 install_jq() {
+  if [ "$IS_TERMUX" = 1 ]; then pkg install -y jq && return 0; fi
   if have brew; then brew install jq && return 0; fi
   local jq_arch
   case "$ARCH" in arm64) jq_arch=arm64 ;; *) jq_arch=amd64 ;; esac
@@ -74,6 +83,7 @@ install_jq() {
 }
 
 install_gh() {
+  if [ "$IS_TERMUX" = 1 ]; then pkg install -y gh && return 0; fi
   if have brew; then brew install gh && return 0; fi
   local v=2.96.0 t
   t="$(mktemp -d)"
@@ -97,6 +107,16 @@ if have daytona; then ok "daytona already installed"; else install_daytona && ok
 if have jq;      then ok "jq already installed";      else install_jq && ok "jq installed"           || warn "could not install jq"; fi
 if have gh;      then ok "gh already installed";      else install_gh && ok "gh installed"           || warn "could not install gh — see https://cli.github.com"; fi
 if have fzf;     then ok "fzf found (nicer pickers)"; else info "optional: install fzf for fuzzy pickers"; fi
+if have qrencode; then ok "qrencode found (devflow mobile QR)"; else
+  case "$OS" in
+    darwin) info "optional: brew install qrencode — scan-to-phone QR in 'devflow mobile'" ;;
+    *)      [ "$IS_TERMUX" = 1 ] && info "optional: pkg install qrencode — scan-to-phone QR in 'devflow mobile'" \
+                                 || info "optional: apt/dnf install qrencode — scan-to-phone QR in 'devflow mobile'" ;;
+  esac
+fi
+if [ "$IS_TERMUX" = 1 ] && ! have ssh; then
+  info "Termux tip: pkg install openssh — needed for 'devflow attach'/'ssh'"
+fi
 
 # --- PATH check --------------------------------------------------------------
 case ":$PATH:" in

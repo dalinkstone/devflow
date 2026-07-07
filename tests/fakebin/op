@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Fake 1Password CLI for devflow tests — logs argv, creates nothing.
+# FAKE_OP_FAIL=1 simulates a signed-out CLI (nonzero exit).
+set -u
+[ -n "${FAKE_LOG:-}" ] && printf 'op %s\n' "$*" >> "$FAKE_LOG"
+[ -n "${FAKE_OP_FAIL:-}" ] && exit 1
+exit 0

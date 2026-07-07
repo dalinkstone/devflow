@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Fake osascript for devflow tests — logs argv and the AppleScript from
+# stdin, touches no real app.
+set -u
+script="$(cat)"
+[ -n "${FAKE_LOG:-}" ] && { printf 'osascript %s\n' "$*"; printf '%s\n' "$script"; } >> "$FAKE_LOG"
+exit 0
