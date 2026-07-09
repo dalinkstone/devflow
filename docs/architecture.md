@@ -100,13 +100,25 @@ All phases are safe to re-run. `devflow sync` re-uploads and runs only `auth`.
   if missing; run by attach after restarts.
 - `dv-statusline` — Claude Code statusLine command (sandbox · model · dir ·
   branch · ctx%). oh-my-claudecode's HUD replaces it when installed.
+- `dv-script` / `dv-script-exec` — pushed by `up --script FILE`: run the
+  user's script in tmux window `script` (cwd = workdir), tee to
+  `~/.devflow/script.log`, append `[devflow script exit: N]`, keep the window
+  open. `up --with-daytona` additionally forwards the `daytona` CLI
+  (version-matched), the API key as a 0600 `~/.config/daytona/config.json`,
+  devflow itself (`$0` pushed verbatim), and jq — so in-sandbox scripts can
+  create/manage *sibling* sandboxes via the Daytona API.
 
 ## Daytona facts devflow relies on (verified 2026-07)
 
 - Default image: user `daytona` + passwordless sudo, git/curl/python/node
   (node via **nvm**, invisible to non-interactive shells), **no tmux**.
-- `create` flags use `--flag=value` form (cobra rejects bare negative values);
-  `--memory` is **MB** on create but **GB** on `snapshot create`.
+- `create` flags use `--flag=value` form (cobra rejects bare negative values).
+- Resources are a property of the **snapshot**, not the create call: the API
+  (≥0.194) rejects `--cpu/--memory/--disk` whenever a snapshot is involved,
+  and the default image is a snapshot too. devflow sizes sandboxes by picking
+  one of Daytona's fixed-size snapshots (`daytona-small|medium|large` =
+  1cpu/1gb/3gb · 2cpu/4gb/8gb · 4cpu/8gb/10gb). `snapshot create` still takes
+  resources (its `--memory` is **GB**); `info` reports memory/disk in GB.
 - Auto-stop default is 15 min and its timer **ignores running processes**
   (only SSH/API traffic resets it) → devflow defaults to `--auto-stop=0`.
 - stop kills processes, preserves disk; archive (default after 7d stopped)

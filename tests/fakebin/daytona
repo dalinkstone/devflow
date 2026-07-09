@@ -24,7 +24,7 @@ case "$cmd" in
     ;;
 
   create)
-    name=""; labels="{}"; cpu=1; memory=1024; disk=3; auto_stop=15; snapshot=""; target=""
+    name=""; labels="{}"; cpu=""; memory=""; disk=""; auto_stop=15; snapshot=""; target=""
     while [ $# -gt 0 ]; do
       case "$1" in
         --name=*) name="${1#--name=}"; shift ;;
@@ -41,6 +41,19 @@ case "$cmd" in
       esac
     done
     [ -n "$name" ] || { echo "create: missing --name" >&2; exit 1; }
+    # real API (v0.194+): resources are rejected whenever a snapshot backs the
+    # sandbox — and the default image is a snapshot too
+    if [ -n "$cpu$memory$disk" ]; then
+      echo "FATA Bad Request: Cannot specify Sandbox resources when using a snapshot" >&2
+      exit 1
+    fi
+    case "$snapshot" in                    # sizes live in the snapshot; memory/disk in GB
+      daytona-small)  cpu=1; memory=1; disk=3 ;;
+      daytona-medium) cpu=2; memory=4; disk=8 ;;
+      daytona-large)  cpu=4; memory=8; disk=10 ;;
+      "")             cpu=1; memory=1; disk=3 ;;   # default snapshot = small
+      *)              cpu=2; memory=4; disk=8 ;;   # custom snapshot: whatever it was built with
+    esac
     jq -n --arg name "$name" --argjson labels "$labels" \
           --argjson cpu "$cpu" --argjson memory "$memory" --argjson disk "$disk" \
           --arg autoStop "$auto_stop" --arg snapshot "$snapshot" --arg target "$target" \
@@ -61,6 +74,7 @@ case "$cmd" in
     ;;
 
   list)
+    [ "${FAKE_UNAUTH:-0}" = "1" ] && { echo "Unauthorized" >&2; exit 1; }
     files=$(ls "$FAKE_STATE_DIR"/*.json 2>/dev/null || true)
     if [ -z "$files" ]; then echo "[]"; else jq -s '.' "$FAKE_STATE_DIR"/*.json; fi
     exit 0

@@ -16,7 +16,7 @@ t_ok()   { TESTN=$((TESTN+1)); PASS=$((PASS+1)); printf 'ok %d - %s\n' "$TESTN" 
 t_fail() { TESTN=$((TESTN+1)); FAIL=$((FAIL+1)); printf 'not ok %d - %s\n' "$TESTN" "$1"; [ -n "${2:-}" ] && printf '    # %s\n' "$2"; }
 
 assert_contains() { # NAME HAYSTACK NEEDLE
-  if printf '%s' "$2" | grep -qF -- "$3"; then
+  if printf '%s' "$2" 2>/dev/null | grep -qF -- "$3"; then
     t_ok "$1"
   else
     t_fail "$1" "missing: $3 | got: $(printf '%s' "$2" | tr '\n' ' ' | head -c 200)"
@@ -121,9 +121,11 @@ assert_not_contains "up stays quiet without auto-handoff" "$OUT" "auto-handoff"
 
 assert_file_contains "create has name" "$T_LOG" "--name=dv-alpha"
 assert_file_contains "create disables auto-stop" "$T_LOG" "--auto-stop=0"
-assert_file_contains "create default cpu" "$T_LOG" "--cpu=2"
-assert_file_contains "create default memory" "$T_LOG" "--memory=4096"
-assert_file_contains "create default disk" "$T_LOG" "--disk=10"
+assert_contains "up shows the default size" "$OUT" "size=medium (2cpu/4gb/8gb)"
+assert_file_contains "create sizes via the medium snapshot" "$T_LOG" "--snapshot=daytona-medium"
+assert_not_contains "create sends no raw cpu (API rejects it)" "$(cat "$T_LOG")" "--cpu="
+assert_not_contains "create sends no raw memory" "$(cat "$T_LOG")" "--memory="
+assert_not_contains "create sends no raw disk" "$(cat "$T_LOG")" "--disk="
 assert_file_contains "create labels devflow" "$T_LOG" "--label devflow=1"
 assert_file_contains "create labels agent" "$T_LOG" "--label devflow.agent=claude"
 assert_file_contains "create labels repo" "$T_LOG" "--label devflow.repo=tester/alpha"
@@ -175,12 +177,13 @@ assert_rc "ls exits 0" "$RC" 0
 assert_contains "ls shows sandbox" "$OUT" "dv-alpha"
 assert_contains "ls shows state" "$OUT" "started"
 assert_contains "ls shows repo" "$OUT" "tester/alpha"
-assert_contains "ls shows resources" "$OUT" "2c/4096m"
+assert_contains "ls shows resources" "$OUT" "2c/4g"
 
 run_devflow up tester/alpha --no-attach
 assert_rc "up on existing exits 0" "$RC" 0
-assert_contains "up on existing attaches" "$OUT" "already exists"
-assert_contains "up on existing reaches ssh" "$OUT" "FAKE-SSH dv-alpha"
+assert_contains "up on existing detects it" "$OUT" "already exists"
+assert_not_contains "up on existing honors --no-attach (no ssh)" "$OUT" "FAKE-SSH"
+assert_contains "up on existing prints the attach hint" "$OUT" "attach anytime"
 
 run_devflow peek
 assert_rc "peek (auto-resolve) exits 0" "$RC" 0
@@ -411,7 +414,122 @@ assert_rc "both agents up exits 0" "$RC" 0
 assert_file_contains "both agents get both harnesses" "$T_LOG" "DV_HARNESS='both'"
 
 # ===========================================================================
-echo "# 8..payload self-checks"
+echo "# 8..sandbox sizes (Daytona fixed-size snapshot classes)"
+# ===========================================================================
+fresh_env
+
+run_devflow up tester/gamma --size small --no-attach
+assert_rc "--size small exits 0" "$RC" 0
+assert_file_contains "--size small uses the small snapshot" "$T_LOG" "--snapshot=daytona-small"
+
+run_devflow up tester/delta --cpu 4 --memory 8192 --disk 10 --no-attach
+assert_rc "legacy resource flags still work" "$RC" 0
+assert_contains "legacy flags announce the size mapping" "$OUT" "map to --size large"
+assert_file_contains "legacy flags map to the large snapshot" "$T_LOG" "--snapshot=daytona-large"
+assert_not_contains "legacy flags never reach daytona raw" "$(cat "$T_LOG")" "--cpu="
+
+run_devflow up tester/epsilon --size huge --no-attach
+assert_rc "invalid size rejected" "$RC" 1
+assert_contains "invalid size message" "$OUT" "invalid --size"
+
+run_devflow config set DEVFLOW_MEMORY 8192
+run_devflow up tester/eta --no-attach
+assert_rc "legacy config memory up exits 0" "$RC" 0
+assert_file_contains "legacy config maps to the large snapshot" "$T_LOG" "--snapshot=daytona-large"
+
+run_devflow config set DEVFLOW_SIZE small
+run_devflow up tester/theta --no-attach
+assert_rc "config size up exits 0" "$RC" 0
+assert_file_contains "DEVFLOW_SIZE beats legacy config" "$T_LOG" "--snapshot=daytona-small"
+
+run_devflow config set DEVFLOW_SNAPSHOT custom-snap
+run_devflow up tester/zeta --size large --no-attach
+assert_rc "custom snapshot up exits 0" "$RC" 0
+assert_file_contains "custom snapshot passed through" "$T_LOG" "--snapshot=custom-snap"
+assert_contains "custom snapshot ignores --size" "$OUT" "has its size baked in"
+
+# ===========================================================================
+echo "# 9..custom snapshot build"
+# ===========================================================================
+fresh_env
+
+run_devflow snapshot build --size large
+assert_rc "snapshot build exits 0" "$RC" 0
+assert_file_contains "snapshot build size-suffixed name" "$T_LOG" "snapshot create devflow-base-"
+assert_file_contains "snapshot build bakes large cpu" "$T_LOG" "--cpu=4"
+assert_file_contains "snapshot build memory is GB" "$T_LOG" "--memory=8"
+assert_file_contains "snapshot build bakes large disk" "$T_LOG" "--disk=10"
+assert_file_contains "snapshot build set as default" "$T_CONFIG/config" "DEVFLOW_SNAPSHOT=devflow-base-"
+assert_contains "snapshot build config name carries the size" "$(cat "$T_CONFIG/config")" "-large"
+
+run_devflow up tester/iota --no-attach
+assert_rc "up after snapshot build exits 0" "$RC" 0
+assert_file_contains "up creates from the built snapshot" "$T_LOG" "--snapshot=devflow-base-"
+
+run_devflow snapshot build --size huge
+assert_rc "snapshot build rejects bad size" "$RC" 1
+assert_contains "snapshot build bad size message" "$OUT" "invalid size"
+
+# ===========================================================================
+echo "# 10..run a script in the sandbox (+ --with-daytona)"
+# ===========================================================================
+fresh_env
+
+printf '#!/usr/bin/env bash\necho repro-ran\n' > "$T_CWD/repro.sh"
+
+run_devflow up tester/kappa --script repro.sh --no-attach
+assert_rc "up --script exits 0" "$RC" 0
+assert_contains "script launch announced" "$OUT" "script running"
+assert_contains "script peek hint" "$OUT" "peek dv-kappa -w script"
+assert_eq "script content uploaded intact" "$(extract_pushed_file /tmp/.dv-user-script)" "$(cat "$T_CWD/repro.sh")"
+SCRIPT_LAUNCH="$(extract_pushed_file /tmp/.dv-script)"
+assert_contains "launcher opens tmux window 'script'" "$SCRIPT_LAUNCH" "new-window -d -t dv -n script"
+SCRIPT_EXEC="$(extract_pushed_file /tmp/.dv-script-exec)"
+assert_contains "runner tees to the log" "$SCRIPT_EXEC" "script.log"
+assert_file_contains "launcher invoked in sandbox" "$T_LOG" "dv-script"
+
+run_devflow up tester/kappa --script repro.sh --no-attach
+assert_rc "script rerun on existing sandbox exits 0" "$RC" 0
+assert_contains "script reruns on the existing sandbox" "$OUT" "script running"
+assert_not_contains "script rerun honors --no-attach" "$OUT" "FAKE-SSH"
+
+printf 'echo positional\n' > "$T_CWD/positional.sh"
+run_devflow up positional.sh --no-attach
+assert_rc "positional script file exits 0" "$RC" 0
+assert_contains "positional file treated as script" "$OUT" "script running"
+assert_eq "positional script uploaded" "$(extract_pushed_file /tmp/.dv-user-script)" "$(cat "$T_CWD/positional.sh")"
+
+run_devflow up tester/kappa --script nope.sh --no-attach
+assert_rc "missing script rejected" "$RC" 1
+assert_contains "missing script message" "$OUT" "script not found"
+
+run_devflow up tester/lambda --with-daytona --no-attach
+assert_rc "up --with-daytona exits 0" "$RC" 0
+assert_contains "forwarding announced" "$OUT" "forwarding Daytona control"
+assert_contains "sibling-sandbox caveat shown" "$OUT" "siblings"
+DTCONF="$(extract_pushed_file /tmp/.dv-daytona-config)"
+assert_contains "forwarded config carries the api key" "$DTCONF" "dtn_FAKEKEY"
+assert_contains "forwarded config carries the api url" "$DTCONF" "fake.daytona.local"
+assert_contains "devflow itself pushed into the sandbox" "$(extract_pushed_file /tmp/.dv-devflow)" "devflow — your agentic cloud dev environment"
+assert_file_contains "daytona cli install targeted" "$T_LOG" "daytona-linux-amd64"
+
+run_devflow peek dv-lambda -w script
+assert_rc "peek -w exits 0" "$RC" 0
+assert_file_contains "peek -w targets the requested window" "$T_LOG" "dv:script"
+
+# browser login (no api key, OAuth token only) → devflow mints + caches a key
+BROWSER_CFG='{"activeProfile":"initial","profiles":[{"id":"initial","name":"initial","api":{"url":"https://fake.daytona.local/api","key":null,"token":{"accessToken":"FAKE_OAUTH"}},"activeOrganizationId":"org-123"}]}'
+printf '%s' "$BROWSER_CFG" > "$T_HOME/Library/Application Support/daytona/config.json"
+printf '%s' "$BROWSER_CFG" > "$T_HOME/.config/daytona/config.json"
+run_devflow up tester/mu --with-daytona --no-attach
+assert_rc "with-daytona (browser login) exits 0" "$RC" 0
+assert_contains "mint announced" "$OUT" "minted Daytona API key"
+assert_file_contains "minted key cached in secrets" "$T_CONFIG/secrets" "dtn_MINTEDFAKE"
+assert_contains "sandbox got the minted key" "$(extract_pushed_file /tmp/.dv-daytona-config)" "dtn_MINTEDFAKE"
+assert_contains "sandbox config carries the org" "$(extract_pushed_file /tmp/.dv-daytona-config)" "org-123"
+
+# ===========================================================================
+echo "# 11..payload self-checks"
 # ===========================================================================
 PROV="$("$DEVFLOW" __provision-script)"
 printf '%s\n' "$PROV" > "$WORK/prov.sh"
@@ -424,6 +542,11 @@ assert_contains "provision autotmux marker" "$PROV" "autotmux"
 DOCKERFILE="$("$DEVFLOW" __dockerfile)"
 assert_contains "dockerfile non-root user" "$DOCKERFILE" "USER daytona"
 assert_contains "dockerfile installs tmux" "$DOCKERFILE" "tmux"
+assert_contains "dockerfile installs go" "$DOCKERFILE" "go.dev/dl/go"
+assert_contains "dockerfile installs bun" "$DOCKERFILE" "bun.sh/install"
+assert_contains "dockerfile installs uv" "$DOCKERFILE" "astral.sh/uv"
+assert_contains "dockerfile installs build tools" "$DOCKERFILE" "build-essential"
+assert_contains "dockerfile links node for non-interactive shells" "$DOCKERFILE" '.local/bin/node'
 
 # ===========================================================================
 printf '\n# results: %d passed, %d failed, %d total\n' "$PASS" "$FAIL" "$TESTN"

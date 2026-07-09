@@ -67,7 +67,10 @@ All green before every commit. CI runs the same three on push/PR
 | `omx setup` writes `.omx` state into **cwd** | provisioner does `cd "$HOME"` at start — keep it |
 | `daytona exec` buffers all output | keep provisioning phased; print progress from the local side |
 | Daytona auto-stop ignores running processes | never lower the `--auto-stop=0` default |
+| Daytona API ≥0.194 rejects `create --cpu/--memory/--disk` whenever a snapshot is involved — and the default image is a snapshot | size via the fixed snapshots `daytona-small\|medium\|large` (`--size`); resources only on `snapshot create`. (A `create --class` flag exists in unreleased CLI docs only — switch when it ships. `--sandbox-class` is a different axis: container\|linux-vm\|android.) |
 | claude refuses `--dangerously-skip-permissions` as root | dv-agent falls back to `--permission-mode acceptEdits` |
+| the sandbox image ships a `daytona` binary that is the **in-sandbox daemon** (terminal/ssh/toolbox servers), not the CLI — `command -v daytona` inside a sandbox finds it and running it spews daemon logs | `--with-daytona` installs the real CLI at `~/.local/bin/daytona` unconditionally (shadows the daemon on PATH) and sanity-checks `daytona version` says "Daytona CLI" |
+| the CLI refuses ALL `organization` subcommands under api-key auth ("reauthenticate with browser") — api-key is exactly how sandboxes and CI authenticate | `dt_auth_check` probes with `daytona list`, which works under both auth modes |
 | macOS runners lack shellcheck | CI installs it via brew on macOS |
 | GitHub tarball sha | always compute from the **downloaded** tag tarball, not local `git archive` |
 

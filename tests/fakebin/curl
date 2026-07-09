@@ -7,6 +7,12 @@ for a in "$@"; do
     *"/ssh-access"*)
       printf '{"token":"faketok123","sshCommand":"ssh faketok123@ssh.app.daytona.io"}'
       exit 0 ;;
+    *"/api-keys"*)
+      printf '{"name":"devflow-sandboxes","value":"dtn_MINTEDFAKE"}'
+      exit 0 ;;
+    *"/sandbox"*)
+      # key-validation probe (GET /sandbox) — accept
+      exit 0 ;;
     *"ntfy.sh/"*)
       # ntfy push endpoint — accept silently (argv already logged above)
       exit 0 ;;

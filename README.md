@@ -8,7 +8,7 @@ from any machine later. It just keeps working.
 
 ```console
 $ devflow up dalinkstone/myapp -m "add rate limiting to the API" --no-attach
-devflow spinning up dv-myapp  agent=claude repo=dalinkstone/myapp 2cpu/4096mb/10gb auto-stop=0m
+devflow spinning up dv-myapp  agent=claude repo=dalinkstone/myapp size=medium (2cpu/4gb/8gb) auto-stop=0m
 ✓ Claude Code: long-lived subscription token
 ✓ Codex: ChatGPT sign-in will be copied
 ✓ GitHub: gh token will be forwarded
@@ -109,8 +109,11 @@ devflow ssh-command [NAME]    print an `ssh token@ssh.app.daytona.io` line for m
 devflow ssh-config [NAME]     managed ~/.ssh/config block: plain `ssh NAME` + VS Code/Cursor Remote-SSH
 devflow mobile [NAME]         hand the session to your phone: QR to camera-scan + ready ssh line
 devflow exec NAME -- CMD      one-off remote command
-devflow snapshot build        prebake a custom snapshot → sessions start in seconds
-devflow config set K V        defaults: DEVFLOW_AGENT, DEVFLOW_CPU/MEMORY/DISK, DEVFLOW_AUTO_STOP…
+devflow up repro.sh           run a local script in the sandbox (tmux window
+                              'script'; add --with-daytona and the script can
+                              spin up sibling sandboxes on your account)
+devflow snapshot build        prebake a custom snapshot (+go/bun/uv) → instant starts
+devflow config set K V        defaults: DEVFLOW_AGENT, DEVFLOW_SIZE, DEVFLOW_AUTO_STOP…
 ```
 
 `devflow up --agent codex` runs Codex instead of Claude; `--agent both` gives
@@ -172,8 +175,8 @@ custom snapshot.
 ## Cost & lifecycle
 
 - Daytona bills per use (~$0.05/vCPU-hr + RAM/disk); new accounts get **$200
-  free**. A default 2-cpu/4GB sandbox costs roughly **$0.13/hour while
-  running**.
+  free**. The default `medium` sandbox (2cpu/4GB — `--size small|medium|large`
+  picks another) costs roughly **$0.13/hour while running**.
 - devflow creates sandboxes with **auto-stop disabled** by default — that's
   the whole point (Daytona's default 15-minute auto-stop kills sessions even
   while the agent is working, because only SSH/API traffic resets the timer).

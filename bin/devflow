@@ -23,13 +23,14 @@ SECRETS_FILE="$CONFIG_DIR/secrets"
 
 GH_PIN_VERSION="2.96.0"          # fallback for in-sandbox gh install
 CODEX_PIN_TAG="rust-v0.142.5"    # fallback for in-sandbox codex install
+DT_PIN_VERSION="0.194.0"         # fallback for in-sandbox daytona install (--with-daytona)
 
-_CONFIG_KEYS="DEVFLOW_AGENT DEVFLOW_CPU DEVFLOW_MEMORY DEVFLOW_DISK DEVFLOW_AUTO_STOP DEVFLOW_TARGET DEVFLOW_SNAPSHOT DEVFLOW_CLAUDE_AUTH DEVFLOW_EXEC_STYLE DEVFLOW_WORKROOT DEVFLOW_HARNESS DEVFLOW_NTFY_URL DEVFLOW_NTFY_TOPIC DEVFLOW_AUTO_HANDOFF"
+_CONFIG_KEYS="DEVFLOW_AGENT DEVFLOW_SIZE DEVFLOW_CPU DEVFLOW_MEMORY DEVFLOW_DISK DEVFLOW_AUTO_STOP DEVFLOW_TARGET DEVFLOW_SNAPSHOT DEVFLOW_CLAUDE_AUTH DEVFLOW_EXEC_STYLE DEVFLOW_WORKROOT DEVFLOW_HARNESS DEVFLOW_NTFY_URL DEVFLOW_NTFY_TOPIC DEVFLOW_AUTO_HANDOFF"
 
 load_config() {
   # 1) preserve values that came from the caller's environment
   local k v _envsaved=""
-  for k in $_CONFIG_KEYS DEVFLOW_CLAUDE_TOKEN; do
+  for k in $_CONFIG_KEYS DEVFLOW_CLAUDE_TOKEN DEVFLOW_DAYTONA_SANDBOX_KEY; do
     eval "v=\${$k-__devflow_unset__}"
     if [ "$v" != "__devflow_unset__" ]; then
       _envsaved="$_envsaved $k=$(printf '%q' "$v")"
@@ -44,9 +45,10 @@ load_config() {
   [ -n "$_envsaved" ] && eval "$_envsaved"
   # 4) defaults fill the gaps
   : "${DEVFLOW_AGENT:=claude}"          # claude | codex | both | none
-  : "${DEVFLOW_CPU:=2}"                 # cores (Daytona no-quota max: 4)
-  : "${DEVFLOW_MEMORY:=4096}"           # MB    (Daytona no-quota max: 8192)
-  : "${DEVFLOW_DISK:=10}"               # GB    (Daytona no-quota max: 10)
+  : "${DEVFLOW_SIZE:=}"                 # small | medium | large; "" = medium
+  : "${DEVFLOW_CPU:=}"                  # legacy; maps to the smallest size that fits
+  : "${DEVFLOW_MEMORY:=}"               # legacy (MB); ditto
+  : "${DEVFLOW_DISK:=}"                 # legacy (GB); ditto
   : "${DEVFLOW_AUTO_STOP:=0}"           # minutes; 0 = never (close your laptop safely)
   : "${DEVFLOW_TARGET:=}"               # us | eu | "" = org default
   : "${DEVFLOW_SNAPSHOT:=}"             # custom snapshot; "" = Daytona default image
@@ -58,6 +60,7 @@ load_config() {
   : "${DEVFLOW_NTFY_TOPIC:=}"           # private topic; set by 'mobile --setup-push'
   : "${DEVFLOW_AUTO_HANDOFF:=}"         # ""=off | auto|push|op|bw|note — send reconnect line after every 'up'
   : "${DEVFLOW_CLAUDE_TOKEN:=}"
+  : "${DEVFLOW_DAYTONA_SANDBOX_KEY:=}"  # minted API key forwarded by --with-daytona
   return 0
 }
 
@@ -74,6 +77,35 @@ resolve_harness() { # AGENT REQUESTED -> effective harness
     none) printf 'core' ;;
     *)    printf '%s' "$req" ;;
   esac
+}
+
+# Daytona sizes sandboxes via its fixed-size default snapshots — the API
+# rejects raw --cpu/--memory/--disk whenever a snapshot backs the sandbox,
+# and the default image is a snapshot too. Sizes:
+#   small = 1cpu/1gb/3gb · medium = 2cpu/4gb/8gb · large = 4cpu/8gb/10gb
+size_desc() { # SIZE -> "2cpu/4gb/8gb"
+  case "$1" in
+    small)  printf '1cpu/1gb/3gb' ;;
+    medium) printf '2cpu/4gb/8gb' ;;
+    large)  printf '4cpu/8gb/10gb' ;;
+  esac
+}
+
+size_for_resources() { # CPU MEM_MB DISK_GB (legacy knobs) -> smallest size that fits
+  local cpu="${1:-1}" mem="${2:-1024}" disk="${3:-3}" n
+  for n in "$cpu" "$mem" "$disk"; do
+    case "$n" in ''|*[!0-9]*) printf 'large'; return 0 ;; esac
+  done
+  if [ "$cpu" -le 1 ] && [ "$mem" -le 1024 ] && [ "$disk" -le 3 ]; then printf 'small'
+  elif [ "$cpu" -le 2 ] && [ "$mem" -le 4096 ] && [ "$disk" -le 8 ]; then printf 'medium'
+  else printf 'large'; fi
+}
+
+default_size() { # from config: DEVFLOW_SIZE wins, legacy resources map, else medium
+  if [ -n "$DEVFLOW_SIZE" ]; then printf '%s' "$DEVFLOW_SIZE"
+  elif [ -n "${DEVFLOW_CPU}${DEVFLOW_MEMORY}${DEVFLOW_DISK}" ]; then
+    size_for_resources "$DEVFLOW_CPU" "$DEVFLOW_MEMORY" "$DEVFLOW_DISK"
+  else printf 'medium'; fi
 }
 
 config_set() { # config_set FILE KEY VALUE
@@ -157,7 +189,9 @@ current_repo() { # owner/name of cwd's github origin, or empty
 # ----------------------------------------------------------------------------
 dt() { command daytona "$@"; }
 
-dt_auth_check() { dt organization list >/dev/null 2>&1; }
+# NOTE: must be an org-scoped call that works under BOTH auth modes — the CLI
+# refuses `organization` subcommands entirely under api-key auth
+dt_auth_check() { dt list >/dev/null 2>&1; }
 
 dt_info_json() { dt info "$1" -f json 2>/dev/null; }
 
@@ -1106,12 +1140,128 @@ resolve_name() { # [ARG] -> NAME (auto-picks when unambiguous)
 }
 
 # ----------------------------------------------------------------------------
+# User scripts (up --script FILE) + Daytona forwarding (up --with-daytona)
+# ----------------------------------------------------------------------------
+emit_script_launcher() { # in-sandbox: start user-script.sh in tmux window 'script'
+cat <<'DV_SCRIPTLAUNCH'
+#!/usr/bin/env bash
+# dv-script — run ~/.devflow/user-script.sh detach-safe (tmux window 'script')
+set -u
+export PATH="$HOME/.local/bin:$HOME/.devflow/bin:$PATH"
+WD="$(cat "$HOME/.devflow/workdir" 2>/dev/null || echo "$HOME")"
+"$HOME/.devflow/bin/dv-ensure" 2>/dev/null || true
+if command -v tmux >/dev/null 2>&1 && tmux has-session -t dv 2>/dev/null; then
+  tmux kill-window -t dv:script 2>/dev/null || true
+  tmux new-window -d -t dv -n script -c "$WD" "$HOME/.devflow/bin/dv-script-exec"
+  echo "script started in tmux window 'script'"
+else
+  nohup "$HOME/.devflow/bin/dv-script-exec" >/dev/null 2>&1 &
+  echo "script started headless (log: ~/.devflow/script.log)"
+fi
+DV_SCRIPTLAUNCH
+}
+
+emit_script_exec() { # in-sandbox: the actual runner — tee to log, report exit
+cat <<'DV_SCRIPTEXEC'
+#!/usr/bin/env bash
+set -u
+export PATH="$HOME/.local/bin:$HOME/.devflow/bin:$PATH"
+cd "$(cat "$HOME/.devflow/workdir" 2>/dev/null || echo "$HOME")" 2>/dev/null || cd "$HOME"
+LOG="$HOME/.devflow/script.log"
+bash "$HOME/.devflow/user-script.sh" 2>&1 | tee "$LOG"
+ec="${PIPESTATUS[0]}"
+printf '[devflow script exit: %s]\n' "$ec" >> "$LOG"
+if [ -n "${TMUX:-}" ]; then
+  printf '[devflow script exit: %s] — window stays open for inspection (Ctrl-b d detaches)\n' "$ec"
+  exec bash
+fi
+exit "$ec"
+DV_SCRIPTEXEC
+}
+
+run_user_script() { # NAME LOCAL_FILE — upload + launch; best-effort (caller warns)
+  local name="$1" file="$2"
+  step "uploading ${C_BOLD}$(basename "$file")${C_RESET} → running in tmux window 'script'…"
+  dt_push_file "$name" "/tmp/.dv-user-script" < "$file" || return 1
+  emit_script_launcher | dt_push_file "$name" "/tmp/.dv-script" || return 1
+  emit_script_exec | dt_push_file "$name" "/tmp/.dv-script-exec" || return 1
+  dt_run "$name" 'mkdir -p "$HOME/.devflow/bin" && mv /tmp/.dv-user-script "$HOME/.devflow/user-script.sh" && mv /tmp/.dv-script "$HOME/.devflow/bin/dv-script" && mv /tmp/.dv-script-exec "$HOME/.devflow/bin/dv-script-exec" && chmod +x "$HOME/.devflow/user-script.sh" "$HOME/.devflow/bin/dv-script" "$HOME/.devflow/bin/dv-script-exec" && "$HOME/.devflow/bin/dv-script"' 60 || return 1
+  ok "script running — watch: ${C_BOLD}devflow peek $name -w script${C_RESET} · log: devflow exec $name -- 'cat ~/.devflow/script.log'"
+  return 0
+}
+
+sandbox_daytona_key() { # sets DT_SANDBOX_KEY: durable, VALIDATED API key (mints + caches once)
+  # requires resolve_daytona_api to have run (DT_API_KEY/DT_API_URL/DT_ORG_ID set)
+  DT_SANDBOX_KEY=""
+  if [ -n "$DEVFLOW_DAYTONA_SANDBOX_KEY" ]; then
+    if dt_key_valid "$DEVFLOW_DAYTONA_SANDBOX_KEY"; then
+      DT_SANDBOX_KEY="$DEVFLOW_DAYTONA_SANDBOX_KEY"; return 0
+    fi
+    warn "cached devflow-sandboxes key was revoked — minting a fresh one"
+  fi
+  case "$DT_API_KEY" in
+    dtn_*)  # already a durable key (env var or api-key login) — but verify it
+      if dt_key_valid "$DT_API_KEY"; then DT_SANDBOX_KEY="$DT_API_KEY"; return 0; fi
+      warn "local Daytona API key is stale (check DAYTONA_API_KEY in your shell env) — minting a fresh one"
+      ;;
+  esac
+  # mint a dedicated, revocable, sandbox-scoped key and cache it (0600 secrets).
+  # bearer: prefer the browser-login OAuth token; /api-keys needs a live credential
+  local bearer="${DT_OAUTH_TOKEN:-$DT_API_KEY}" resp val
+  [ -n "$DT_ORG_ID" ] || { warn "no active Daytona organization in CLI config (run: daytona login)"; return 1; }
+  resp="$(curl -fsSL -X POST -H "Authorization: Bearer $bearer" \
+          -H "X-Daytona-Organization-ID: $DT_ORG_ID" -H "Content-Type: application/json" \
+          -d '{"name":"devflow-sandboxes","permissions":["write:sandboxes","delete:sandboxes"]}' \
+          "$DT_API_URL/api-keys" 2>/dev/null)" || {
+    # name may already exist from a lost secrets file — replace it (we own the name)
+    curl -fsSL -X DELETE -H "Authorization: Bearer $bearer" \
+      -H "X-Daytona-Organization-ID: $DT_ORG_ID" \
+      "$DT_API_URL/api-keys/devflow-sandboxes" >/dev/null 2>&1
+    resp="$(curl -fsSL -X POST -H "Authorization: Bearer $bearer" \
+            -H "X-Daytona-Organization-ID: $DT_ORG_ID" -H "Content-Type: application/json" \
+            -d '{"name":"devflow-sandboxes","permissions":["write:sandboxes","delete:sandboxes"]}' \
+            "$DT_API_URL/api-keys" 2>/dev/null)" || { warn "could not mint a Daytona API key (run: daytona login)"; return 1; }
+  }
+  val="$(printf '%s' "$resp" | jq -r '.value // empty')"
+  [ -n "$val" ] || { warn "unexpected api-keys response"; return 1; }
+  config_set "$SECRETS_FILE" DEVFLOW_DAYTONA_SANDBOX_KEY "$val"
+  DEVFLOW_DAYTONA_SANDBOX_KEY="$val"
+  DT_SANDBOX_KEY="$val"
+  step "minted Daytona API key 'devflow-sandboxes' (scope: sandboxes; revoke: app.daytona.io/dashboard/keys)"
+}
+
+forward_daytona() { # NAME — daytona CLI + API auth + devflow itself, inside the sandbox
+  local name="$1"
+  resolve_daytona_api || { warn "no local Daytona credentials (run: daytona login)"; return 1; }
+  sandbox_daytona_key || return 1
+  local fwd_key="$DT_SANDBOX_KEY"
+  step "forwarding Daytona control into ${C_BOLD}$name${C_RESET} (CLI + API key + devflow — ~30s)…"
+  local dtv
+  dtv="$(daytona version 2>/dev/null | sed -n 's/.*v\([0-9][0-9.]*\).*/\1/p' | head -1)"
+  [ -n "$dtv" ] || dtv="$DT_PIN_VERSION"
+  # same config schema the daytona CLI writes; 0600 like every devflow secret
+  local org_field=""
+  [ -n "$DT_ORG_ID" ] && org_field=",\"activeOrganizationId\":\"$DT_ORG_ID\""
+  printf '{"activeProfile":"default","profiles":[{"id":"default","name":"default","api":{"url":"%s","key":"%s"}%s}]}' \
+      "$DT_API_URL" "$fwd_key" "$org_field" \
+    | dt_push_file "$name" "/tmp/.dv-daytona-config" || return 1
+  dt_push_file "$name" "/tmp/.dv-devflow" < "$0" || return 1
+  # the sandbox image ships its own `daytona` binary (the in-sandbox daemon on
+  # /usr/local/bin) — so install the real CLI unconditionally at ~/.local/bin
+  # (which shadows it on PATH) and sanity-check it actually IS the CLI
+  dt_run "$name" 'mkdir -p "$HOME/.local/bin" "$HOME/.config/daytona" && mv /tmp/.dv-daytona-config "$HOME/.config/daytona/config.json" && chmod 600 "$HOME/.config/daytona/config.json" && mv /tmp/.dv-devflow "$HOME/.local/bin/devflow" && chmod +x "$HOME/.local/bin/devflow" && ln -sf "$HOME/.local/bin/devflow" "$HOME/.local/bin/dv" && { [ -x "$HOME/.local/bin/daytona" ] || { curl -fsSL "https://github.com/daytona/clients/releases/download/v'"$dtv"'/daytona-linux-amd64" -o "$HOME/.local/bin/daytona" && chmod +x "$HOME/.local/bin/daytona" && timeout 10 "$HOME/.local/bin/daytona" version 2>/dev/null | grep -q "Daytona CLI"; }; } && { command -v jq >/dev/null 2>&1 || { curl -fsSL "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64" -o "$HOME/.local/bin/jq" && chmod +x "$HOME/.local/bin/jq"; }; }' 240 || return 1
+  ok "sandbox can now run ${C_BOLD}daytona${C_RESET} + ${C_BOLD}devflow${C_RESET} — new sandboxes it makes are ${C_BOLD}siblings${C_RESET} on your account (bill + need cleanup: devflow rm)"
+  return 0
+}
+
+# ----------------------------------------------------------------------------
 # Commands
 # ----------------------------------------------------------------------------
 cmd_up() {
   local repo="" name="" branch="" agent="$DEVFLOW_AGENT" task="" attach=1 fresh=0 blank=0
-  local cpu="$DEVFLOW_CPU" memory="$DEVFLOW_MEMORY" disk="$DEVFLOW_DISK" auto_stop="$DEVFLOW_AUTO_STOP"
+  local size="" cpu="$DEVFLOW_CPU" memory="$DEVFLOW_MEMORY" disk="$DEVFLOW_DISK" auto_stop="$DEVFLOW_AUTO_STOP"
   local snapshot="$DEVFLOW_SNAPSHOT" explicit_resources=0 harness="$DEVFLOW_HARNESS"
+  local script="" with_daytona=0
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1120,24 +1270,46 @@ cmd_up() {
       -n|--name)    need_val "$1" "${2:-}"; name="$2"; shift 2 ;;
       -b|--branch)  need_val "$1" "${2:-}"; branch="$2"; shift 2 ;;
       -m|--task)    need_val "$1" "${2:-}"; task="$2"; shift 2 ;;
-      --cpu)        need_val "$1" "${2:-}"; cpu="$2"; explicit_resources=1; shift 2 ;;
-      --memory)     need_val "$1" "${2:-}"; memory="$2"; explicit_resources=1; shift 2 ;;
-      --disk)       need_val "$1" "${2:-}"; disk="$2"; explicit_resources=1; shift 2 ;;
+      -s|--size)    need_val "$1" "${2:-}"; size="$2"; shift 2 ;;
+      --cpu)        need_val "$1" "${2:-}"; cpu="$2"; explicit_resources=1; shift 2 ;;      # legacy
+      --memory)     need_val "$1" "${2:-}"; memory="$2"; explicit_resources=1; shift 2 ;;   # legacy
+      --disk)       need_val "$1" "${2:-}"; disk="$2"; explicit_resources=1; shift 2 ;;     # legacy
       --auto-stop)  need_val "$1" "${2:-}"; auto_stop="$2"; shift 2 ;;
       --snapshot)   need_val "$1" "${2:-}"; snapshot="$2"; shift 2 ;;
+      --script)     need_val "$1" "${2:-}"; script="$2"; shift 2 ;;
+      --with-daytona) with_daytona=1; shift ;;
       --no-attach)  attach=0; shift ;;
       --fresh)      fresh=1; shift ;;
       --blank)      blank=1; shift ;;
       --pick)       repo="__PICK__"; shift ;;
       -h|--help)    usage_up; return 0 ;;
       -*)           die "unknown flag for up: $1 (see: devflow up --help)" ;;
-      *)            repo="$1"; shift ;;
+      *)            # a positional that names a local file is a script to run
+                    if [ -z "$script" ] && [ -f "$1" ]; then script="$1"
+                    else repo="$1"; fi
+                    shift ;;
     esac
   done
+  [ -n "$script" ] && [ ! -f "$script" ] && die "script not found: $script"
 
   case "$agent" in claude|codex|both|none) ;; *) die "invalid --agent '$agent' (claude|codex|both|none)" ;; esac
   case "$harness" in auto|omc|omx|both|core|none) ;; *) die "invalid --harness '$harness' (auto|omc|omx|both|core|none)" ;; esac
   harness="$(resolve_harness "$agent" "$harness")"
+
+  # --- size (a custom snapshot brings its own; else pick a Daytona size class) ---
+  if [ -n "$snapshot" ]; then
+    if [ -n "$size" ] || [ "$explicit_resources" = 1 ]; then
+      step "note: --size/--cpu/--memory/--disk ignored — snapshot '$snapshot' has its size baked in (want another? devflow snapshot build --size ${size:-small|medium|large}, or --snapshot to pick)"
+    fi
+  else
+    if [ -z "$size" ] && [ "$explicit_resources" = 1 ]; then
+      size="$(size_for_resources "$cpu" "$memory" "$disk")"
+      step "note: Daytona sizes sandboxes in classes now — --cpu/--memory/--disk map to --size $size ($(size_desc "$size"))"
+    elif [ -z "$size" ]; then
+      size="$(default_size)"
+    fi
+    case "$size" in small|medium|large) ;; *) die "invalid --size '$size' (small|medium|large)" ;; esac
+  fi
 
   need_cmd daytona "brew install daytonaio/cli/daytona"
   need_cmd jq "brew install jq"
@@ -1178,16 +1350,27 @@ cmd_up() {
       step "recreating '$name' (--fresh)…"
       dt delete "$name" >/dev/null 2>&1 || true
     else
-      say "sandbox '$name' already exists ($st) — attaching. (--fresh recreates, -n NAME makes another)"
-      cmd_attach "$name"
-      return $?
+      say "sandbox '$name' already exists ($st). (--fresh recreates, -n NAME makes another)"
+      if [ "$with_daytona" = 1 ] || [ -n "$script" ]; then ensure_running "$name"; fi
+      [ "$with_daytona" = 1 ] && { forward_daytona "$name" || warn "daytona forwarding failed"; }
+      [ -n "$script" ] && { run_user_script "$name" "$script" || warn "script launch failed"; }
+      if [ "$attach" = 1 ] && [ -t 0 ]; then
+        cmd_attach "$name"
+        return $?
+      fi
+      ok "up. attach anytime, from any machine:  ${C_BOLD}devflow attach $name${C_RESET}"
+      return 0
     fi
   fi
 
-  say "spinning up ${C_BOLD}$name${C_RESET}  ${C_DIM}agent=$agent harness=$harness repo=${repo:-none} ${cpu}cpu/${memory}mb/${disk}gb auto-stop=${auto_stop}m${C_RESET}"
+  local size_note
+  size_note="size=$size ($(size_desc "$size"))"
+  [ -n "$snapshot" ] && size_note="snapshot=$snapshot"
+  say "spinning up ${C_BOLD}$name${C_RESET}  ${C_DIM}agent=$agent harness=$harness repo=${repo:-none} $size_note auto-stop=${auto_stop}m${C_RESET}"
   auth_summary
 
-  # --- create ---
+  # --- create (never pass raw resources: the API rejects them with snapshots,
+  # and even the default image is a snapshot — sizes live in the snapshot) ---
   local create_args
   create_args=(create "--name=$name" "--auto-stop=$auto_stop"
                --label devflow=1 --label "devflow.agent=$agent"
@@ -1195,9 +1378,8 @@ cmd_up() {
   [ -n "$repo" ] && create_args+=(--label "devflow.repo=$repo")
   if [ -n "$snapshot" ]; then
     create_args+=("--snapshot=$snapshot")
-    [ "$explicit_resources" = 1 ] && create_args+=("--cpu=$cpu" "--memory=$memory" "--disk=$disk")
   else
-    create_args+=("--cpu=$cpu" "--memory=$memory" "--disk=$disk")
+    create_args+=("--snapshot=daytona-$size")
   fi
   [ -n "$DEVFLOW_TARGET" ] && create_args+=("--target=$DEVFLOW_TARGET")
 
@@ -1209,12 +1391,20 @@ cmd_up() {
   provision_sandbox "$name" "$agent" "$repo" "$branch" "$task" "$harness"
   ok "provisioned"
 
+  [ "$with_daytona" = 1 ] && { forward_daytona "$name" \
+    || warn "daytona forwarding failed — the sandbox can't manage sibling sandboxes"; }
+  [ -n "$script" ] && { run_user_script "$name" "$script" \
+    || warn "script launch failed — session is still up (retry: devflow up -n $name --script $script)"; }
+
   [ -n "$DEVFLOW_AUTO_HANDOFF" ] && { auto_handoff "$name" || true; }
 
   if [ -n "$task" ]; then
     say "the agent is on it. it keeps working even when you're not attached."
     step "peek progress:  ${C_BOLD}devflow peek $name${C_RESET}"
     step "join session:   ${C_BOLD}devflow attach $name${C_RESET}"
+  fi
+  if [ -n "$script" ]; then
+    step "script output:  ${C_BOLD}devflow peek $name -w script${C_RESET}"
   fi
 
   if [ "$attach" = 1 ] && [ -t 0 ]; then
@@ -1251,35 +1441,54 @@ cmd_ssh() {
 # API. Prints ONLY the ssh line on stdout (so it's safe in $(…)); dies on
 # stderr on any failure. Caller handles resolve_name + ensure_running.
 # Shared by `ssh-command` and `mobile`.
+resolve_daytona_api() { # sets DT_API_KEY / DT_API_URL / DT_ORG_ID; rc 1 if no credential
+  # browser logins store an OAuth token (api.key is null) — the API accepts it
+  # as a Bearer too; api-key logins store api.key. Env vars override the file.
+  DT_API_KEY="${DAYTONA_API_KEY:-}"
+  DT_API_URL="${DAYTONA_API_URL:-https://app.daytona.io/api}"
+  DT_ORG_ID=""
+  DT_OAUTH_TOKEN=""
+  local cfg u
+  for cfg in "$HOME/Library/Application Support/daytona/config.json" \
+             "${XDG_CONFIG_HOME:-$HOME/.config}/daytona/config.json"; do
+    [ -f "$cfg" ] || continue
+    [ -z "$DT_API_KEY" ] && DT_API_KEY="$(jq -r '. as $c | ($c.activeProfile // "default") as $a
+               | ($c.profiles // [])[] | select((.id // .name) == $a or .name == $a)
+               | (.api.key // .api.token.accessToken // empty)' "$cfg" 2>/dev/null | head -1)"
+    DT_OAUTH_TOKEN="$(jq -r '. as $c | ($c.activeProfile // "default") as $a
+               | ($c.profiles // [])[] | select((.id // .name) == $a or .name == $a)
+               | (.api.token.accessToken // empty)' "$cfg" 2>/dev/null | head -1)"
+    u="$(jq -r '. as $c | ($c.activeProfile // "default") as $a
+               | ($c.profiles // [])[] | select((.id // .name) == $a or .name == $a)
+               | (.api.url // empty)' "$cfg" 2>/dev/null | head -1)"
+    [ -n "$u" ] && DT_API_URL="$u"
+    DT_ORG_ID="$(jq -r '. as $c | ($c.activeProfile // "default") as $a
+               | ($c.profiles // [])[] | select((.id // .name) == $a or .name == $a)
+               | (.activeOrganizationId // empty)' "$cfg" 2>/dev/null | head -1)"
+    [ -n "$DT_API_KEY" ] && break
+  done
+  [ -n "$DT_API_KEY" ]
+}
+
+dt_key_valid() { # KEY — does the API accept it? (org is implied by the key)
+  curl -fsS -o /dev/null -H "Authorization: Bearer $1" "$DT_API_URL/sandbox" 2>/dev/null
+}
+
 mint_ssh_command() { # NAME EXPIRES_MIN -> ssh line on stdout
   local name="$1" expires="$2"
   need_cmd jq "brew install jq"
   need_cmd curl "install curl"
 
-  local api_key="${DAYTONA_API_KEY:-}" api_url="${DAYTONA_API_URL:-https://app.daytona.io/api}" cfg=""
-  if [ -z "$api_key" ]; then
-    for cfg in "$HOME/Library/Application Support/daytona/config.json" \
-               "${XDG_CONFIG_HOME:-$HOME/.config}/daytona/config.json"; do
-      [ -f "$cfg" ] || continue
-      api_key="$(jq -r '. as $c | ($c.activeProfile // "default") as $a
-                 | ($c.profiles // [])[] | select((.id // .name) == $a or .name == $a)
-                 | (.api.key // .api.token // empty)' "$cfg" 2>/dev/null | head -1)"
-      local u
-      u="$(jq -r '. as $c | ($c.activeProfile // "default") as $a
-                 | ($c.profiles // [])[] | select((.id // .name) == $a or .name == $a)
-                 | (.api.url // empty)' "$cfg" 2>/dev/null | head -1)"
-      [ -n "$u" ] && api_url="$u"
-      [ -n "$api_key" ] && break
-    done
-  fi
-  [ -n "$api_key" ] || die "no Daytona API key available — use 'devflow ssh $name' instead, or set DAYTONA_API_KEY"
+  resolve_daytona_api \
+    || die "no Daytona API key available — use 'devflow ssh $name' instead, or set DAYTONA_API_KEY"
+  local api_key="$DT_API_KEY" api_url="$DT_API_URL"
 
   local sandbox_id resp
   sandbox_id="$(dt_info_json "$name" | jq -r '.id // .sandboxId // empty')"
   [ -n "$sandbox_id" ] || die "could not resolve sandbox id for '$name'"
   resp="$(curl -fsSL -X POST -H "Authorization: Bearer $api_key" \
           "$api_url/sandbox/$sandbox_id/ssh-access?expiresInMinutes=$expires" 2>/dev/null)" \
-    || die "ssh-access API call failed — fall back to: devflow ssh $name"
+    || die "ssh-access API call failed — fall back to: devflow ssh $name  (a stale DAYTONA_API_KEY env var overrides your login — unset it if set)"
   local sshcmd token
   sshcmd="$(printf '%s' "$resp" | jq -r '.sshCommand // empty')"
   token="$(printf '%s' "$resp" | jq -r '.token // empty')"
@@ -1654,10 +1863,11 @@ cmd_exec() {
 }
 
 cmd_peek() {
-  local name="" lines=40
+  local name="" lines=40 window=agent
   while [ $# -gt 0 ]; do
     case "$1" in
       --lines) need_val "$1" "${2:-}"; lines="$2"; shift 2 ;;
+      -w|--window) need_val "$1" "${2:-}"; window="$2"; shift 2 ;;
       *) name="$1"; shift ;;
     esac
   done
@@ -1668,8 +1878,8 @@ cmd_peek() {
     say "'$name' is ${st} — nothing running to peek at. ${C_DIM}devflow attach $name restarts it.${C_RESET}"
     return 0
   fi
-  say "agent pane in ${C_BOLD}$name${C_RESET} (last $lines lines):"
-  dt_run "$name" "tmux capture-pane -p -t dv:agent -S -$lines 2>/dev/null || echo '(no tmux session yet — devflow attach $name)'" 60
+  say "$window pane in ${C_BOLD}$name${C_RESET} (last $lines lines):"
+  dt_run "$name" "tmux capture-pane -p -t dv:$window -S -$lines 2>/dev/null || echo '(no $window window — windows: agent/shell, plus codex/script when used)'" 60
 }
 
 cmd_ls() {
@@ -1689,7 +1899,7 @@ cmd_ls() {
       (.state // .status // "?"),
       ((.labels // {})["devflow.agent"] // "-"),
       ((.labels // {})["devflow.repo"] // "-"),
-      (((.cpu // "?") | tostring) + "c/" + ((.memory // "?") | tostring) + "m")
+      (((.cpu // "?") | tostring) + "c/" + ((.memory // "?") | tostring) + "g")
     ] | @tsv' \
   | while IFS=$'\t' read -r n s a r c; do
       local color="$C_DIM"
@@ -1850,7 +2060,8 @@ cmd_doctor() {
   printf '%s\n' "${C_BOLD}defaults${C_RESET}"
   check_row "agent" ok "$DEVFLOW_AGENT"
   check_row "harness" ok "$DEVFLOW_HARNESS (auto → omc for claude, omx for codex)"
-  check_row "resources" ok "${DEVFLOW_CPU}cpu / ${DEVFLOW_MEMORY}mb / ${DEVFLOW_DISK}gb"
+  local dsize; dsize="$(default_size)"
+  check_row "size" ok "$dsize ($(size_desc "$dsize"))"
   check_row "auto-stop" ok "${DEVFLOW_AUTO_STOP}m (0 = runs until 'devflow stop')"
   [ -n "$DEVFLOW_AUTO_HANDOFF" ] && check_row "auto-handoff" ok "$DEVFLOW_AUTO_HANDOFF (every 'up' sends the reconnect line to your phone)"
   [ -n "$DEVFLOW_SNAPSHOT" ] && check_row "snapshot" ok "$DEVFLOW_SNAPSHOT"
@@ -1937,14 +2148,21 @@ cmd_setup() {
 # ----------------------------------------------------------------------------
 emit_dockerfile() {
 cat <<'DV_DOCKERFILE'
-# devflow base snapshot — agents + tools prebaked for instant session starts.
-# Built server-side by Daytona:  devflow snapshot build
+# devflow base snapshot — agents + toolchains prebaked for instant session
+# starts (claude, codex, gh, tmux, node, go, bun, uv, build tools, harnesses).
+# Built server-side by Daytona:  devflow snapshot build [--size S]
 FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
       bash ca-certificates curl git jq ripgrep sudo tmux unzip xz-utils \
       python3 python3-pip openssh-client less nano vim-tiny locales \
+      build-essential pkg-config \
     && rm -rf /var/lib/apt/lists/*
+# Go toolchain — /usr/local/bin is on every shell's PATH, login or not
+RUN GO_V=1.26.5 && \
+    curl -fsSL "https://go.dev/dl/go${GO_V}.linux-amd64.tar.gz" | tar -xz -C /usr/local && \
+    ln -s /usr/local/go/bin/go /usr/local/bin/go && \
+    ln -s /usr/local/go/bin/gofmt /usr/local/bin/gofmt
 # non-root user with passwordless sudo (claude bypass mode refuses root)
 RUN userdel -r ubuntu 2>/dev/null || true; \
     useradd -m -s /bin/bash -u 1000 daytona && \
@@ -1962,39 +2180,72 @@ RUN mkdir -p "$HOME/.local/bin" && \
     find /tmp -maxdepth 1 -name 'codex*' -type f -exec cp {} "$HOME/.local/bin/codex" \; && \
     chmod +x "$HOME"/.local/bin/* && \
     "$HOME/.local/bin/claude" --version && "$HOME/.local/bin/codex" --version && "$HOME/.local/bin/gh" --version
-# node + the oh-my-* multi-agent harnesses, prebaked for instant session starts
+# bun + uv — linked into ~/.local/bin so non-interactive shells find them too
+RUN curl -fsSL https://bun.sh/install | bash && \
+    ln -sf "$HOME/.bun/bin/bun" "$HOME/.local/bin/bun" && \
+    ln -sf "$HOME/.bun/bin/bun" "$HOME/.local/bin/bunx" && \
+    curl -LsSf https://astral.sh/uv/install.sh | sh && \
+    go version && "$HOME/.local/bin/bun" --version && "$HOME/.local/bin/uv" --version
+# node + the oh-my-* multi-agent harnesses, prebaked for instant session starts.
+# node/npm/npx get linked into ~/.local/bin — nvm only loads in interactive
+# shells, and agents shell out non-interactively (the classic nvm PATH trap)
 RUN export NVM_DIR="$HOME/.nvm" && \
     curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash && \
     . "$NVM_DIR/nvm.sh" && nvm install 22 && \
+    NODE_DIR="$(dirname "$(nvm which 22)")" && \
+    ln -sf "$NODE_DIR/node" "$HOME/.local/bin/node" && \
+    ln -sf "$NODE_DIR/npm"  "$HOME/.local/bin/npm" && \
+    ln -sf "$NODE_DIR/npx"  "$HOME/.local/bin/npx" && \
     npm config set prefix "$HOME/.local" && \
     npm install -g oh-my-claude-sisyphus@latest oh-my-codex@latest && \
-    "$HOME/.local/bin/omc" --version && "$HOME/.local/bin/omx" --version
+    "$HOME/.local/bin/omc" --version && "$HOME/.local/bin/omx" --version && \
+    "$HOME/.local/bin/node" --version && "$HOME/.local/bin/npm" --version && \
+    sed -i '/NVM_DIR/d' "$HOME/.bashrc"
+# ^ drop nvm's login-shell loader: node is symlinked above, and nvm + the npm
+#   prefix we set would print a warning on every interactive login otherwise
 CMD ["sleep", "infinity"]
 DV_DOCKERFILE
 }
 
 cmd_snapshot() {
-  case "${1:-}" in
+  local sub="${1:-}"
+  [ $# -gt 0 ] && shift
+  case "$sub" in
     build)
+      local size=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          -s|--size) need_val "$1" "${2:-}"; size="$2"; shift 2 ;;
+          *) die "unknown flag for snapshot build: $1 (usage: devflow snapshot build [--size small|medium|large])" ;;
+        esac
+      done
+      [ -n "$size" ] || size="$(default_size)"
+      local cpu mem_gb disk_gb
+      case "$size" in   # a snapshot bakes its resources ('snapshot create' memory is GB)
+        small)  cpu=1 mem_gb=1 disk_gb=3 ;;
+        medium) cpu=2 mem_gb=4 disk_gb=8 ;;
+        large)  cpu=4 mem_gb=8 disk_gb=10 ;;
+        *) die "invalid size '$size' (small|medium|large)" ;;
+      esac
       need_cmd daytona "brew install daytonaio/cli/daytona"
       dt_auth_check || die "not logged in to Daytona — run: devflow setup"
-      local snap_name="devflow-base-$DEVFLOW_VERSION" tmp mem_gb
-      mem_gb=$((DEVFLOW_MEMORY / 1024)); [ "$mem_gb" -lt 1 ] && mem_gb=1
+      local snap_name="devflow-base-$DEVFLOW_VERSION-$size" tmp
       tmp="$(mktemp -d "${TMPDIR:-/tmp}/devflow-snap.XXXXXX")"
       emit_dockerfile >"$tmp/Dockerfile"
-      say "building snapshot ${C_BOLD}$snap_name${C_RESET} on Daytona (one-time, a few minutes)…"
+      say "building snapshot ${C_BOLD}$snap_name${C_RESET} ($(size_desc "$size")) on Daytona (one-time, a few minutes)…"
       if dt snapshot create "$snap_name" --dockerfile "$tmp/Dockerfile" \
-           "--cpu=$DEVFLOW_CPU" "--memory=$mem_gb" "--disk=$DEVFLOW_DISK"; then
+           "--cpu=$cpu" "--memory=$mem_gb" "--disk=$disk_gb"; then
         config_set "$CONFIG_FILE" DEVFLOW_SNAPSHOT "$snap_name"
         rm -rf "$tmp"
         ok "snapshot built + set as default — new sandboxes now start in seconds"
+        step "want another size too? ${C_BOLD}devflow snapshot build --size small|medium|large${C_RESET} (they coexist; DEVFLOW_SNAPSHOT picks)"
       else
         rm -rf "$tmp"
         die "snapshot build failed (see output above)"
       fi
       ;;
     dockerfile) emit_dockerfile ;;
-    *) die "usage: devflow snapshot [build|dockerfile]" ;;
+    *) die "usage: devflow snapshot [build [--size small|medium|large] | dockerfile]" ;;
   esac
 }
 
@@ -2015,15 +2266,25 @@ ${C_BOLD}devflow up${C_RESET} [REPO] [flags] — create (or reattach to) a cloud
                       core = devflow's built-in dv-engineer/designer/security)
   -m, --task "…"      hand the agent a task right away; add --no-attach to
                       fire-and-forget, then 'devflow peek' to check on it
+      --script FILE   run a local script inside the sandbox (tmux window
+                      'script'; log ~/.devflow/script.log). A bare positional
+                      arg that names an existing file works too:
+                      devflow up repro.sh
+      --with-daytona  give the sandbox your Daytona CLI + API key + devflow,
+                      so scripts/agents in it can spin up SIBLING sandboxes
+                      (they bill your account — clean up with devflow rm)
   -b, --branch B      checkout (or create) branch B
   -n, --name N        sandbox name (default: dv-<repo>)
       --blank         no repo — empty scratch sandbox
       --pick          force the repo picker
       --fresh         delete + recreate if the sandbox already exists
       --no-attach     don't SSH in after starting
-      --cpu N | --memory MB | --disk GB   resources (default ${DEVFLOW_CPU}/${DEVFLOW_MEMORY}/${DEVFLOW_DISK})
+  -s, --size S        small | medium | large   (default: $(default_size))
+                      small=1cpu/1gb/3gb · medium=2cpu/4gb/8gb · large=4cpu/8gb/10gb
+                      (--cpu/--memory/--disk are deprecated: they map to the
+                      smallest size that fits)
       --auto-stop MIN 0 = keep running until 'devflow stop' (default ${DEVFLOW_AUTO_STOP})
-      --snapshot S    custom snapshot (see: devflow snapshot build)
+      --snapshot S    custom snapshot — brings its own size (see: devflow snapshot build)
 EOF
 }
 
@@ -2035,6 +2296,8 @@ ${C_BOLD}start here${C_RESET}
   devflow setup                 one-time: accounts + auth (no API keys needed)
   devflow up [REPO]             spin up Claude Code / Codex on a repo & attach
   devflow up -m "fix bug X" --no-attach    fire-and-forget, close your laptop
+  devflow up repro.sh --with-daytona       run a script in a sandbox; it can
+                                           even spin up sibling sandboxes
 
   every sandbox gets a multi-agent harness: oh-my-claudecode (/autopilot,
   /team, 29 agents) with claude, oh-my-codex with codex, plus devflow's own
@@ -2042,7 +2305,7 @@ ${C_BOLD}start here${C_RESET}
 
 ${C_BOLD}daily driving${C_RESET}
   devflow attach [NAME]   (a)   reattach from anywhere — tmux keeps it alive
-  devflow peek [NAME]           glance at the agent without attaching
+  devflow peek [NAME] [-w W]    glance at the agent (or window W, e.g. script)
   devflow ls                    list sandboxes
   devflow stop [NAME|--all]     stop (disk kept) — attach restarts + resumes
   devflow rm [NAME|--all]       delete sandbox
@@ -2058,7 +2321,8 @@ ${C_BOLD}more${C_RESET}
                                 (ntfy notification / 1Password / Apple Notes)
   devflow exec NAME -- CMD      run a one-off command in a sandbox
   devflow token                 store a 1-year Claude subscription token
-  devflow snapshot build        prebake a snapshot for instant starts
+  devflow snapshot build        prebake a custom snapshot (agents + go/bun/uv/
+                                build tools) for instant starts; --size S per size
   devflow doctor                check local setup
   devflow config [set K V]      defaults (agent, resources, auto-stop…)
   devflow dashboard             open app.daytona.io

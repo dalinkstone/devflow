@@ -47,7 +47,7 @@ devflow never sets it and sandboxes never receive it.
 ```bash
 devflow up [REPO] [flags]      # create (or reattach to) a session
 devflow attach [NAME]          # rejoin from anywhere; restarts stopped sandboxes
-devflow peek [NAME] [--lines N]# view the agent's screen without attaching
+devflow peek [NAME] [-w WIN]   # view the agent's screen (or window: script)
 devflow ls                     # list devflow sandboxes
 devflow stop [NAME|--all]      # stop compute billing; disk preserved
 devflow rm [NAME|--all] [-f]   # delete (unpushed work is lost)
@@ -57,6 +57,12 @@ devflow rm [NAME|--all] [-f]   # delete (unpushed work is lost)
 uses that repo's origin; outside one you get a picker of your GitHub repos
 (fzf if installed). `up` on an existing sandbox just attaches (idempotent);
 `--fresh` recreates it.
+
+Sizes are Daytona's fixed classes (the API rejects raw cpu/memory/disk when a
+snapshot is involved — and even the default image is a snapshot). The old
+`--cpu/--memory/--disk` flags and `DEVFLOW_CPU/MEMORY/DISK` config keys are
+deprecated: they still work but map to the smallest size that fits. A custom
+`--snapshot` brings its own resources (set at `devflow snapshot build` time).
 
 ### `devflow up` flags
 
@@ -71,9 +77,9 @@ uses that repo's origin; outside one you get a picker of your GitHub repos
 | `--pick` | force the repo picker | — |
 | `--fresh` | delete + recreate existing sandbox | — |
 | `--no-attach` | don't SSH in afterwards | attaches when on a TTY |
-| `--cpu N` / `--memory MB` / `--disk GB` | resources (Daytona no-quota max: 4/8192/10) | 2 / 4096 / 10 |
+| `-s, --size S` | `small` (1cpu/1gb/3gb) \| `medium` (2cpu/4gb/8gb) \| `large` (4cpu/8gb/10gb) | `medium` |
 | `--auto-stop MIN` | 0 = run until stopped | 0 |
-| `--snapshot S` | custom snapshot | Daytona default image |
+| `--snapshot S` | custom snapshot (its size is baked in; `--size` is ignored) | Daytona default image |
 
 ### The fire-and-forget pattern
 
@@ -87,6 +93,51 @@ devflow mobile        # …or reconnect from your phone (see "Access paths")
 
 The agent keeps working while detached because the session lives in tmux
 inside the sandbox and sandboxes default to `--auto-stop 0`.
+
+### Run a script in the sandbox
+
+```bash
+devflow up repro.sh                          # positional arg naming a file = script
+devflow up owner/repo --script ci-repro.sh   # with a repo: script runs in the clone
+devflow up --blank repro.sh --no-attach      # scratch sandbox, fire-and-forget
+```
+
+The script is uploaded and runs in tmux window `script`; the agent window is
+untouched, so `-m` tasks and normal prompting work alongside it, and it keeps
+running while you're detached.
+
+- watch live: `devflow peek NAME -w script` — or `devflow attach` and switch
+  windows (`Ctrl-b 0..9`)
+- full log: `~/.devflow/script.log` in the sandbox; the exit code is appended
+  as `[devflow script exit: N]` and the window stays open for inspection
+- running `up … --script` again (same sandbox) replaces the window + log
+
+### Sandboxes from inside a sandbox (siblings)
+
+```bash
+devflow up --blank repro.sh --with-daytona
+```
+
+`--with-daytona` forwards Daytona control into the sandbox: the `daytona`
+CLI (version-matched to your local one), an API key (as a 0600 CLI config),
+devflow itself, and jq. Scripts or agents inside can then run `devflow up`,
+`devflow ls`, `daytona create`… — sandboxes created from inside are
+**siblings** on your account, not children: everything is an API call to
+Daytona, so there is no container-in-container problem and it composes to
+any depth. devflow-in-sandbox reuses the claude/codex/gh auth that's already
+there, so inner `up`s need no re-login.
+
+Which key gets forwarded: if you logged in with `daytona login --api-key`,
+that key. With a browser login (an expiring OAuth token), devflow **mints a
+dedicated API key** named `devflow-sandboxes` the first time — scoped to
+`write:sandboxes`/`delete:sandboxes` only, cached in
+`~/.config/devflow/secrets` (0600), revocable anytime at
+[app.daytona.io/dashboard/keys](https://app.daytona.io/dashboard/keys).
+
+Opt-in for a reason: that key can create/delete sandboxes on your account
+(= billing), so it's only ever forwarded with the flag — and inner sandboxes
+are **not** cleaned up automatically. `devflow ls` / `devflow rm` (laptop or
+sandbox) see them all; make repro scripts delete what they create.
 
 ## Inside a session
 
@@ -262,8 +313,9 @@ devflow config list | get KEY | set KEY VALUE | edit
 ```
 
 Keys (file: `~/.config/devflow/config`, env vars override the file):
-`DEVFLOW_AGENT`, `DEVFLOW_HARNESS`, `DEVFLOW_CPU`, `DEVFLOW_MEMORY` (MB),
-`DEVFLOW_DISK` (GB), `DEVFLOW_AUTO_STOP` (min), `DEVFLOW_TARGET` (us|eu),
+`DEVFLOW_AGENT`, `DEVFLOW_HARNESS`, `DEVFLOW_SIZE` (small|medium|large;
+`DEVFLOW_CPU`/`MEMORY`/`DISK` are deprecated and map to the smallest size
+that fits), `DEVFLOW_AUTO_STOP` (min), `DEVFLOW_TARGET` (us|eu),
 `DEVFLOW_SNAPSHOT`, `DEVFLOW_CLAUDE_AUTH` (auto|token|creds),
 `DEVFLOW_AUTO_HANDOFF` (off|auto|push|op|bw|note — send the reconnect line
 to your phone after every `up`), `DEVFLOW_NTFY_URL` (push server,
@@ -274,16 +326,21 @@ leave alone). Secrets in `~/.config/devflow/secrets` (0600):
 ## Faster starts
 
 ```bash
-devflow snapshot build       # one-time server-side image build; becomes default
-devflow snapshot dockerfile  # print the Dockerfile it uses
+devflow snapshot build [--size S]  # one-time server-side image build; becomes default
+devflow snapshot dockerfile        # print the Dockerfile it uses
 ```
 
-Prebakes claude/codex/gh/tmux/node + both harnesses so `up` skips installs.
+Prebakes claude/codex/gh/tmux/node + both harnesses **plus Go, bun, uv and
+build-essential** so `up` skips installs and agents get real toolchains from
+second zero. A snapshot bakes its resources, so the name carries the size
+(`devflow-base-<version>-<size>`, default size from your config). Want more
+than one size? Build each once — they coexist; `DEVFLOW_SNAPSHOT` (set
+automatically by the last build) picks which one `up` uses.
 
 ## Costs & lifecycle
 
-- Daytona bills usage (~$0.05/vCPU-h + RAM/disk); default 2cpu/4GB ≈
-  **$0.13/h while running**. New accounts: $200 free.
+- Daytona bills usage (~$0.05/vCPU-h + RAM/disk); the default `medium` size
+  (2cpu/4GB) ≈ **$0.13/h while running**. New accounts: $200 free.
 - devflow defaults to **auto-stop 0** because Daytona's idle timer ignores
   running processes (only SSH/API traffic resets it) — a 15-min auto-stop
   would kill detached agents mid-task. So run `devflow stop --all` when done.
@@ -302,4 +359,5 @@ Prebakes claude/codex/gh/tmux/node + both harnesses so `up` skips installs.
 | claude refuses bypass mode | sandbox user is root (custom image) — devflow falls back to acceptEdits; prefer non-root images |
 | harness missing | `devflow exec NAME -- 'tail -20 ~/.devflow/omc-install.log ~/.devflow/omx-install.log'` |
 | daytona CLI/API version-mismatch warning | `brew upgrade daytonaio/cli/daytona` |
+| create fails: "Cannot specify Sandbox resources when using a snapshot" | you're on an old devflow that passes raw `--cpu/--memory/--disk` — update it; sizes are now `--size small\|medium\|large` |
 | deep inspection | `devflow ssh NAME`, then `~/.devflow/` holds all state/logs |
