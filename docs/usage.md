@@ -80,6 +80,40 @@ deprecated: they still work but map to the smallest size that fits. A custom
 | `-s, --size S` | `small` (1cpu/1gb/3gb) \| `medium` (2cpu/4gb/8gb) \| `large` (4cpu/8gb/10gb) | `medium` |
 | `--auto-stop MIN` | 0 = run until stopped | 0 |
 | `--snapshot S` | custom snapshot (its size is baked in; `--size` is ignored) | Daytona default image |
+| `--aws-profile P` | forward named AWS profile as an expiring sandbox session; install AWS/EKS tools | — |
+| `--secret-env VAR` | forward one set local environment variable; repeatable | — |
+| `--allow-static-aws` | explicitly permit a non-expiring AWS credential (discouraged) | off |
+
+### AWS and secret forwarding
+
+AWS access and arbitrary environment secrets are always opt-in. Use a dedicated
+assumed-role or IAM Identity Center profile, not a static default profile:
+
+```bash
+export DAYTONA_API_KEY=…
+export CLOUDFLARE_API_TOKEN=…
+
+devflow up dalinkstone/helm-charts \
+  --agent codex --branch codex/daytona-v0199-canary \
+  --name dv-daytona-v0199 --size large \
+  --aws-profile devflow-deployer \
+  --secret-env DAYTONA_API_KEY \
+  --secret-env CLOUDFLARE_API_TOKEN \
+  --task "Verify HEAD is 6ba15ea, deploy, test, collect evidence, and do not teardown."
+```
+
+Before Daytona creates or starts anything, devflow runs `aws configure
+export-credentials --profile P --format process`, requires
+`AccessKeyId`/`SecretAccessKey`/`SessionToken`/`Expiration`, and checks the
+identity with STS. Static credentials fail closed unless `--allow-static-aws`
+is present. The remote profile is always named `devflow`; devflow writes
+`~/.aws/credentials`, `~/.aws/config`, and `~/.devflow/{aws,forwarded}.env`
+mode 0600. The temporary upload is shredded after auth.
+
+When AWS forwarding is selected, the tools phase ensures AWS CLI v2, eksctl,
+kubectl, Helm, yq, helm-unittest, ShellCheck, Docker, Python/venv, and the
+supporting system packages are available. A running Docker daemon still
+depends on the Daytona snapshot being Docker-in-Docker capable.
 
 ### The fire-and-forget pattern
 
@@ -306,6 +340,19 @@ devflow token         # mint + store the 1-year Claude subscription token
 If Codex auth goes stale inside a sandbox: `devflow sync`, or run
 `codex login --device-auth` in the sandbox shell.
 
+Refresh cloud credentials and selected environment secrets with the same flags
+used on `up`:
+
+```bash
+devflow sync dv-daytona-v0199 \
+  --aws-profile devflow-deployer \
+  --secret-env DAYTONA_API_KEY \
+  --secret-env CLOUDFLARE_API_TOKEN
+```
+
+`sync` re-runs the tools phase when `--aws-profile` is supplied and then
+atomically replaces the credential files and recorded expiration.
+
 ## Configuration
 
 ```bash
@@ -356,6 +403,8 @@ automatically by the last build) picks which one `up` uses.
 | anything unclear | `devflow doctor` |
 | "not logged in to Daytona" | `daytona login` (or `devflow setup`) |
 | agent says logged out | `devflow sync NAME` |
+| AWS credentials expired | renew the local SSO/role session, then `devflow sync NAME --aws-profile PROFILE` |
+| Docker client cannot reach daemon | use a Daytona snapshot configured for Docker-in-Docker |
 | claude refuses bypass mode | sandbox user is root (custom image) — devflow falls back to acceptEdits; prefer non-root images |
 | harness missing | `devflow exec NAME -- 'tail -20 ~/.devflow/omc-install.log ~/.devflow/omx-install.log'` |
 | daytona CLI/API version-mismatch warning | `brew upgrade daytonaio/cli/daytona` |

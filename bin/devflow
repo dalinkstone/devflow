@@ -3,8 +3,9 @@
 #  devflow — your agentic cloud dev environment
 #
 #  Spin up Claude Code or Codex in a Daytona sandbox using your existing
-#  subscriptions (Claude Max / ChatGPT Pro) — no API keys. Sessions live in
-#  tmux inside the sandbox, so you can close your laptop and reattach from
+#  subscriptions (Claude Max / ChatGPT Pro) — no agent API keys. Optional
+#  deployment credentials are forwarded only through explicit flags. Sessions
+#  live in tmux inside the sandbox, so you can close your laptop and reattach from
 #  anywhere with `devflow attach`.
 #
 #  https://github.com/dalinkstone/devflow
@@ -298,6 +299,55 @@ harvest_all() {
   # --- git identity ---
   GIT_NAME="$(git config --global user.name 2>/dev/null || git config user.name 2>/dev/null || true)"
   GIT_EMAIL="$(git config --global user.email 2>/dev/null || git config user.email 2>/dev/null || true)"
+
+  # --- explicit deployment credentials (opt-in per invocation) ---
+  AWS_ENABLED=0 AWS_CREDS_B64="" AWS_CONFIG_B64="" AWS_EXPIRATION="" AWS_SOURCE_PROFILE=""
+  SECRET_ENV_B64="" SECRET_ENV_NAMES=""
+  if [ -n "${DEVFLOW_AWS_PROFILE:-}" ]; then
+    have_cmd aws || die "--aws-profile requires the AWS CLI locally"
+    local aws_json aws_key aws_secret aws_token aws_region aws_creds aws_config
+    aws_json="$(aws configure export-credentials --profile "$DEVFLOW_AWS_PROFILE" --format process 2>/dev/null)" \
+      || die "could not resolve AWS profile '$DEVFLOW_AWS_PROFILE' (log in/refresh it, then retry)"
+    aws_key="$(printf '%s' "$aws_json" | jq -r '.AccessKeyId // empty')"
+    aws_secret="$(printf '%s' "$aws_json" | jq -r '.SecretAccessKey // empty')"
+    aws_token="$(printf '%s' "$aws_json" | jq -r '.SessionToken // empty')"
+    AWS_EXPIRATION="$(printf '%s' "$aws_json" | jq -r '.Expiration // empty')"
+    [ -n "$aws_key" ] && [ -n "$aws_secret" ] \
+      || die "AWS profile '$DEVFLOW_AWS_PROFILE' did not resolve usable credentials"
+    if { [ -z "$aws_token" ] || [ -z "$AWS_EXPIRATION" ]; } && [ "${DEVFLOW_ALLOW_STATIC_AWS:-0}" != 1 ]; then
+      die "AWS profile '$DEVFLOW_AWS_PROFILE' resolved non-expiring/static credentials; use an assumed-role/SSO profile (or explicitly accept the risk with --allow-static-aws)"
+    fi
+    aws sts get-caller-identity --profile "$DEVFLOW_AWS_PROFILE" >/dev/null 2>&1 \
+      || die "AWS profile '$DEVFLOW_AWS_PROFILE' failed sts:GetCallerIdentity"
+    aws_region="$(aws configure get region --profile "$DEVFLOW_AWS_PROFILE" 2>/dev/null || true)"
+    [ -n "$aws_region" ] || aws_region="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
+    aws_creds="[devflow]
+aws_access_key_id = $aws_key
+aws_secret_access_key = $aws_secret"
+    [ -n "$aws_token" ] && aws_creds="$aws_creds
+aws_session_token = $aws_token"
+    aws_config="[profile devflow]
+region = $aws_region
+output = json"
+    AWS_CREDS_B64="$(printf '%s\n' "$aws_creds" | b64_encode)"
+    AWS_CONFIG_B64="$(printf '%s\n' "$aws_config" | b64_encode)"
+    AWS_SOURCE_PROFILE="$DEVFLOW_AWS_PROFILE"
+    AWS_ENABLED=1
+  fi
+
+  if [ -n "${DEVFLOW_SECRET_ENV_NAMES:-}" ]; then
+    local env_name env_value env_payload=""
+    for env_name in $DEVFLOW_SECRET_ENV_NAMES; do
+      case "$env_name" in
+        ''|[0-9]*|*[!A-Za-z0-9_]*) die "invalid --secret-env name '$env_name'" ;;
+      esac
+      eval "env_value=\${$env_name-}"
+      [ -n "$env_value" ] || die "--secret-env $env_name is unset or empty"
+      env_payload="$env_payload$(printf 'export %s=%q' "$env_name" "$env_value")"$'\n'
+      SECRET_ENV_NAMES="${SECRET_ENV_NAMES}${SECRET_ENV_NAMES:+ }$env_name"
+    done
+    SECRET_ENV_B64="$(printf '%s' "$env_payload" | b64_encode)"
+  fi
   return 0
 }
 
@@ -312,6 +362,13 @@ build_secrets_bundle() { # stdout: env file consumed by the sandbox provisioner
   printf 'DV_GIT_EMAIL=%q\n' "${GIT_EMAIL:-}"
   printf 'DV_GH_PIN=%s\n' "$GH_PIN_VERSION"
   printf 'DV_CODEX_PIN=%s\n' "$CODEX_PIN_TAG"
+  printf 'DV_AWS_ENABLED=%s\n' "$AWS_ENABLED"
+  printf 'DV_AWS_CREDS_B64=%s\n' "$AWS_CREDS_B64"
+  printf 'DV_AWS_CONFIG_B64=%s\n' "$AWS_CONFIG_B64"
+  printf 'DV_AWS_EXPIRATION=%q\n' "$AWS_EXPIRATION"
+  printf 'DV_AWS_SOURCE_PROFILE=%q\n' "$AWS_SOURCE_PROFILE"
+  printf 'DV_SECRET_ENV_B64=%s\n' "$SECRET_ENV_B64"
+  printf 'DV_SECRET_ENV_NAMES=%q\n' "$SECRET_ENV_NAMES"
 }
 
 auth_summary() { # print what will be synced (no secret values)
@@ -326,6 +383,12 @@ auth_summary() { # print what will be synced (no secret values)
   else warn "Codex: no ~/.codex/auth.json — run 'codex' locally and sign in with ChatGPT first"; fi
   if [ -n "$GH_TOKEN_VAL" ]; then ok "GitHub: gh token will be forwarded"
   else warn "GitHub: gh not authenticated — private clones/pushes won't work (gh auth login)"; fi
+  if [ "$AWS_ENABLED" = 1 ]; then
+    if [ -n "$AWS_EXPIRATION" ]; then ok "AWS: temporary profile '$AWS_SOURCE_PROFILE' (expires $AWS_EXPIRATION)"
+    else warn "AWS: static profile '$AWS_SOURCE_PROFILE' explicitly allowed"; fi
+    step "AWS deployment toolchain will be installed in the sandbox"
+  fi
+  [ -n "$SECRET_ENV_NAMES" ] && ok "secret env: forwarding named variables ($SECRET_ENV_NAMES)"
 }
 
 # ----------------------------------------------------------------------------
@@ -436,6 +499,8 @@ gh_curl() { # authenticated GitHub download when possible (rate limits)
 load_secrets() {
   DV_CLAUDE_MODE=none DV_CLAUDE_TOKEN="" DV_CLAUDE_CREDS_B64="" DV_CODEX_AUTH_B64=""
   DV_GH_TOKEN="" DV_GIT_NAME="" DV_GIT_EMAIL="" DV_GH_PIN="2.96.0" DV_CODEX_PIN="rust-v0.142.5"
+  DV_AWS_ENABLED=0 DV_AWS_CREDS_B64="" DV_AWS_CONFIG_B64="" DV_AWS_EXPIRATION="" DV_AWS_SOURCE_PROFILE=""
+  DV_SECRET_ENV_B64="" DV_SECRET_ENV_NAMES=""
   if [ -f "$DV_STAGE/secrets.env" ]; then
     # shellcheck disable=SC1090
     . "$DV_STAGE/secrets.env"
@@ -478,6 +543,88 @@ link_global_bin() { # expose an npm-global binary at ~/.local/bin
   return 0
 }
 
+cloud_arch() { case "$(uname -m)" in aarch64|arm64) printf 'arm64' ;; *) printf 'amd64' ;; esac; }
+aws_arch()   { case "$(uname -m)" in aarch64|arm64) printf 'aarch64' ;; *) printf 'x86_64' ;; esac; }
+
+install_cloud_tools() {
+  [ "${DV_AWS_ENABLED:-0}" = 1 ] || return 0
+  log "installing AWS deployment toolchain (aws, eksctl, kubectl, helm, yq, envsubst, shellcheck, docker)…"
+  apt_install unzip gettext-base openssh-client openssl file shellcheck docker.io \
+    python3 python3-venv python3-pip ca-certificates || true
+  local t arch kver
+  arch="$(cloud_arch)"
+
+  if ! command -v aws >/dev/null 2>&1; then
+    t="$(mktemp -d)"
+    if curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(aws_arch).zip" -o "$t/aws.zip" \
+       && unzip -q "$t/aws.zip" -d "$t" \
+       && "$t/aws/install" -i "$HOME/.local/aws-cli" -b "$HOME/.local/bin" >/dev/null; then :
+    else rm -rf "$t"; fail "AWS CLI install failed"; fi
+    rm -rf "$t"
+  fi
+
+  if ! command -v eksctl >/dev/null 2>&1; then
+    t="$(mktemp -d)"
+    if curl -fsSL "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_Linux_${arch}.tar.gz" -o "$t/eksctl.tgz" \
+       && tar -xzf "$t/eksctl.tgz" -C "$t" \
+       && install -m 0755 "$t/eksctl" "$HOME/.local/bin/eksctl"; then :
+    else rm -rf "$t"; fail "eksctl install failed"; fi
+    rm -rf "$t"
+  fi
+
+  if ! command -v kubectl >/dev/null 2>&1; then
+    kver="$(curl -fsSL https://dl.k8s.io/release/stable.txt 2>/dev/null || true)"
+    [ -n "$kver" ] || fail "could not resolve the current stable kubectl version"
+    curl -fsSL "https://dl.k8s.io/release/${kver}/bin/linux/${arch}/kubectl" -o "$HOME/.local/bin/kubectl" \
+      || fail "kubectl install failed"
+    chmod 0755 "$HOME/.local/bin/kubectl"
+  fi
+
+  if ! command -v helm >/dev/null 2>&1; then
+    t="$(mktemp -d)"
+    if curl -fsSL "https://get.helm.sh/helm-v3.18.4-linux-${arch}.tar.gz" -o "$t/helm.tgz" \
+       && tar -xzf "$t/helm.tgz" -C "$t" \
+       && install -m 0755 "$t/linux-${arch}/helm" "$HOME/.local/bin/helm"; then :
+    else rm -rf "$t"; fail "helm install failed"; fi
+    rm -rf "$t"
+  fi
+
+  if ! command -v yq >/dev/null 2>&1; then
+    curl -fsSL "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_${arch}" -o "$HOME/.local/bin/yq" \
+      || fail "yq install failed"
+    chmod 0755 "$HOME/.local/bin/yq"
+  fi
+
+  if ! helm unittest --help >/dev/null 2>&1; then
+    helm plugin install https://github.com/helm-unittest/helm-unittest.git --version v1.1.1 \
+      > "$DV_DIR/helm-unittest-install.log" 2>&1 \
+      || fail "helm-unittest install failed (see ~/.devflow/helm-unittest-install.log)"
+  fi
+
+  # Daytona's Docker-in-Docker snapshots can run dockerd. On a plain snapshot
+  # the CLI is still installed, and a clear warning tells the operator to use
+  # a prebuilt image or a DIND-capable snapshot.
+  if command -v docker >/dev/null 2>&1 && ! docker info >/dev/null 2>&1; then
+    [ -n "$SUDO" ] && $SUDO service docker start >/dev/null 2>&1 || true
+    if ! docker info >/dev/null 2>&1 && [ -n "$SUDO" ] && $SUDO docker info >/dev/null 2>&1; then
+      cat > "$HOME/.local/bin/docker" <<'DV_DOCKER_WRAPPER'
+#!/usr/bin/env bash
+exec sudo -n /usr/bin/docker "$@"
+DV_DOCKER_WRAPPER
+      chmod 0755 "$HOME/.local/bin/docker"
+    fi
+  fi
+
+  for t in aws eksctl kubectl helm yq envsubst jq ssh-keygen curl openssl shellcheck docker file python3; do
+    command -v "$t" >/dev/null 2>&1 || fail "AWS deployment tool missing after install: $t"
+  done
+  if docker info >/dev/null 2>&1; then
+    log "AWS deployment toolchain ready (Docker daemon available)"
+  else
+    log "warn: Docker CLI installed but daemon unavailable — use a prebuilt runner image or a DIND-capable Daytona snapshot"
+  fi
+}
+
 # ============================ phase: tools ===================================
 phase_tools() {
   log "phase 1/4 tools: checking base packages…"
@@ -493,6 +640,7 @@ phase_tools() {
   command -v tmux >/dev/null 2>&1 || log "warn: no tmux — sessions won't survive disconnects"
   command -v jq   >/dev/null 2>&1 || apt_install jq || true
   command -v rg   >/dev/null 2>&1 || apt_install ripgrep || true
+  install_cloud_tools
 
   # ---- gh CLI ----
   if ! command -v gh >/dev/null 2>&1; then
@@ -559,7 +707,8 @@ phase_auth() {
   log "phase 2/4 auth: applying subscription credentials…"
   load_secrets
   umask 077
-  mkdir -p "$HOME/.claude" "$HOME/.codex"
+  mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.aws"
+  chmod 700 "$HOME/.aws"
 
   : > "$DV_DIR/env"
   chmod 600 "$DV_DIR/env"
@@ -575,6 +724,8 @@ phase_auth() {
       ;;
     *) log "claude auth: none provided (claude will ask to log in)" ;;
   esac
+  printf '%s\n' '[ -f "$HOME/.devflow/forwarded.env" ] && . "$HOME/.devflow/forwarded.env"' >> "$DV_DIR/env"
+  printf '%s\n' '[ -f "$HOME/.devflow/aws.env" ] && . "$HOME/.devflow/aws.env"' >> "$DV_DIR/env"
 
   if [ -n "$DV_CODEX_AUTH_B64" ]; then
     printf '%s' "$DV_CODEX_AUTH_B64" | base64 -d > "$HOME/.codex/auth.json"
@@ -595,7 +746,37 @@ phase_auth() {
   git config --global init.defaultBranch main 2>/dev/null || true
   git config --global push.autoSetupRemote true 2>/dev/null || true
 
-  rm -f "$DV_STAGE/secrets.env"
+  if [ "${DV_AWS_ENABLED:-0}" = 1 ]; then
+    printf '%s' "$DV_AWS_CREDS_B64" | base64 -d > "$HOME/.aws/credentials"
+    printf '%s' "$DV_AWS_CONFIG_B64" | base64 -d > "$HOME/.aws/config"
+    chmod 600 "$HOME/.aws/credentials" "$HOME/.aws/config"
+    {
+      printf 'export AWS_PROFILE=devflow\n'
+      printf 'export AWS_SDK_LOAD_CONFIG=1\n'
+      printf 'export AWS_CREDENTIAL_EXPIRATION=%q\n' "$DV_AWS_EXPIRATION"
+      printf 'export DEVFLOW_AWS_EXPIRATION=%q\n' "$DV_AWS_EXPIRATION"
+    } > "$DV_DIR/aws.env"
+    chmod 600 "$DV_DIR/aws.env"
+    printf '%s' "$DV_AWS_EXPIRATION" > "$DV_DIR/aws-expiration"
+    printf '%s' "$DV_AWS_SOURCE_PROFILE" > "$DV_DIR/aws-profile"
+    chmod 600 "$DV_DIR/aws-expiration" "$DV_DIR/aws-profile"
+    if [ -n "$DV_AWS_EXPIRATION" ]; then
+      log "aws auth: temporary session applied (expires $DV_AWS_EXPIRATION)"
+    else
+      log "aws auth: explicitly allowed static credentials applied"
+    fi
+  fi
+
+  if [ -n "${DV_SECRET_ENV_B64:-}" ]; then
+    printf '%s' "$DV_SECRET_ENV_B64" | base64 -d > "$DV_DIR/forwarded.env"
+    chmod 600 "$DV_DIR/forwarded.env"
+    printf '%s' "$DV_SECRET_ENV_NAMES" > "$DV_DIR/forwarded-env-names"
+    chmod 600 "$DV_DIR/forwarded-env-names"
+    log "secret env: named variables applied ($DV_SECRET_ENV_NAMES)"
+  fi
+
+  if command -v shred >/dev/null 2>&1; then shred -u "$DV_STAGE/secrets.env" 2>/dev/null || rm -f "$DV_STAGE/secrets.env"
+  else rm -f "$DV_STAGE/secrets.env"; fi
   umask 022
   log "auth done."
 }
@@ -1257,11 +1438,32 @@ forward_daytona() { # NAME — daytona CLI + API auth + devflow itself, inside t
 # ----------------------------------------------------------------------------
 # Commands
 # ----------------------------------------------------------------------------
+set_forwarding_options() { # AWS_PROFILE SECRET_ENV_NAMES ALLOW_STATIC
+  DEVFLOW_AWS_PROFILE="$1"
+  DEVFLOW_SECRET_ENV_NAMES="$2"
+  DEVFLOW_ALLOW_STATIC_AWS="$3"
+  _HARVESTED=0
+  if [ -n "$DEVFLOW_AWS_PROFILE" ]; then
+    need_cmd aws "install AWS CLI v2"
+    need_cmd jq "brew install jq"
+  fi
+}
+
+refresh_forwarded_auth() { # NAME [RUN_TOOLS]
+  local name="$1" run_tools="${2:-0}"
+  ensure_running "$name"
+  step "re-syncing auth and explicitly forwarded credentials into '$name'…"
+  upload_provisioner "$name" 1
+  [ "$run_tools" = 1 ] && run_phase "$name" tools "" "" "" "" "core"
+  run_phase "$name" auth "" "" "" "" "core"
+  ok "auth refreshed in '$name'"
+}
+
 cmd_up() {
   local repo="" name="" branch="" agent="$DEVFLOW_AGENT" task="" attach=1 fresh=0 blank=0
   local size="" cpu="$DEVFLOW_CPU" memory="$DEVFLOW_MEMORY" disk="$DEVFLOW_DISK" auto_stop="$DEVFLOW_AUTO_STOP"
   local snapshot="$DEVFLOW_SNAPSHOT" explicit_resources=0 harness="$DEVFLOW_HARNESS"
-  local script="" with_daytona=0
+  local script="" with_daytona=0 aws_profile="" secret_env_names="" allow_static_aws=0
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1277,6 +1479,9 @@ cmd_up() {
       --auto-stop)  need_val "$1" "${2:-}"; auto_stop="$2"; shift 2 ;;
       --snapshot)   need_val "$1" "${2:-}"; snapshot="$2"; shift 2 ;;
       --script)     need_val "$1" "${2:-}"; script="$2"; shift 2 ;;
+      --aws-profile) need_val "$1" "${2:-}"; aws_profile="$2"; shift 2 ;;
+      --secret-env) need_val "$1" "${2:-}"; secret_env_names="${secret_env_names}${secret_env_names:+ }$2"; shift 2 ;;
+      --allow-static-aws) allow_static_aws=1; shift ;;
       --with-daytona) with_daytona=1; shift ;;
       --no-attach)  attach=0; shift ;;
       --fresh)      fresh=1; shift ;;
@@ -1291,6 +1496,9 @@ cmd_up() {
     esac
   done
   [ -n "$script" ] && [ ! -f "$script" ] && die "script not found: $script"
+  set_forwarding_options "$aws_profile" "$secret_env_names" "$allow_static_aws"
+  # Resolve and validate credentials before creating anything billable.
+  if [ -n "$aws_profile$secret_env_names" ]; then harvest_all; fi
 
   case "$agent" in claude|codex|both|none) ;; *) die "invalid --agent '$agent' (claude|codex|both|none)" ;; esac
   case "$harness" in auto|omc|omx|both|core|none) ;; *) die "invalid --harness '$harness' (auto|omc|omx|both|core|none)" ;; esac
@@ -1351,7 +1559,10 @@ cmd_up() {
       dt delete "$name" >/dev/null 2>&1 || true
     else
       say "sandbox '$name' already exists ($st). (--fresh recreates, -n NAME makes another)"
-      if [ "$with_daytona" = 1 ] || [ -n "$script" ]; then ensure_running "$name"; fi
+      if [ "$with_daytona" = 1 ] || [ -n "$script$aws_profile$secret_env_names" ]; then ensure_running "$name"; fi
+      if [ -n "$aws_profile$secret_env_names" ]; then
+        refresh_forwarded_auth "$name" "$([ -n "$aws_profile" ] && printf 1 || printf 0)"
+      fi
       [ "$with_daytona" = 1 ] && { forward_daytona "$name" || warn "daytona forwarding failed"; }
       [ -n "$script" ] && { run_user_script "$name" "$script" || warn "script launch failed"; }
       if [ "$attach" = 1 ] && [ -t 0 ]; then
@@ -1955,13 +2166,23 @@ cmd_rm() {
 
 cmd_sync() {
   need_cmd jq "brew install jq"
-  local name
-  name="$(resolve_name "${1:-}")" || exit 1
-  ensure_running "$name"
-  step "re-syncing subscription auth into '$name'…"
-  upload_provisioner "$name" 1
-  run_phase "$name" auth "" "" "" ""
-  ok "auth refreshed in '$name'"
+  local name="" aws_profile="" secret_env_names="" allow_static_aws=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --aws-profile) need_val "$1" "${2:-}"; aws_profile="$2"; shift 2 ;;
+      --secret-env) need_val "$1" "${2:-}"; secret_env_names="${secret_env_names}${secret_env_names:+ }$2"; shift 2 ;;
+      --allow-static-aws) allow_static_aws=1; shift ;;
+      -h|--help)
+        echo "usage: devflow sync [NAME] [--aws-profile PROFILE] [--secret-env VARIABLE] [--allow-static-aws]"
+        return 0 ;;
+      -*) die "unknown flag for sync: $1" ;;
+      *) [ -z "$name" ] || die "sync accepts at most one sandbox name"; name="$1"; shift ;;
+    esac
+  done
+  set_forwarding_options "$aws_profile" "$secret_env_names" "$allow_static_aws"
+  [ -n "$aws_profile$secret_env_names" ] && harvest_all
+  name="$(resolve_name "$name")" || exit 1
+  refresh_forwarded_auth "$name" "$([ -n "$aws_profile" ] && printf 1 || printf 0)"
 }
 
 cmd_token() {
@@ -2273,6 +2494,14 @@ ${C_BOLD}devflow up${C_RESET} [REPO] [flags] — create (or reattach to) a cloud
       --with-daytona  give the sandbox your Daytona CLI + API key + devflow,
                       so scripts/agents in it can spin up SIBLING sandboxes
                       (they bill your account — clean up with devflow rm)
+      --aws-profile P resolve and forward profile P as a temporary AWS session;
+                      also installs aws/eksctl/kubectl/helm/yq/envsubst,
+                      helm-unittest, shellcheck, Docker, and supporting tools
+      --secret-env V  forward the named local environment variable through the
+                      encrypted 0600 auth bundle (repeatable; values never log)
+      --allow-static-aws
+                      explicitly permit non-expiring AWS credentials (unsafe;
+                      assumed-role or IAM Identity Center profiles preferred)
   -b, --branch B      checkout (or create) branch B
   -n, --name N        sandbox name (default: dv-<repo>)
       --blank         no repo — empty scratch sandbox
@@ -2309,7 +2538,8 @@ ${C_BOLD}daily driving${C_RESET}
   devflow ls                    list sandboxes
   devflow stop [NAME|--all]     stop (disk kept) — attach restarts + resumes
   devflow rm [NAME|--all]       delete sandbox
-  devflow sync [NAME]           re-sync subscription auth into a sandbox
+  devflow sync [NAME] [flags]   re-sync auth; accepts --aws-profile P,
+                                repeatable --secret-env V, --allow-static-aws
 
 ${C_BOLD}more${C_RESET}
   devflow ssh [NAME]            SSH in (lands in tmux; detach: Ctrl-b d)

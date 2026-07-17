@@ -12,7 +12,7 @@ Formula/devflow.rb              Homebrew formula (this repo doubles as the tap)
 Makefile                        install / lint / test / test-docker
 docs/                           this documentation
 tests/run-tests.sh              hermetic functional suite (fake CLIs)
-tests/fakebin/{daytona,gh,security,curl,qrencode,pbcopy,op,bw,osascript}   PATH-shim fakes
+tests/fakebin/{daytona,gh,aws,security,curl,qrencode,pbcopy,op,bw,osascript}   PATH-shim fakes
 tests/docker-provision-test.sh  real provisioner in ubuntu:24.04 (needs Docker)
 .github/workflows/ci.yml        lint+test (ubuntu, macos) + docker provision
 ```
@@ -108,7 +108,8 @@ when the sandbox can't query the GitHub API) and mirrored in
   `FAKE_EXEC_STYLE=argv|join`; **materializes `dt_push_file` uploads** into
   `$FAKE_STATE_DIR/fs/<remote-path>` so tests assert on the exact decoded
   bytes (log-parsing proved environment-brittle — don't go back to it).
-- `gh` / `security` / `curl` — canned auth fixtures, the ssh-access API, and
+- `gh` / `aws` / `security` / `curl` — canned auth fixtures, temporary/static
+  credential export and STS identity, the ssh-access API, and
   a silent-accept ntfy push endpoint.
 - `qrencode` / `pbcopy` — deterministic `FAKE-QR[payload]` marker instead of
   a real QR (`FAKE_QRENCODE_FAIL=1` simulates a broken install) and a

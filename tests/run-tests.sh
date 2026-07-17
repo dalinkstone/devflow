@@ -72,6 +72,9 @@ run_devflow() { # args… (stdin=/dev/null, captures stdout+stderr, sets RC/OUT)
       DEVFLOW_CONFIG_DIR="$T_CONFIG" \
       FAKE_LOG="$T_LOG" FAKE_STATE_DIR="$T_STATE" FAKE_EXEC_STYLE="$EXEC_STYLE" \
       FAKE_QRENCODE_FAIL="${FAKE_QRENCODE_FAIL:-}" FAKE_OP_FAIL="${FAKE_OP_FAIL:-}" \
+      FAKE_AWS_STATIC="${FAKE_AWS_STATIC:-0}" \
+      DAYTONA_API_KEY="${TEST_DAYTONA_API_KEY:-}" \
+      CLOUDFLARE_API_TOKEN="${TEST_CLOUDFLARE_API_TOKEN:-}" \
       CODEX_HOME="$T_HOME/.codex" \
       "$DEVFLOW" "$@" </dev/null 2>&1)"
   RC=$?
@@ -529,7 +532,51 @@ assert_contains "sandbox got the minted key" "$(extract_pushed_file /tmp/.dv-day
 assert_contains "sandbox config carries the org" "$(extract_pushed_file /tmp/.dv-daytona-config)" "org-123"
 
 # ===========================================================================
-echo "# 11..payload self-checks"
+echo "# 11..AWS + explicit secret forwarding"
+# ===========================================================================
+fresh_env argv
+TEST_DAYTONA_API_KEY="dtn_DEPLOY_FAKE"
+TEST_CLOUDFLARE_API_TOKEN="cf_DEPLOY_FAKE"
+
+run_devflow up tester/aws-deploy --agent codex --aws-profile devflow-deployer \
+  --secret-env DAYTONA_API_KEY --secret-env CLOUDFLARE_API_TOKEN --no-attach
+assert_rc "AWS forwarding up exits 0" "$RC" 0
+assert_contains "AWS forwarding announces temporary expiry" "$OUT" "temporary profile 'devflow-deployer'"
+assert_contains "AWS forwarding announces toolchain" "$OUT" "AWS deployment toolchain"
+assert_file_contains "AWS profile resolved through export-credentials" "$T_LOG" "aws configure export-credentials --profile devflow-deployer --format process"
+assert_file_contains "AWS identity validated before forwarding" "$T_LOG" "aws sts get-caller-identity --profile devflow-deployer"
+
+AWS_SECRETS="$(extract_pushed_file /tmp/.dv-secrets.env)"
+AWS_CREDS_LINE="$(printf '%s\n' "$AWS_SECRETS" | sed -n 's/^DV_AWS_CREDS_B64=//p')"
+AWS_CONFIG_LINE="$(printf '%s\n' "$AWS_SECRETS" | sed -n 's/^DV_AWS_CONFIG_B64=//p')"
+FORWARDED_LINE="$(printf '%s\n' "$AWS_SECRETS" | sed -n 's/^DV_SECRET_ENV_B64=//p')"
+DECODED_AWS_CREDS="$(printf '%s' "$AWS_CREDS_LINE" | base64 --decode 2>/dev/null)"
+DECODED_AWS_CONFIG="$(printf '%s' "$AWS_CONFIG_LINE" | base64 --decode 2>/dev/null)"
+DECODED_FORWARDED="$(printf '%s' "$FORWARDED_LINE" | base64 --decode 2>/dev/null)"
+assert_contains "AWS credentials use sandbox-only profile" "$DECODED_AWS_CREDS" "[devflow]"
+assert_contains "AWS session token forwarded" "$DECODED_AWS_CREDS" "temporary-session-token-fake"
+assert_contains "AWS region forwarded" "$DECODED_AWS_CONFIG" "us-west-2"
+assert_contains "named Daytona secret forwarded" "$DECODED_FORWARDED" "DAYTONA_API_KEY=dtn_DEPLOY_FAKE"
+assert_contains "named Cloudflare secret forwarded" "$DECODED_FORWARDED" "CLOUDFLARE_API_TOKEN=cf_DEPLOY_FAKE"
+assert_not_contains "secret values never appear in user output" "$OUT" "dtn_DEPLOY_FAKE"
+
+run_devflow sync dv-aws-deploy --aws-profile devflow-deployer --secret-env DAYTONA_API_KEY
+assert_rc "AWS credential sync exits 0" "$RC" 0
+assert_contains "AWS credential sync reports refresh" "$OUT" "auth refreshed"
+
+FAKE_AWS_STATIC=1
+run_devflow up tester/static-rejected --aws-profile default --no-attach
+assert_rc "static AWS credentials rejected by default" "$RC" 1
+assert_contains "static rejection explains the safe path" "$OUT" "assumed-role/SSO profile"
+assert_not_contains "rejected static credentials create no sandbox" "$(cat "$T_LOG")" "--name=dv-static-rejected"
+
+run_devflow up tester/static-allowed --aws-profile default --allow-static-aws --no-attach
+assert_rc "static AWS credentials require explicit override" "$RC" 0
+assert_contains "static override is visibly warned" "$OUT" "static profile 'default' explicitly allowed"
+unset FAKE_AWS_STATIC TEST_DAYTONA_API_KEY TEST_CLOUDFLARE_API_TOKEN
+
+# ===========================================================================
+echo "# 12..payload self-checks"
 # ===========================================================================
 PROV="$("$DEVFLOW" __provision-script)"
 printf '%s\n' "$PROV" > "$WORK/prov.sh"
@@ -538,6 +585,11 @@ assert_contains "provision is phased" "$PROV" 'case "$DV_PHASE" in'
 assert_contains "provision writes CLAUDE.md" "$PROV" "devflow sandbox"
 assert_contains "provision guards root bypass" "$PROV" "acceptEdits"
 assert_contains "provision autotmux marker" "$PROV" "autotmux"
+assert_contains "provision installs AWS deployment tools" "$PROV" "installing AWS deployment toolchain"
+assert_contains "provision installs Python venv support" "$PROV" "python3-venv"
+assert_contains "provision writes AWS credentials securely" "$PROV" '"$HOME/.aws/credentials"'
+assert_contains "provision exports AWS expiration" "$PROV" "AWS_CREDENTIAL_EXPIRATION"
+assert_contains "provision forwards named secret env" "$PROV" "forwarded.env"
 
 DOCKERFILE="$("$DEVFLOW" __dockerfile)"
 assert_contains "dockerfile non-root user" "$DOCKERFILE" "USER daytona"

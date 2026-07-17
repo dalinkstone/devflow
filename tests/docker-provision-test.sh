@@ -22,6 +22,15 @@ trap 'rm -rf "$WORK"' EXIT
 # the clone target is a public repo so no auth is needed)
 FAKE_CREDS='{"claudeAiOauth":{"accessToken":"sk-ant-oat01-FAKE","refreshToken":"sk-ant-ort01-FAKE","expiresAt":9999999999,"subscriptionType":"max"}}'
 FAKE_CODEX='{"auth_mode":"chatgpt","tokens":{"id_token":"FAKE","access_token":"FAKE"},"last_refresh":"2026-01-01T00:00:00Z"}'
+FAKE_AWS_CREDS='[devflow]
+aws_access_key_id = ASIAFAKEDOCKER00000
+aws_secret_access_key = fake-docker-secret
+aws_session_token = fake-docker-session'
+FAKE_AWS_CONFIG='[profile devflow]
+region = us-west-2
+output = json'
+FAKE_FORWARDED='export DAYTONA_API_KEY=dtn_DOCKER_FAKE
+export CLOUDFLARE_API_TOKEN=cf_DOCKER_FAKE'
 {
   printf 'DV_CLAUDE_MODE=creds\n'
   printf 'DV_CLAUDE_TOKEN=\n'
@@ -32,6 +41,13 @@ FAKE_CODEX='{"auth_mode":"chatgpt","tokens":{"id_token":"FAKE","access_token":"F
   printf 'DV_GIT_EMAIL=docker@test.local\n'
   printf 'DV_GH_PIN=2.96.0\n'
   printf 'DV_CODEX_PIN=rust-v0.142.5\n'
+  printf 'DV_AWS_ENABLED=1\n'
+  printf 'DV_AWS_CREDS_B64=%s\n' "$(printf '%s' "$FAKE_AWS_CREDS" | base64 | tr -d '\n')"
+  printf 'DV_AWS_CONFIG_B64=%s\n' "$(printf '%s' "$FAKE_AWS_CONFIG" | base64 | tr -d '\n')"
+  printf 'DV_AWS_EXPIRATION=2099-01-01T00:00:00Z\n'
+  printf 'DV_AWS_SOURCE_PROFILE=devflow-deployer\n'
+  printf 'DV_SECRET_ENV_B64=%s\n' "$(printf '%s' "$FAKE_FORWARDED" | base64 | tr -d '\n')"
+  printf 'DV_SECRET_ENV_NAMES=DAYTONA_API_KEY\\ CLOUDFLARE_API_TOKEN\n'
 } > "$WORK/secrets.env"
 
 cat > "$WORK/inner.sh" <<'INNER'
@@ -81,6 +97,16 @@ check "claude installed + runs"   'command -v claude && claude --version'
 check "codex installed + runs"    'command -v codex && codex --version'
 check "jq installed"              'command -v jq'
 check "ripgrep installed"         'command -v rg'
+check "aws installed"             'command -v aws && aws --version'
+check "eksctl installed"          'command -v eksctl'
+check "kubectl installed"         'command -v kubectl'
+check "helm installed"            'command -v helm'
+check "helm-unittest installed"   'helm unittest --help'
+check "yq installed"              'command -v yq'
+check "envsubst installed"        'command -v envsubst'
+check "shellcheck installed"      'command -v shellcheck'
+check "docker cli installed"      'command -v docker'
+check "python3 installed"         'command -v python3'
 
 check "claude creds file"         "test -f $H/.claude/.credentials.json"
 checkmode "claude creds 600"      600 "$H/.claude/.credentials.json"
@@ -96,6 +122,15 @@ check "claude CLAUDE.md"          "grep -q 'Daytona cloud sandbox' $H/.claude/CL
 check "git identity name"         "git config --global user.name | grep -q 'Docker Test'"
 check "git identity email"        "git config --global user.email | grep -q docker@test.local"
 check "secrets file shredded"     "test ! -f $H/.devflow/stage/secrets.env"
+check "aws credentials file"      "grep -q ASIAFAKEDOCKER $H/.aws/credentials"
+checkmode "aws credentials 600"   600 "$H/.aws/credentials"
+check "aws config file"           "grep -q us-west-2 $H/.aws/config"
+checkmode "aws config 600"        600 "$H/.aws/config"
+check "aws expiry recorded"       "grep -q 2099-01-01 $H/.devflow/aws-expiration"
+check "named secrets forwarded"   "grep -q CLOUDFLARE_API_TOKEN $H/.devflow/forwarded.env"
+checkmode "forwarded secrets 600" 600 "$H/.devflow/forwarded.env"
+check "main env loads AWS"        "grep -q aws.env $H/.devflow/env"
+check "AWS expiration exported"   "grep -q 'AWS_CREDENTIAL_EXPIRATION=2099-01-01T00:00:00Z' $H/.devflow/aws.env"
 
 check "repo cloned"               "test -d $H/work/Hello-World/.git"
 check "workdir recorded"          "grep -q Hello-World $H/.devflow/workdir"

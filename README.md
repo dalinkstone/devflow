@@ -49,7 +49,8 @@ $ devflow peek            # or just glance at the agent's screen
   [`daytona` CLI](https://www.daytona.io/docs) — create, exec, ssh.
 - **Auth is harvested locally at launch** and injected into the sandbox:
   your Claude subscription token (or credentials), your Codex ChatGPT login,
-  your `gh` token, and your git identity. No API keys anywhere.
+  your `gh` token, and your git identity. Deployment credentials are forwarded
+  only when explicitly requested with `--aws-profile` / `--secret-env`.
 - **The session is tmux**, so SSH disconnects are meaningless. Attaching from
   a fresh machine lands you in the same screen, and if the sandbox was
   stopped, attach restarts it and the agent **resumes its conversation**
@@ -120,6 +121,45 @@ devflow config set K V        defaults: DEVFLOW_AGENT, DEVFLOW_SIZE, DEVFLOW_AUT
 you a tmux window for each (and OMC can even drive Codex workers: `omc team
 2:codex "review the auth flow"`). `up` on an existing sandbox just reattaches
 — it's idempotent.
+
+## Opt-in cloud deployment credentials
+
+Forward a named, expiring AWS session and only the environment secrets a job
+needs:
+
+```bash
+export DAYTONA_API_KEY=…
+export CLOUDFLARE_API_TOKEN=…
+
+devflow up dalinkstone/helm-charts \
+  --agent codex \
+  --branch codex/daytona-v0199-canary \
+  --name dv-daytona-v0199 \
+  --size large \
+  --aws-profile devflow-deployer \
+  --secret-env DAYTONA_API_KEY \
+  --secret-env CLOUDFLARE_API_TOKEN \
+  --task "Verify HEAD is exactly 6ba15ea, deploy the AWS canary, and run every test."
+```
+
+`--aws-profile` resolves the local profile with `aws configure
+export-credentials`, verifies it with STS, and forwards it as the sandbox-only
+profile `devflow`. The exported credentials must include a session token and
+expiration; static credentials are rejected unless you deliberately add
+`--allow-static-aws`. The AWS/EKS toolchain is installed automatically. Refresh
+an expiring session without rebuilding the sandbox:
+
+```bash
+devflow sync dv-daytona-v0199 \
+  --aws-profile devflow-deployer \
+  --secret-env DAYTONA_API_KEY \
+  --secret-env CLOUDFLARE_API_TOKEN
+```
+
+Use a dedicated assumed-role or IAM Identity Center profile with a session long
+enough for provisioning and tests. `--secret-env` is repeatable and names only
+variables already set in the local environment; values are never command-line
+arguments or console output.
 
 ## The multi-agent harness
 
@@ -201,6 +241,9 @@ custom snapshot.
   all. If that's not acceptable, this tool isn't the right fit.
 - devflow itself stores secrets only in `~/.config/devflow/secrets` (0600),
   and nothing is ever hardcoded in the repo.
+- Forwarded AWS sessions and `--secret-env` values exist only in memory on the
+  client and in `0600` sandbox files. The staging bundle is shredded during
+  auth; `devflow sync` replaces the files and refreshes recorded expiration.
 - Free-tier note: Daytona Tier 1/2 sandboxes have a network egress whitelist
   (GitHub, npm/pip, Anthropic, OpenAI, …) — agents work fine, but arbitrary
   outbound hosts need Tier 3+.
