@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Fake AWS CLI for hermetic credential-forwarding tests.
+set -u
+
+[ -n "${FAKE_LOG:-}" ] && printf 'aws %s\n' "$*" >> "$FAKE_LOG"
+
+case "${1:-} ${2:-}" in
+  "configure export-credentials")
+    if [ "${FAKE_AWS_STATIC:-0}" = 1 ]; then
+      printf '%s\n' '{"Version":1,"AccessKeyId":"AKIASTATICFAKE000000","SecretAccessKey":"static-secret-fake"}'
+    else
+      printf '%s\n' '{"Version":1,"AccessKeyId":"ASIAFAKESESSION00000","SecretAccessKey":"temporary-secret-fake","SessionToken":"temporary-session-token-fake","Expiration":"2099-01-01T00:00:00Z"}'
+    fi
+    ;;
+  "configure get")
+    printf '%s\n' 'us-west-2'
+    ;;
+  "sts get-caller-identity")
+    printf '%s\n' '{"Account":"111122223333","Arn":"arn:aws:sts::111122223333:assumed-role/devflow-deployer/devflow","UserId":"FAKE"}'
+    ;;
+  *)
+    case "${1:-}" in
+      --version) printf '%s\n' 'aws-cli/2.99.0 fake' ;;
+      *) exit 0 ;;
+    esac
+    ;;
+esac

@@ -3,8 +3,9 @@
 #  devflow — your agentic cloud dev environment
 #
 #  Spin up Claude Code or Codex in a Daytona sandbox using your existing
-#  subscriptions (Claude Max / ChatGPT Pro) — no API keys. Sessions live in
-#  tmux inside the sandbox, so you can close your laptop and reattach from
+#  subscriptions (Claude Max / ChatGPT Pro) — no agent API keys. Optional
+#  deployment credentials are forwarded only through explicit flags. Sessions
+#  live in tmux inside the sandbox, so you can close your laptop and reattach from
 #  anywhere with `devflow attach`.
 #
 #  https://github.com/dalinkstone/devflow
@@ -23,7 +24,8 @@ SECRETS_FILE="$CONFIG_DIR/secrets"
 
 GH_PIN_VERSION="2.96.0"          # fallback for in-sandbox gh install
 CODEX_PIN_TAG="rust-v0.142.5"    # fallback for in-sandbox codex install
-DT_PIN_VERSION="0.194.0"         # fallback for in-sandbox daytona install (--with-daytona)
+DT_PIN_VERSION="0.199.0"         # fallback for in-sandbox daytona install (--with-daytona)
+DV_EXPECTED_PROVISION_VERSION=5
 
 _CONFIG_KEYS="DEVFLOW_AGENT DEVFLOW_SIZE DEVFLOW_CPU DEVFLOW_MEMORY DEVFLOW_DISK DEVFLOW_AUTO_STOP DEVFLOW_TARGET DEVFLOW_SNAPSHOT DEVFLOW_CLAUDE_AUTH DEVFLOW_EXEC_STYLE DEVFLOW_WORKROOT DEVFLOW_HARNESS DEVFLOW_NTFY_URL DEVFLOW_NTFY_TOPIC DEVFLOW_AUTO_HANDOFF"
 
@@ -154,6 +156,14 @@ need_val() { [ -n "${2:-}" ] || die "flag $1 requires a value"; }
 
 b64_encode() { # portable, single-line output
   if base64 --help 2>&1 | grep -q -- '-w'; then base64 -w0; else base64 | tr -d '\n'; fi
+}
+
+b64_decode() { # portable stdin decoder
+  local data
+  data="$(cat)"
+  printf '%s' "$data" | base64 --decode 2>/dev/null \
+    || printf '%s' "$data" | base64 -D 2>/dev/null \
+    || printf '%s' "$data" | base64 -d
 }
 
 sanitize_name() {
@@ -298,6 +308,70 @@ harvest_all() {
   # --- git identity ---
   GIT_NAME="$(git config --global user.name 2>/dev/null || git config user.name 2>/dev/null || true)"
   GIT_EMAIL="$(git config --global user.email 2>/dev/null || git config user.email 2>/dev/null || true)"
+
+  # --- explicit deployment credentials (opt-in per invocation) ---
+  AWS_ENABLED=0 AWS_CREDS_B64="" AWS_CONFIG_B64="" AWS_EXPIRATION="" AWS_SOURCE_PROFILE=""
+  SECRET_ENV_B64="" SECRET_ENV_NAMES=""
+  local env_name env_value env_payload="" env_item env_assignment
+  if [ -n "${DEVFLOW_AWS_PROFILE:-}" ]; then
+    have_cmd aws || die "--aws-profile requires the AWS CLI locally"
+    local aws_json aws_key aws_secret aws_token aws_region aws_creds aws_config
+    aws_json="$(aws configure export-credentials --profile "$DEVFLOW_AWS_PROFILE" --format process 2>/dev/null)" \
+      || die "could not resolve AWS profile '$DEVFLOW_AWS_PROFILE' (log in/refresh it, then retry)"
+    aws_key="$(printf '%s' "$aws_json" | jq -r '.AccessKeyId // empty')"
+    aws_secret="$(printf '%s' "$aws_json" | jq -r '.SecretAccessKey // empty')"
+    aws_token="$(printf '%s' "$aws_json" | jq -r '.SessionToken // empty')"
+    AWS_EXPIRATION="$(printf '%s' "$aws_json" | jq -r '.Expiration // empty')"
+    [ -n "$aws_key" ] && [ -n "$aws_secret" ] \
+      || die "AWS profile '$DEVFLOW_AWS_PROFILE' did not resolve usable credentials"
+    if { [ -z "$aws_token" ] || [ -z "$AWS_EXPIRATION" ]; } && [ "${DEVFLOW_ALLOW_STATIC_AWS:-0}" != 1 ]; then
+      die "AWS profile '$DEVFLOW_AWS_PROFILE' resolved non-expiring/static credentials; use an assumed-role profile with an expiring STS session (or explicitly accept the risk with --allow-static-aws)"
+    fi
+    aws sts get-caller-identity --profile "$DEVFLOW_AWS_PROFILE" >/dev/null 2>&1 \
+      || die "AWS profile '$DEVFLOW_AWS_PROFILE' failed sts:GetCallerIdentity"
+    aws_region="$(aws configure get region --profile "$DEVFLOW_AWS_PROFILE" 2>/dev/null || true)"
+    [ -n "$aws_region" ] || aws_region="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
+    aws_creds="[devflow]
+aws_access_key_id = $aws_key
+aws_secret_access_key = $aws_secret"
+    [ -n "$aws_token" ] && aws_creds="$aws_creds
+aws_session_token = $aws_token"
+    aws_config="[profile devflow]
+region = $aws_region
+output = json"
+    AWS_CREDS_B64="$(printf '%s\n' "$aws_creds" | b64_encode)"
+    AWS_CONFIG_B64="$(printf '%s\n' "$aws_config" | b64_encode)"
+    AWS_SOURCE_PROFILE="$DEVFLOW_AWS_PROFILE"
+    AWS_ENABLED=1
+  fi
+
+  if [ -n "${DEVFLOW_SECRET_ENV_NAMES:-}" ]; then
+    for env_name in $DEVFLOW_SECRET_ENV_NAMES; do
+      case "$env_name" in
+        ''|[0-9]*|*[!A-Za-z0-9_]*) die "invalid --secret-env name '$env_name'" ;;
+      esac
+      eval "env_value=\${$env_name-}"
+      [ -n "$env_value" ] || die "--secret-env $env_name is unset or empty"
+      env_payload="$env_payload$(printf 'export %s=%q' "$env_name" "$env_value")"$'\n'
+      SECRET_ENV_NAMES="${SECRET_ENV_NAMES}${SECRET_ENV_NAMES:+ }$env_name"
+    done
+  fi
+  if [ -n "${DEVFLOW_ENV_ITEMS:-}" ]; then
+    for env_item in $DEVFLOW_ENV_ITEMS; do
+      env_assignment="$(printf '%s' "$env_item" | b64_decode)" \
+        || die "could not decode --env assignment"
+      case "$env_assignment" in
+        *=*) env_name="${env_assignment%%=*}"; env_value="${env_assignment#*=}" ;;
+        *) die "--env expects NAME=VALUE" ;;
+      esac
+      case "$env_name" in
+        ''|[0-9]*|*[!A-Za-z0-9_]*) die "invalid --env name '$env_name'" ;;
+      esac
+      env_payload="$env_payload$(printf 'export %s=%q' "$env_name" "$env_value")"$'\n'
+      SECRET_ENV_NAMES="${SECRET_ENV_NAMES}${SECRET_ENV_NAMES:+ }$env_name"
+    done
+  fi
+  [ -n "$env_payload" ] && SECRET_ENV_B64="$(printf '%s' "$env_payload" | b64_encode)"
   return 0
 }
 
@@ -312,6 +386,13 @@ build_secrets_bundle() { # stdout: env file consumed by the sandbox provisioner
   printf 'DV_GIT_EMAIL=%q\n' "${GIT_EMAIL:-}"
   printf 'DV_GH_PIN=%s\n' "$GH_PIN_VERSION"
   printf 'DV_CODEX_PIN=%s\n' "$CODEX_PIN_TAG"
+  printf 'DV_AWS_ENABLED=%s\n' "$AWS_ENABLED"
+  printf 'DV_AWS_CREDS_B64=%s\n' "$AWS_CREDS_B64"
+  printf 'DV_AWS_CONFIG_B64=%s\n' "$AWS_CONFIG_B64"
+  printf 'DV_AWS_EXPIRATION=%q\n' "$AWS_EXPIRATION"
+  printf 'DV_AWS_SOURCE_PROFILE=%q\n' "$AWS_SOURCE_PROFILE"
+  printf 'DV_SECRET_ENV_B64=%s\n' "$SECRET_ENV_B64"
+  printf 'DV_SECRET_ENV_NAMES=%q\n' "$SECRET_ENV_NAMES"
 }
 
 auth_summary() { # print what will be synced (no secret values)
@@ -326,6 +407,12 @@ auth_summary() { # print what will be synced (no secret values)
   else warn "Codex: no ~/.codex/auth.json — run 'codex' locally and sign in with ChatGPT first"; fi
   if [ -n "$GH_TOKEN_VAL" ]; then ok "GitHub: gh token will be forwarded"
   else warn "GitHub: gh not authenticated — private clones/pushes won't work (gh auth login)"; fi
+  if [ "$AWS_ENABLED" = 1 ]; then
+    if [ -n "$AWS_EXPIRATION" ]; then ok "AWS: temporary profile '$AWS_SOURCE_PROFILE' (expires $AWS_EXPIRATION)"
+    else warn "AWS: static profile '$AWS_SOURCE_PROFILE' explicitly allowed"; fi
+    step "AWS deployment toolchain will be installed in the sandbox"
+  fi
+  [ -n "$SECRET_ENV_NAMES" ] && ok "forwarded env: applying named variables ($SECRET_ENV_NAMES)"
 }
 
 # ----------------------------------------------------------------------------
@@ -371,7 +458,7 @@ set -o pipefail
 DV_DIR="$HOME/.devflow"
 DV_BIN="$DV_DIR/bin"
 DV_STAGE="$DV_DIR/stage"
-DV_PROVISION_VERSION=1
+DV_PROVISION_VERSION=5
 export PATH="$HOME/.local/bin:$DV_BIN:$PATH"
 
 : "${DV_PHASE:=all}"
@@ -425,6 +512,18 @@ ensure_node_path() { # surface nvm-installed node (default Daytona image uses nv
 arch_triple() { case "$(uname -m)" in aarch64|arm64) printf 'aarch64' ;; *) printf 'x86_64' ;; esac; }
 arch_gh()     { case "$(uname -m)" in aarch64|arm64) printf 'arm64'   ;; *) printf 'amd64'  ;; esac; }
 
+version_lt() { # VERSION MINIMUM; release versions only
+  awk -v have="$1" -v want="$2" 'BEGIN {
+    split(have, h, "."); split(want, w, ".")
+    for (i = 1; i <= 3; i++) {
+      h[i] += 0; w[i] += 0
+      if (h[i] < w[i]) exit 0
+      if (h[i] > w[i]) exit 1
+    }
+    exit 1
+  }'
+}
+
 gh_curl() { # authenticated GitHub download when possible (rate limits)
   if [ -n "${DV_GH_TOKEN:-}" ]; then
     curl -fsSL -H "Authorization: Bearer $DV_GH_TOKEN" "$@"
@@ -436,6 +535,8 @@ gh_curl() { # authenticated GitHub download when possible (rate limits)
 load_secrets() {
   DV_CLAUDE_MODE=none DV_CLAUDE_TOKEN="" DV_CLAUDE_CREDS_B64="" DV_CODEX_AUTH_B64=""
   DV_GH_TOKEN="" DV_GIT_NAME="" DV_GIT_EMAIL="" DV_GH_PIN="2.96.0" DV_CODEX_PIN="rust-v0.142.5"
+  DV_AWS_ENABLED=0 DV_AWS_CREDS_B64="" DV_AWS_CONFIG_B64="" DV_AWS_EXPIRATION="" DV_AWS_SOURCE_PROFILE=""
+  DV_SECRET_ENV_B64="" DV_SECRET_ENV_NAMES=""
   if [ -f "$DV_STAGE/secrets.env" ]; then
     # shellcheck disable=SC1090
     . "$DV_STAGE/secrets.env"
@@ -478,6 +579,88 @@ link_global_bin() { # expose an npm-global binary at ~/.local/bin
   return 0
 }
 
+cloud_arch() { case "$(uname -m)" in aarch64|arm64) printf 'arm64' ;; *) printf 'amd64' ;; esac; }
+aws_arch()   { case "$(uname -m)" in aarch64|arm64) printf 'aarch64' ;; *) printf 'x86_64' ;; esac; }
+
+install_cloud_tools() {
+  [ "${DV_AWS_ENABLED:-0}" = 1 ] || return 0
+  log "installing AWS deployment toolchain (aws, eksctl, kubectl, helm, yq, envsubst, shellcheck, docker)…"
+  apt_install unzip gettext-base openssh-client openssl file shellcheck docker.io \
+    python3 python3-venv python3-pip ca-certificates || true
+  local t arch kver
+  arch="$(cloud_arch)"
+
+  if ! command -v aws >/dev/null 2>&1; then
+    t="$(mktemp -d)"
+    if curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(aws_arch).zip" -o "$t/aws.zip" \
+       && unzip -q "$t/aws.zip" -d "$t" \
+       && "$t/aws/install" -i "$HOME/.local/aws-cli" -b "$HOME/.local/bin" >/dev/null; then :
+    else rm -rf "$t"; fail "AWS CLI install failed"; fi
+    rm -rf "$t"
+  fi
+
+  if ! command -v eksctl >/dev/null 2>&1; then
+    t="$(mktemp -d)"
+    if curl -fsSL "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_Linux_${arch}.tar.gz" -o "$t/eksctl.tgz" \
+       && tar -xzf "$t/eksctl.tgz" -C "$t" \
+       && install -m 0755 "$t/eksctl" "$HOME/.local/bin/eksctl"; then :
+    else rm -rf "$t"; fail "eksctl install failed"; fi
+    rm -rf "$t"
+  fi
+
+  if ! command -v kubectl >/dev/null 2>&1; then
+    kver="$(curl -fsSL https://dl.k8s.io/release/stable.txt 2>/dev/null || true)"
+    [ -n "$kver" ] || fail "could not resolve the current stable kubectl version"
+    curl -fsSL "https://dl.k8s.io/release/${kver}/bin/linux/${arch}/kubectl" -o "$HOME/.local/bin/kubectl" \
+      || fail "kubectl install failed"
+    chmod 0755 "$HOME/.local/bin/kubectl"
+  fi
+
+  if ! command -v helm >/dev/null 2>&1; then
+    t="$(mktemp -d)"
+    if curl -fsSL "https://get.helm.sh/helm-v3.18.4-linux-${arch}.tar.gz" -o "$t/helm.tgz" \
+       && tar -xzf "$t/helm.tgz" -C "$t" \
+       && install -m 0755 "$t/linux-${arch}/helm" "$HOME/.local/bin/helm"; then :
+    else rm -rf "$t"; fail "helm install failed"; fi
+    rm -rf "$t"
+  fi
+
+  if ! command -v yq >/dev/null 2>&1; then
+    curl -fsSL "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_${arch}" -o "$HOME/.local/bin/yq" \
+      || fail "yq install failed"
+    chmod 0755 "$HOME/.local/bin/yq"
+  fi
+
+  if ! helm unittest --help >/dev/null 2>&1; then
+    helm plugin install https://github.com/helm-unittest/helm-unittest.git --version v1.1.1 \
+      > "$DV_DIR/helm-unittest-install.log" 2>&1 \
+      || fail "helm-unittest install failed (see ~/.devflow/helm-unittest-install.log)"
+  fi
+
+  # Daytona's Docker-in-Docker snapshots can run dockerd. On a plain snapshot
+  # the CLI is still installed, and a clear warning tells the operator to use
+  # a prebuilt image or a DIND-capable snapshot.
+  if command -v docker >/dev/null 2>&1 && ! docker info >/dev/null 2>&1; then
+    [ -n "$SUDO" ] && $SUDO service docker start >/dev/null 2>&1 || true
+    if ! docker info >/dev/null 2>&1 && [ -n "$SUDO" ] && $SUDO docker info >/dev/null 2>&1; then
+      cat > "$HOME/.local/bin/docker" <<'DV_DOCKER_WRAPPER'
+#!/usr/bin/env bash
+exec sudo -n /usr/bin/docker "$@"
+DV_DOCKER_WRAPPER
+      chmod 0755 "$HOME/.local/bin/docker"
+    fi
+  fi
+
+  for t in aws eksctl kubectl helm yq envsubst jq ssh-keygen curl openssl shellcheck docker file python3; do
+    command -v "$t" >/dev/null 2>&1 || fail "AWS deployment tool missing after install: $t"
+  done
+  if docker info >/dev/null 2>&1; then
+    log "AWS deployment toolchain ready (Docker daemon available)"
+  else
+    log "warn: Docker CLI installed but daemon unavailable — use a prebuilt runner image or a DIND-capable Daytona snapshot"
+  fi
+}
+
 # ============================ phase: tools ===================================
 phase_tools() {
   log "phase 1/4 tools: checking base packages…"
@@ -493,6 +676,7 @@ phase_tools() {
   command -v tmux >/dev/null 2>&1 || log "warn: no tmux — sessions won't survive disconnects"
   command -v jq   >/dev/null 2>&1 || apt_install jq || true
   command -v rg   >/dev/null 2>&1 || apt_install ripgrep || true
+  install_cloud_tools
 
   # ---- gh CLI ----
   if ! command -v gh >/dev/null 2>&1; then
@@ -522,36 +706,66 @@ phase_tools() {
   fi
 
   # ---- Codex CLI ----
-  if ! command -v codex >/dev/null 2>&1; then
-    log "installing Codex CLI…"
-    local triple tag t bin
-    triple="$(arch_triple)-unknown-linux-musl"
-    tag=""
-    if [ -n "${DV_GH_TOKEN:-}" ]; then
-      tag="$(gh_curl https://api.github.com/repos/openai/codex/releases/latest 2>/dev/null | grep -m1 '"tag_name"' | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/' || true)"
+  # Daytona snapshots may already contain Codex. Treat an older binary as
+  # missing: stale defaults can select a model that ChatGPT auth rejects.
+  local triple tag t bin codex_have codex_want install_codex
+  triple="$(arch_triple)-unknown-linux-musl"
+  tag=""
+  if [ -n "${DV_GH_TOKEN:-}" ]; then
+    tag="$(gh_curl https://api.github.com/repos/openai/codex/releases/latest 2>/dev/null | grep -m1 '"tag_name"' | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/' || true)"
+  fi
+  [ -n "$tag" ] || tag="$DV_CODEX_PIN"
+  codex_want="${tag#rust-v}"
+  codex_have="$(codex --version 2>/dev/null | awk '{print $NF}' | sed 's/^v//' || true)"
+  install_codex=0
+  if [ -z "$codex_have" ] || version_lt "$codex_have" "$codex_want"; then
+    install_codex=1
+  fi
+  if [ "$install_codex" = 1 ]; then
+    if [ -n "$codex_have" ]; then
+      log "upgrading Codex CLI v$codex_have → v$codex_want…"
+    else
+      log "installing Codex CLI v$codex_want…"
     fi
-    [ -n "$tag" ] || tag="$DV_CODEX_PIN"
     t="$(mktemp -d)"
     if gh_curl "https://github.com/openai/codex/releases/download/${tag}/codex-${triple}.tar.gz" -o "$t/codex.tgz" \
-       && tar -xzf "$t/codex.tgz" -C "$t"; then
+       2> "$DV_DIR/codex-native-install.log" \
+       && tar -xzf "$t/codex.tgz" -C "$t" >> "$DV_DIR/codex-native-install.log" 2>&1; then
       bin="$(find "$t" -maxdepth 2 -type f -name 'codex*' ! -name '*.tar.gz' | head -1)"
       [ -n "$bin" ] && cp "$bin" "$HOME/.local/bin/codex" && chmod +x "$HOME/.local/bin/codex"
     fi
     rm -rf "$t"
-    if ! command -v codex >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
-      log "binary install unavailable — falling back to npm…"
-      npm install -g @openai/codex > "$DV_DIR/codex-install.log" 2>&1 || true
+    codex_have="$(codex --version 2>/dev/null | awk '{print $NF}' | sed 's/^v//' || true)"
+    if [ -z "$codex_have" ] || version_lt "$codex_have" "$codex_want"; then
+      log "native Codex install unavailable — falling back to a user-local npm install…"
+      ensure_node_path
+      command -v npm >/dev/null 2>&1 || ensure_npm || true
+      if command -v npm >/dev/null 2>&1; then
+        # ensure_npm may have linked an older snapshot-global codex here.
+        # Remove that exact user-local launcher so npm can install the matching
+        # package executable, never modifying the snapshot's Node tree.
+        rm -f "$HOME/.local/bin/codex"
+        npm install --prefix "$HOME/.local" --no-audit --no-fund "@openai/codex@$codex_want" \
+          > "$DV_DIR/codex-install.log" 2>&1 || true
+        if [ -x "$HOME/.local/node_modules/@openai/codex/bin/codex.js" ]; then
+          ln -sf "$HOME/.local/node_modules/@openai/codex/bin/codex.js" "$HOME/.local/bin/codex"
+        fi
+      fi
     fi
   fi
+
+  codex_have="$(codex --version 2>/dev/null | awk '{print $NF}' | sed 's/^v//' || true)"
 
   # only hard-fail if the selected agent is unusable
   case "$DV_AGENT" in
     claude) command -v claude >/dev/null 2>&1 || fail "claude install failed (see ~/.devflow/claude-install.log)" ;;
-    codex)  command -v codex  >/dev/null 2>&1 || fail "codex install failed" ;;
+    codex)  command -v codex  >/dev/null 2>&1 || fail "codex install failed"
+            version_lt "$codex_have" "$codex_want" && fail "Codex CLI v$codex_have is older than required v$codex_want" ;;
     both)   command -v claude >/dev/null 2>&1 || fail "claude install failed"
-            command -v codex  >/dev/null 2>&1 || fail "codex install failed" ;;
+            command -v codex  >/dev/null 2>&1 || fail "codex install failed"
+            version_lt "$codex_have" "$codex_want" && fail "Codex CLI v$codex_have is older than required v$codex_want" ;;
   esac
-  log "tools ready: $(command -v claude >/dev/null 2>&1 && printf 'claude ')$(command -v codex >/dev/null 2>&1 && printf 'codex ')$(command -v gh >/dev/null 2>&1 && printf 'gh ')$(command -v tmux >/dev/null 2>&1 && printf 'tmux')"
+  log "tools ready: $(command -v claude >/dev/null 2>&1 && printf 'claude ')$(command -v codex >/dev/null 2>&1 && printf 'codex-v%s ' "$codex_have")$(command -v gh >/dev/null 2>&1 && printf 'gh ')$(command -v tmux >/dev/null 2>&1 && printf 'tmux')"
 }
 
 # ============================ phase: auth ====================================
@@ -559,7 +773,8 @@ phase_auth() {
   log "phase 2/4 auth: applying subscription credentials…"
   load_secrets
   umask 077
-  mkdir -p "$HOME/.claude" "$HOME/.codex"
+  mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.aws"
+  chmod 700 "$HOME/.aws"
 
   : > "$DV_DIR/env"
   chmod 600 "$DV_DIR/env"
@@ -575,6 +790,8 @@ phase_auth() {
       ;;
     *) log "claude auth: none provided (claude will ask to log in)" ;;
   esac
+  printf '%s\n' '[ -f "$HOME/.devflow/forwarded.env" ] && . "$HOME/.devflow/forwarded.env"' >> "$DV_DIR/env"
+  printf '%s\n' '[ -f "$HOME/.devflow/aws.env" ] && . "$HOME/.devflow/aws.env"' >> "$DV_DIR/env"
 
   if [ -n "$DV_CODEX_AUTH_B64" ]; then
     printf '%s' "$DV_CODEX_AUTH_B64" | base64 -d > "$HOME/.codex/auth.json"
@@ -595,7 +812,37 @@ phase_auth() {
   git config --global init.defaultBranch main 2>/dev/null || true
   git config --global push.autoSetupRemote true 2>/dev/null || true
 
-  rm -f "$DV_STAGE/secrets.env"
+  if [ "${DV_AWS_ENABLED:-0}" = 1 ]; then
+    printf '%s' "$DV_AWS_CREDS_B64" | base64 -d > "$HOME/.aws/credentials"
+    printf '%s' "$DV_AWS_CONFIG_B64" | base64 -d > "$HOME/.aws/config"
+    chmod 600 "$HOME/.aws/credentials" "$HOME/.aws/config"
+    {
+      printf 'export AWS_PROFILE=devflow\n'
+      printf 'export AWS_SDK_LOAD_CONFIG=1\n'
+      printf 'export AWS_CREDENTIAL_EXPIRATION=%q\n' "$DV_AWS_EXPIRATION"
+      printf 'export DEVFLOW_AWS_EXPIRATION=%q\n' "$DV_AWS_EXPIRATION"
+    } > "$DV_DIR/aws.env"
+    chmod 600 "$DV_DIR/aws.env"
+    printf '%s' "$DV_AWS_EXPIRATION" > "$DV_DIR/aws-expiration"
+    printf '%s' "$DV_AWS_SOURCE_PROFILE" > "$DV_DIR/aws-profile"
+    chmod 600 "$DV_DIR/aws-expiration" "$DV_DIR/aws-profile"
+    if [ -n "$DV_AWS_EXPIRATION" ]; then
+      log "aws auth: temporary session applied (expires $DV_AWS_EXPIRATION)"
+    else
+      log "aws auth: explicitly allowed static credentials applied"
+    fi
+  fi
+
+  if [ -n "${DV_SECRET_ENV_B64:-}" ]; then
+    printf '%s' "$DV_SECRET_ENV_B64" | base64 -d > "$DV_DIR/forwarded.env"
+    chmod 600 "$DV_DIR/forwarded.env"
+    printf '%s' "$DV_SECRET_ENV_NAMES" > "$DV_DIR/forwarded-env-names"
+    chmod 600 "$DV_DIR/forwarded-env-names"
+    log "forwarded env: named variables applied ($DV_SECRET_ENV_NAMES)"
+  fi
+
+  if command -v shred >/dev/null 2>&1; then shred -u "$DV_STAGE/secrets.env" 2>/dev/null || rm -f "$DV_STAGE/secrets.env"
+  else rm -f "$DV_STAGE/secrets.env"; fi
   umask 022
   log "auth done."
 }
@@ -810,17 +1057,49 @@ DV_SHELLRC
 # dv-agent [claude|codex] — launch the coding agent in the work directory,
 # resuming the previous conversation when one exists.
 set -u
+set -o pipefail
+DV_DIR="$HOME/.devflow"
+RUN_DIR="$DV_DIR/run"
 AGENT="${1:-$(cat "$HOME/.devflow/agent" 2>/dev/null || echo claude)}"
 WORKDIR="$(cat "$HOME/.devflow/workdir" 2>/dev/null || echo "$HOME")"
 cd "$WORKDIR" 2>/dev/null || cd "$HOME"
 [ -f "$HOME/.devflow/env" ] && . "$HOME/.devflow/env"
 export PATH="$HOME/.local/bin:$HOME/.devflow/bin:$PATH"
+mkdir -p "$RUN_DIR"
+chmod 700 "$RUN_DIR"
 
 TASK=""
-if [ -f "$HOME/.devflow/task" ]; then
-  TASK="$(cat "$HOME/.devflow/task")"
-  rm -f "$HOME/.devflow/task"
+TASK_FILE="$RUN_DIR/task.txt"
+if [ -f "$DV_DIR/task" ]; then
+  mv -f "$DV_DIR/task" "$TASK_FILE"
+  chmod 600 "$TASK_FILE"
+  TASK=1
 fi
+STARTED_AT="$(date -u +%FT%TZ)"
+COMPLETED_AT=""
+PROMPT_SHA=""
+if [ -n "$TASK" ]; then
+  if command -v sha256sum >/dev/null 2>&1; then
+    PROMPT_SHA="$(sha256sum "$TASK_FILE" | awk '{print $1}')"
+  else
+    PROMPT_SHA="$(shasum -a 256 "$TASK_FILE" | awk '{print $1}')"
+  fi
+fi
+
+status_write() { # STATE [EXIT_CODE]
+  local state="$1" exit_code="${2:-}" tmp="$RUN_DIR/status.tmp.$$"
+  {
+    printf 'state=%s\n' "$state"
+    printf 'agent=%s\n' "$AGENT"
+    printf 'pid=%s\n' "$$"
+    printf 'started_at=%s\n' "$STARTED_AT"
+    [ -n "$COMPLETED_AT" ] && printf 'completed_at=%s\n' "$COMPLETED_AT"
+    [ -n "$PROMPT_SHA" ] && printf 'prompt_sha256=%s\n' "$PROMPT_SHA"
+    [ -n "$exit_code" ] && printf 'exit_code=%s\n' "$exit_code"
+  } > "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$RUN_DIR/status"
+}
 
 CLAUDE_FLAGS="--dangerously-skip-permissions"
 if [ "$(id -u)" = "0" ]; then
@@ -836,17 +1115,32 @@ has_claude_history() {
 
 case "$AGENT" in
   codex)
-    # prefer the oh-my-codex launcher when the harness installed it
-    if [ -n "$TASK" ]; then exec codex "$TASK"; fi
+    if [ -n "$TASK" ]; then
+      : > "$RUN_DIR/agent.log"
+      chmod 600 "$RUN_DIR/agent.log"
+      status_write running
+      codex exec --dangerously-bypass-approvals-and-sandbox --color never \
+        -C "$WORKDIR" -o "$RUN_DIR/last-message.txt" - < "$TASK_FILE" 2>&1 \
+        | tee -a "$RUN_DIR/agent.log"
+      rc="${PIPESTATUS[0]}"
+      COMPLETED_AT="$(date -u +%FT%TZ)"
+      chmod 600 "$RUN_DIR/last-message.txt" 2>/dev/null || true
+      if [ "$rc" -eq 0 ]; then status_write completed "$rc"
+      else status_write failed "$rc"; fi
+      exit "$rc"
+    fi
+    status_write interactive
     if codex resume --last 2>/dev/null; then exit 0; fi
     if command -v omx >/dev/null 2>&1; then exec omx; fi
     exec codex
     ;;
   claude|*)
     if [ -n "$TASK" ]; then
+      status_write running
       # shellcheck disable=SC2086
-      exec claude $CLAUDE_FLAGS "$TASK"
+      exec claude $CLAUDE_FLAGS "$(cat "$TASK_FILE")"
     fi
+    status_write interactive
     if has_claude_history; then
       # shellcheck disable=SC2086
       claude $CLAUDE_FLAGS --continue || exec claude $CLAUDE_FLAGS
@@ -859,6 +1153,54 @@ esac
 DV_DVAGENT
   chmod +x "$DV_BIN/dv-agent"
 
+  cat > "$DV_BIN/dv-task-start" <<'DV_TASKSTART'
+#!/usr/bin/env bash
+# Start one queued task in a fresh tmux agent window without attaching.
+set -u
+DV_DIR="$HOME/.devflow"
+RUN_DIR="$DV_DIR/run"
+WORKDIR="$(cat "$DV_DIR/workdir" 2>/dev/null || echo "$HOME")"
+AGENT="$(cat "$DV_DIR/agent" 2>/dev/null || echo claude)"
+INCOMING="${1:-}"
+AGENT_OVERRIDE="${2:-}"
+export PATH="$HOME/.local/bin:$DV_DIR/bin:$PATH"
+command -v tmux >/dev/null 2>&1 || { echo "tmux is not installed" >&2; exit 1; }
+
+state="$(sed -n 's/^state=//p' "$RUN_DIR/status" 2>/dev/null | head -1)"
+pid="$(sed -n 's/^pid=//p' "$RUN_DIR/status" 2>/dev/null | head -1)"
+if [ "$state" = "running" ] && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+  echo "an agent task is already running (pid $pid)" >&2
+  exit 2
+fi
+if [ -n "$AGENT_OVERRIDE" ]; then
+  case "$AGENT_OVERRIDE" in claude|codex|both) AGENT="$AGENT_OVERRIDE" ;; *) echo "invalid agent override" >&2; exit 1 ;; esac
+  printf '%s' "$AGENT" > "$DV_DIR/agent"
+fi
+[ "$AGENT" != "none" ] || { echo "sandbox agent is set to none" >&2; exit 1; }
+mkdir -p "$RUN_DIR"
+chmod 700 "$RUN_DIR"
+if [ -n "$INCOMING" ]; then
+  [ -f "$INCOMING" ] || { echo "incoming task file not found" >&2; exit 1; }
+  mv -f "$INCOMING" "$DV_DIR/task"
+  chmod 600 "$DV_DIR/task"
+fi
+[ -f "$DV_DIR/task" ] || { echo "no queued task" >&2; exit 1; }
+printf 'state=queued\nagent=%s\n' "$AGENT" > "$RUN_DIR/status"
+chmod 600 "$RUN_DIR/status"
+
+if ! tmux has-session -t dv 2>/dev/null; then
+  tmux new-session -d -s dv -n shell -c "$WORKDIR"
+elif ! tmux list-windows -t dv -F '#{window_name}' | grep -qx shell; then
+  tmux new-window -d -t dv -n shell -c "$WORKDIR"
+fi
+tmux kill-window -t dv:agent 2>/dev/null || true
+tmux new-window -d -t dv -n agent -c "$WORKDIR"
+tmux send-keys -t dv:agent "dv-agent $AGENT" C-m
+tmux select-window -t dv:agent
+echo "agent task started in tmux window dv:agent"
+DV_TASKSTART
+  chmod +x "$DV_BIN/dv-task-start"
+
   cat > "$DV_BIN/dv-ensure" <<'DV_DVENSURE'
 #!/usr/bin/env bash
 # dv-ensure — make sure the devflow tmux session exists (agent + shell windows)
@@ -869,20 +1211,38 @@ AGENT="$(cat "$HOME/.devflow/agent" 2>/dev/null || echo claude)"
 export PATH="$HOME/.local/bin:$HOME/.devflow/bin:$PATH"
 
 if ! tmux has-session -t dv 2>/dev/null; then
-  tmux new-session -d -s dv -n agent -c "$WORKDIR"
-  case "$AGENT" in
-    none) ;;
-    both)
+  tmux new-session -d -s dv -n shell -c "$WORKDIR"
+fi
+if ! tmux list-windows -t dv -F '#{window_name}' | grep -qx shell; then
+  tmux new-window -d -t dv -n shell -c "$WORKDIR"
+fi
+case "$AGENT" in
+  none)
+    if ! tmux list-windows -t dv -F '#{window_name}' | grep -qx agent; then
+      tmux new-window -d -t dv -n agent -c "$WORKDIR"
+    fi
+    ;;
+  both)
+    if ! tmux list-windows -t dv -F '#{window_name}' | grep -qx agent; then
+      tmux new-window -d -t dv -n agent -c "$WORKDIR"
       tmux send-keys -t dv:agent "dv-agent claude" C-m
-      tmux new-window -t dv -n codex -c "$WORKDIR"
+    fi
+    if ! tmux list-windows -t dv -F '#{window_name}' | grep -qx codex; then
+      tmux new-window -d -t dv -n codex -c "$WORKDIR"
       tmux send-keys -t dv:codex "dv-agent codex" C-m
-      ;;
-    *)
+    fi
+    ;;
+  *)
+    if ! tmux list-windows -t dv -F '#{window_name}' | grep -qx agent; then
+      tmux new-window -d -t dv -n agent -c "$WORKDIR"
       tmux send-keys -t dv:agent "dv-agent $AGENT" C-m
-      ;;
-  esac
-  tmux new-window -t dv -n shell -c "$WORKDIR"
+    fi
+    ;;
+esac
+if tmux list-windows -t dv -F '#{window_name}' | grep -qx agent; then
   tmux select-window -t dv:agent
+else
+  tmux select-window -t dv:shell
 fi
 DV_DVENSURE
   chmod +x "$DV_BIN/dv-ensure"
@@ -908,7 +1268,13 @@ DV_STATUSLINE
   chmod +x "$DV_BIN/dv-statusline"
 
   # ---- start the session ----
-  "$DV_BIN/dv-ensure"
+  # dv-ensure preserves existing windows. A queued task must instead replace
+  # an idle or previously failed agent window so it cannot remain stranded.
+  if [ -n "$DV_TASK_B64" ]; then
+    "$DV_BIN/dv-task-start"
+  else
+    "$DV_BIN/dv-ensure"
+  fi
   printf '%s' "$DV_PROVISION_VERSION" > "$DV_DIR/provisioned"
   log "workspace ready: agent=$DV_AGENT repo=${DV_REPO:-none} workdir=$WORKDIR"
 }
@@ -1083,16 +1449,52 @@ provision_sandbox() { # NAME AGENT REPO BRANCH TASK HARNESS
   upload_provisioner "$name" 1
 
   step "installing tools (tmux, gh, claude, codex — output appears when done)…"
-  run_phase "$name" tools "$agent" "$repo" "$branch" "$task_b64" "$harness"
+  run_phase "$name" tools "$agent" "$repo" "$branch" "$task_b64" "$harness" \
+    || die "sandbox tools phase failed; task was not queued"
 
   step "applying auth…"
-  run_phase "$name" auth "$agent" "$repo" "$branch" "$task_b64" "$harness"
+  run_phase "$name" auth "$agent" "$repo" "$branch" "$task_b64" "$harness" \
+    || die "sandbox auth phase failed; task was not queued"
 
   step "setting up workspace + starting agent session…"
-  run_phase "$name" workspace "$agent" "$repo" "$branch" "$task_b64" "$harness"
+  run_phase "$name" workspace "$agent" "$repo" "$branch" "$task_b64" "$harness" \
+    || die "sandbox workspace phase failed; task was not queued"
 
   step "installing multi-agent harness ($harness)…"
-  run_phase "$name" harness "$agent" "$repo" "$branch" "$task_b64" "$harness"
+  run_phase "$name" harness "$agent" "$repo" "$branch" "$task_b64" "$harness" \
+    || die "sandbox harness phase failed; task was not queued"
+}
+
+sandbox_is_provisioned() { # NAME
+  local got
+  got="$(dt_run "$1" 'cat "$HOME/.devflow/provisioned" 2>/dev/null || true' 60 2>/dev/null | tail -1)"
+  [ "$got" = "$DV_EXPECTED_PROVISION_VERSION" ]
+}
+
+agent_task_state() { # NAME
+  dt_run "$1" 'i=0; state=""; while [ "$i" -lt 30 ]; do state="$(sed -n "s/^state=//p" "$HOME/.devflow/run/status" 2>/dev/null | head -1)"; case "$state" in running|completed|failed) break ;; esac; i=$((i + 1)); sleep 1; done; printf "%s\n" "${state:-not-started}"' 60 2>/dev/null | tail -1
+}
+
+verify_agent_task_started() { # NAME
+  local state
+  state="$(agent_task_state "$1")"
+  case "$state" in
+    running|completed) ok "agent task state: $state" ;;
+    failed) die "agent task exited immediately (inspect: devflow peek $1; devflow status $1)" ;;
+    *) die "agent task did not start (state: ${state:-unknown}; inspect: devflow status $1)" ;;
+  esac
+}
+
+queue_agent_task() { # NAME TASK [AGENT_OVERRIDE]
+  local name="$1" task="$2" agent_override="${3:-}"
+  [ -n "$task" ] || return 0
+  printf '%s' "$task" | dt_push_file "$name" "/tmp/.dv-task"
+  step "starting detached agent task…"
+  if ! dt_run "$name" '"$HOME/.devflow/bin/dv-task-start" /tmp/.dv-task '"$agent_override" 60; then
+    dt_run "$name" 'rm -f /tmp/.dv-task' 60 >/dev/null 2>&1 || true
+    die "could not start task — another agent task may already be running (check: devflow status $name)"
+  fi
+  verify_agent_task_started "$name"
 }
 
 ensure_running() { # NAME — start if stopped/archived
@@ -1257,28 +1659,59 @@ forward_daytona() { # NAME — daytona CLI + API auth + devflow itself, inside t
 # ----------------------------------------------------------------------------
 # Commands
 # ----------------------------------------------------------------------------
+set_forwarding_options() { # AWS_PROFILE SECRET_ENV_NAMES ALLOW_STATIC ENV_ITEMS
+  DEVFLOW_AWS_PROFILE="$1"
+  DEVFLOW_SECRET_ENV_NAMES="$2"
+  DEVFLOW_ALLOW_STATIC_AWS="$3"
+  DEVFLOW_ENV_ITEMS="${4:-}"
+  _HARVESTED=0
+  if [ -n "$DEVFLOW_AWS_PROFILE" ]; then
+    need_cmd aws "install AWS CLI v2"
+    need_cmd jq "brew install jq"
+  fi
+}
+
+refresh_forwarded_auth() { # NAME [RUN_TOOLS]
+  local name="$1" run_tools="${2:-0}"
+  ensure_running "$name"
+  step "re-syncing auth and explicitly forwarded credentials into '$name'…"
+  upload_provisioner "$name" 1
+  if [ "$run_tools" = 1 ]; then
+    run_phase "$name" tools "" "" "" "" "core" \
+      || die "sandbox tools phase failed; auth was not refreshed"
+  fi
+  run_phase "$name" auth "" "" "" "" "core" \
+    || die "sandbox auth phase failed"
+  ok "auth refreshed in '$name'"
+}
+
 cmd_up() {
   local repo="" name="" branch="" agent="$DEVFLOW_AGENT" task="" attach=1 fresh=0 blank=0
   local size="" cpu="$DEVFLOW_CPU" memory="$DEVFLOW_MEMORY" disk="$DEVFLOW_DISK" auto_stop="$DEVFLOW_AUTO_STOP"
   local snapshot="$DEVFLOW_SNAPSHOT" explicit_resources=0 harness="$DEVFLOW_HARNESS"
-  local script="" with_daytona=0
+  local script="" with_daytona=0 aws_profile="" secret_env_names="" env_items="" allow_static_aws=0
+  local size_explicit=0 snapshot_explicit=0 agent_explicit=0
 
   while [ $# -gt 0 ]; do
     case "$1" in
-      -a|--agent)   need_val "$1" "${2:-}"; agent="$2"; shift 2 ;;
+      -a|--agent)   need_val "$1" "${2:-}"; agent="$2"; agent_explicit=1; shift 2 ;;
       -H|--harness) need_val "$1" "${2:-}"; harness="$2"; shift 2 ;;
       -n|--name)    need_val "$1" "${2:-}"; name="$2"; shift 2 ;;
       -b|--branch)  need_val "$1" "${2:-}"; branch="$2"; shift 2 ;;
       -m|--task)    need_val "$1" "${2:-}"; task="$2"; shift 2 ;;
-      -s|--size)    need_val "$1" "${2:-}"; size="$2"; shift 2 ;;
+      -s|--size)    need_val "$1" "${2:-}"; size="$2"; size_explicit=1; shift 2 ;;
       --cpu)        need_val "$1" "${2:-}"; cpu="$2"; explicit_resources=1; shift 2 ;;      # legacy
       --memory)     need_val "$1" "${2:-}"; memory="$2"; explicit_resources=1; shift 2 ;;   # legacy
       --disk)       need_val "$1" "${2:-}"; disk="$2"; explicit_resources=1; shift 2 ;;     # legacy
       --auto-stop)  need_val "$1" "${2:-}"; auto_stop="$2"; shift 2 ;;
-      --snapshot)   need_val "$1" "${2:-}"; snapshot="$2"; shift 2 ;;
+      --snapshot)   need_val "$1" "${2:-}"; snapshot="$2"; snapshot_explicit=1; shift 2 ;;
       --script)     need_val "$1" "${2:-}"; script="$2"; shift 2 ;;
+      --aws-profile) need_val "$1" "${2:-}"; aws_profile="$2"; shift 2 ;;
+      --secret-env) need_val "$1" "${2:-}"; secret_env_names="${secret_env_names}${secret_env_names:+ }$2"; shift 2 ;;
+      --env) need_val "$1" "${2:-}"; env_items="${env_items}${env_items:+ }$(printf '%s' "$2" | b64_encode)"; shift 2 ;;
+      --allow-static-aws) allow_static_aws=1; shift ;;
       --with-daytona) with_daytona=1; shift ;;
-      --no-attach)  attach=0; shift ;;
+      --no-attach|--detach) attach=0; shift ;;
       --fresh)      fresh=1; shift ;;
       --blank)      blank=1; shift ;;
       --pick)       repo="__PICK__"; shift ;;
@@ -1291,12 +1724,19 @@ cmd_up() {
     esac
   done
   [ -n "$script" ] && [ ! -f "$script" ] && die "script not found: $script"
+  set_forwarding_options "$aws_profile" "$secret_env_names" "$allow_static_aws" "$env_items"
+  # Resolve and validate credentials before creating anything billable.
+  if [ -n "$aws_profile$secret_env_names$env_items" ]; then harvest_all; fi
 
   case "$agent" in claude|codex|both|none) ;; *) die "invalid --agent '$agent' (claude|codex|both|none)" ;; esac
   case "$harness" in auto|omc|omx|both|core|none) ;; *) die "invalid --harness '$harness' (auto|omc|omx|both|core|none)" ;; esac
   harness="$(resolve_harness "$agent" "$harness")"
 
   # --- size (a custom snapshot brings its own; else pick a Daytona size class) ---
+  if [ "$size_explicit" = 1 ] && [ "$snapshot_explicit" = 0 ] && [ -n "$snapshot" ]; then
+    step "explicit --size overrides configured snapshot '$snapshot'"
+    snapshot=""
+  fi
   if [ -n "$snapshot" ]; then
     if [ -n "$size" ] || [ "$explicit_resources" = 1 ]; then
       step "note: --size/--cpu/--memory/--disk ignored — snapshot '$snapshot' has its size baked in (want another? devflow snapshot build --size ${size:-small|medium|large}, or --snapshot to pick)"
@@ -1351,9 +1791,37 @@ cmd_up() {
       dt delete "$name" >/dev/null 2>&1 || true
     else
       say "sandbox '$name' already exists ($st). (--fresh recreates, -n NAME makes another)"
-      if [ "$with_daytona" = 1 ] || [ -n "$script" ]; then ensure_running "$name"; fi
+      local needs_remote=0 reprovisioned=0
+      if [ "$with_daytona" = 1 ] || [ -n "$script$task$aws_profile$secret_env_names$env_items" ]; then
+        needs_remote=1
+      elif [ "$attach" = 1 ] && [ -t 0 ]; then
+        needs_remote=1
+      fi
+      [ "$needs_remote" = 1 ] && ensure_running "$name"
+      if [ "$needs_remote" = 1 ] && ! sandbox_is_provisioned "$name"; then
+        step "sandbox provisioning is incomplete or outdated — resuming all phases…"
+        provision_sandbox "$name" "$agent" "$repo" "$branch" "$task" "$harness"
+        ok "provisioned"
+        [ -n "$task" ] && verify_agent_task_started "$name"
+        reprovisioned=1
+      fi
+      if [ "$reprovisioned" = 0 ] && [ -n "$aws_profile$secret_env_names$env_items" ]; then
+        refresh_forwarded_auth "$name" "$([ -n "$aws_profile" ] && printf 1 || printf 0)"
+      fi
+      if [ "$reprovisioned" = 0 ] && [ -n "$task" ]; then
+        if [ "$agent_explicit" = 1 ]; then
+          queue_agent_task "$name" "$task" "$agent"
+        else
+          queue_agent_task "$name" "$task"
+        fi
+      fi
       [ "$with_daytona" = 1 ] && { forward_daytona "$name" || warn "daytona forwarding failed"; }
       [ -n "$script" ] && { run_user_script "$name" "$script" || warn "script launch failed"; }
+      if [ -n "$task" ]; then
+        say "the agent is on it. it keeps working even when you're not attached."
+        step "poll state:     ${C_BOLD}devflow status $name${C_RESET}"
+        step "peek progress:  ${C_BOLD}devflow peek $name${C_RESET}"
+      fi
       if [ "$attach" = 1 ] && [ -t 0 ]; then
         cmd_attach "$name"
         return $?
@@ -1390,6 +1858,7 @@ cmd_up() {
 
   provision_sandbox "$name" "$agent" "$repo" "$branch" "$task" "$harness"
   ok "provisioned"
+  [ -n "$task" ] && verify_agent_task_started "$name"
 
   [ "$with_daytona" = 1 ] && { forward_daytona "$name" \
     || warn "daytona forwarding failed — the sandbox can't manage sibling sandboxes"; }
@@ -1400,6 +1869,7 @@ cmd_up() {
 
   if [ -n "$task" ]; then
     say "the agent is on it. it keeps working even when you're not attached."
+    step "poll state:     ${C_BOLD}devflow status $name${C_RESET}"
     step "peek progress:  ${C_BOLD}devflow peek $name${C_RESET}"
     step "join session:   ${C_BOLD}devflow attach $name${C_RESET}"
   fi
@@ -1882,6 +2352,24 @@ cmd_peek() {
   dt_run "$name" "tmux capture-pane -p -t dv:$window -S -$lines 2>/dev/null || echo '(no $window window — windows: agent/shell, plus codex/script when used)'" 60
 }
 
+cmd_status() {
+  local name=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) echo "usage: devflow status [NAME]"; return 0 ;;
+      -*) die "unknown flag for status: $1" ;;
+      *) [ -z "$name" ] || die "status accepts at most one sandbox name"; name="$1"; shift ;;
+    esac
+  done
+  name="$(resolve_name "$name")" || exit 1
+  local st
+  st="$(sandbox_state "$name")"
+  say "status for ${C_BOLD}$name${C_RESET}"
+  printf 'sandbox_state=%s\n' "$st"
+  [ "$st" = "started" ] || return 0
+  dt_run "$name" 'run="$HOME/.devflow/run"; field() { sed -n "s/^$1=//p" "$run/status" 2>/dev/null | head -1; }; state="$(field state)"; agent="$(field agent)"; pid="$(field pid)"; started="$(field started_at)"; completed="$(field completed_at)"; exit_code="$(field exit_code)"; prompt_sha="$(field prompt_sha256)"; alive=no; [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && alive=yes; [ "$state" = running ] && [ "$alive" = no ] && state=stale; [ -n "$state" ] || state=not-started; tmux_state=absent; tmux has-session -t dv 2>/dev/null && tmux_state=running; printf "agent_state=%s\nagent=%s\nprocess_alive=%s\ntmux_session=%s\nstarted_at=%s\ncompleted_at=%s\nexit_code=%s\nprompt_sha256=%s\n" "$state" "${agent:-unknown}" "$alive" "$tmux_state" "${started:-}" "${completed:-}" "${exit_code:-}" "${prompt_sha:-}"' 60
+}
+
 cmd_ls() {
   need_cmd daytona "brew install daytonaio/cli/daytona"
   need_cmd jq "brew install jq"
@@ -1955,13 +2443,24 @@ cmd_rm() {
 
 cmd_sync() {
   need_cmd jq "brew install jq"
-  local name
-  name="$(resolve_name "${1:-}")" || exit 1
-  ensure_running "$name"
-  step "re-syncing subscription auth into '$name'…"
-  upload_provisioner "$name" 1
-  run_phase "$name" auth "" "" "" ""
-  ok "auth refreshed in '$name'"
+  local name="" aws_profile="" secret_env_names="" env_items="" allow_static_aws=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --aws-profile) need_val "$1" "${2:-}"; aws_profile="$2"; shift 2 ;;
+      --secret-env) need_val "$1" "${2:-}"; secret_env_names="${secret_env_names}${secret_env_names:+ }$2"; shift 2 ;;
+      --env) need_val "$1" "${2:-}"; env_items="${env_items}${env_items:+ }$(printf '%s' "$2" | b64_encode)"; shift 2 ;;
+      --allow-static-aws) allow_static_aws=1; shift ;;
+      -h|--help)
+        echo "usage: devflow sync [NAME] [--aws-profile PROFILE] [--secret-env VARIABLE] [--env NAME=VALUE] [--allow-static-aws]"
+        return 0 ;;
+      -*) die "unknown flag for sync: $1" ;;
+      *) [ -z "$name" ] || die "sync accepts at most one sandbox name"; name="$1"; shift ;;
+    esac
+  done
+  set_forwarding_options "$aws_profile" "$secret_env_names" "$allow_static_aws" "$env_items"
+  [ -n "$aws_profile$secret_env_names$env_items" ] && harvest_all
+  name="$(resolve_name "$name")" || exit 1
+  refresh_forwarded_auth "$name" "$([ -n "$aws_profile" ] && printf 1 || printf 0)"
 }
 
 cmd_token() {
@@ -2265,7 +2764,7 @@ ${C_BOLD}devflow up${C_RESET} [REPO] [flags] — create (or reattach to) a cloud
                       oh-my-claudecode for claude, oh-my-codex for codex;
                       core = devflow's built-in dv-engineer/designer/security)
   -m, --task "…"      hand the agent a task right away; add --no-attach to
-                      fire-and-forget, then 'devflow peek' to check on it
+                      fire-and-forget; poll with 'devflow status' or 'peek'
       --script FILE   run a local script inside the sandbox (tmux window
                       'script'; log ~/.devflow/script.log). A bare positional
                       arg that names an existing file works too:
@@ -2273,12 +2772,23 @@ ${C_BOLD}devflow up${C_RESET} [REPO] [flags] — create (or reattach to) a cloud
       --with-daytona  give the sandbox your Daytona CLI + API key + devflow,
                       so scripts/agents in it can spin up SIBLING sandboxes
                       (they bill your account — clean up with devflow rm)
+      --aws-profile P resolve and forward profile P as a temporary AWS session;
+                      also installs aws/eksctl/kubectl/helm/yq/envsubst,
+                      helm-unittest, shellcheck, Docker, and supporting tools
+      --secret-env V  forward the named local environment variable through the
+                      encrypted 0600 auth bundle (repeatable; values never log)
+      --env N=V       forward a non-secret runtime setting through the same
+                      0600 bundle (repeatable; useful for domains/API URLs)
+      --allow-static-aws
+                      explicitly permit non-expiring AWS credentials (unsafe;
+                      an assumed-role profile with an STS session is preferred)
   -b, --branch B      checkout (or create) branch B
   -n, --name N        sandbox name (default: dv-<repo>)
       --blank         no repo — empty scratch sandbox
       --pick          force the repo picker
       --fresh         delete + recreate if the sandbox already exists
       --no-attach     don't SSH in after starting
+      --detach        alias for --no-attach
   -s, --size S        small | medium | large   (default: $(default_size))
                       small=1cpu/1gb/3gb · medium=2cpu/4gb/8gb · large=4cpu/8gb/10gb
                       (--cpu/--memory/--disk are deprecated: they map to the
@@ -2295,7 +2805,7 @@ ${C_CYAN}${C_BOLD}devflow${C_RESET} $DEVFLOW_VERSION — agentic cloud dev sessi
 ${C_BOLD}start here${C_RESET}
   devflow setup                 one-time: accounts + auth (no API keys needed)
   devflow up [REPO]             spin up Claude Code / Codex on a repo & attach
-  devflow up -m "fix bug X" --no-attach    fire-and-forget, close your laptop
+  devflow up -m "fix bug X" --detach       fire-and-forget, close your laptop
   devflow up repro.sh --with-daytona       run a script in a sandbox; it can
                                            even spin up sibling sandboxes
 
@@ -2305,11 +2815,14 @@ ${C_BOLD}start here${C_RESET}
 
 ${C_BOLD}daily driving${C_RESET}
   devflow attach [NAME]   (a)   reattach from anywhere — tmux keeps it alive
+  devflow status [NAME]         poll detached task state (queued/running/completed/failed)
   devflow peek [NAME] [-w W]    glance at the agent (or window W, e.g. script)
   devflow ls                    list sandboxes
   devflow stop [NAME|--all]     stop (disk kept) — attach restarts + resumes
   devflow rm [NAME|--all]       delete sandbox
-  devflow sync [NAME]           re-sync subscription auth into a sandbox
+  devflow sync [NAME] [flags]   re-sync auth; accepts --aws-profile P,
+                                repeatable --secret-env V / --env N=V,
+                                --allow-static-aws
 
 ${C_BOLD}more${C_RESET}
   devflow ssh [NAME]            SSH in (lands in tmux; detach: Ctrl-b d)
@@ -2348,6 +2861,7 @@ main() {
     mobile|phone|qr)      cmd_mobile "$@" ;;
     exec)                 cmd_exec "$@" ;;
     peek|watch)           cmd_peek "$@" ;;
+    status|state)         cmd_status "$@" ;;
     ls|list|ps)           cmd_ls "$@" ;;
     stop)                 cmd_stop "$@" ;;
     rm|delete|down)       cmd_rm "$@" ;;

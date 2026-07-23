@@ -78,26 +78,44 @@ DV_TASK_B64=… DV_WORKROOT=… DV_HARNESS=… bash ~/.devflow/stage/provision.s
 
 | Phase | Does |
 |---|---|
-| `tools` | apt (tmux/jq/ripgrep via passwordless sudo), gh binary, Claude Code native installer (claude.ai/install.sh), Codex musl release binary; npm fallbacks; hard-fails only if the *selected* agent is unusable |
-| `auth` | secrets bundle → `CLAUDE_CODE_OAUTH_TOKEN` in `~/.devflow/env` **or** `~/.claude/.credentials.json` (0600); `~/.codex/auth.json` (0600); `gh auth login --with-token` + `setup-git`; git identity; shreds the bundle |
-| `workspace` | repo clone to `~/work/<repo>` (branch handling), `~/.claude.json` onboarding/trust seed, `~/.claude/settings.json` + `CLAUDE.md`, `~/.codex/config.toml` + `AGENTS.md`, `~/.tmux.conf`, shell integration (`~/.devflow/shellrc` sourced from .bashrc/.profile with re-entry guard; SSH logins auto-attach tmux), helper scripts `dv-agent`/`dv-ensure`/`dv-statusline`, queues `-m` task, starts tmux session `dv` |
+| `tools` | apt (tmux/jq/ripgrep via passwordless sudo), gh binary, Claude Code native installer (claude.ai/install.sh), Codex musl release binary; npm fallbacks. With `--aws-profile`, also installs AWS CLI v2, eksctl, kubectl, Helm, yq, helm-unittest, ShellCheck, Docker, Python/venv, and supporting packages. Hard-fails only if the selected agent or selected cloud toolchain is unusable. |
+| `auth` | secrets bundle → agent/GitHub auth; git identity; optional AWS profile in `~/.aws/{credentials,config}` plus `~/.devflow/aws.env`; optional named environment exports in `~/.devflow/forwarded.env`; all secret files 0600; shreds the bundle |
+| `workspace` | repo clone to `~/work/<repo>` (branch handling), `~/.claude.json` onboarding/trust seed, `~/.claude/settings.json` + `CLAUDE.md`, `~/.codex/config.toml` + `AGENTS.md`, `~/.tmux.conf`, shell integration (`~/.devflow/shellrc` sourced from .bashrc/.profile with re-entry guard; SSH logins auto-attach tmux), helper scripts `dv-agent`/`dv-task-start`/`dv-ensure`/`dv-statusline`, queues `-m` task, starts tmux session `dv` |
 | `harness` | `ensure_npm` (nvm-installs node 22 if needed, symlinks nvm bins into `~/.local/bin`), installs oh-my-claudecode (`omc setup --no-plugin --force --quiet`) and/or oh-my-codex (`omx setup --scope user --merge-agents --force`), then installs dv-engineer/dv-designer/dv-security **after** omc (whose setup syncs `~/.claude/agents` and deletes unknown files) |
 
-All phases are safe to re-run. `devflow sync` re-uploads and runs only `auth`.
+All phases are safe to re-run. `devflow sync` re-uploads and runs `auth`; when
+an AWS profile is supplied it also re-runs `tools` so older sandboxes gain the
+cloud toolchain.
+
+Before attaching to an existing sandbox for work, `up` compares its
+`provisioned` marker with the current embedded provisioner version. Missing or
+older markers resume all four phases. A new `--task` on a current sandbox is
+uploaded separately and launched through `dv-task-start` instead of being
+silently ignored.
 
 ### Sandbox state directory (`~/.devflow/`)
 
-`env` (0600 secrets env), `agent`, `workdir`, `name`, `repo`, `harness`,
+`env`, `aws.env`, `forwarded.env` (0600 forwarded env files),
+`aws-expiration`, `aws-source-profile`, `forwarded-env-names` (0600 metadata),
+`agent`, `workdir`, `name`, `repo`, `harness`,
 `task` (consumed on first agent launch), `provisioned` (version marker),
+`run/{status,task.txt,agent.log,last-message.txt}` (0600 detached-task state),
 `autotmux` (enables SSH auto-attach), `shellrc`, `stage/` (0700),
 `bin/{dv-agent,dv-ensure,dv-statusline}`, `*-install.log`.
 
-- `dv-agent [claude|codex]` — launches the agent in the workdir; consumes a
-  queued task; resumes prior conversations; root fallback (`acceptEdits`,
-  since claude refuses bypass as root); prefers the `omx` launcher for fresh
-  codex sessions.
-- `dv-ensure` — recreates tmux session `dv` (agent/[codex]/shell windows)
-  if missing; run by attach after restarts.
+- `dv-agent [claude|codex]` — launches the agent in the workdir and consumes a
+  queued task. Codex tasks use non-interactive `codex exec`, tee output to the
+  0600 run log, and atomically record running/completed/failed state. Launches
+  without a task resume an interactive conversation. The tools phase checks
+  snapshot-provided Codex versions and upgrades stale binaries before a task
+  can start. A failed provision phase is terminal for that launch: devflow
+  never continues to queue a task using an unusable agent.
+- `dv-task-start` — atomically accepts a new queued task, refuses to replace a
+  live run, and starts a fresh detached `dv:agent` window. Workspace
+  reprovisioning uses it whenever a task is present, so a failed or idle
+  window cannot strand a newly queued task.
+- `dv-ensure` — recreates missing tmux sessions or individual
+  agent/[codex]/shell windows; run by attach after restarts.
 - `dv-statusline` — Claude Code statusLine command (sandbox · model · dir ·
   branch · ctx%). oh-my-claudecode's HUD replaces it when installed.
 - `dv-script` / `dv-script-exec` — pushed by `up --script FILE`: run the

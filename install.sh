@@ -11,7 +11,7 @@ set -o pipefail
 
 REPO="dalinkstone/devflow"
 RAW="https://raw.githubusercontent.com/$REPO/main"
-DAYTONA_VERSION="${DAYTONA_VERSION:-0.194.0}"
+DAYTONA_VERSION="${DAYTONA_VERSION:-0.199.0}"
 INSTALL_DIR="${DEVFLOW_INSTALL_DIR:-$HOME/.local/bin}"
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
@@ -60,13 +60,18 @@ ok "devflow → $INSTALL_DIR/devflow (alias: dv)"
 # --- dependencies -----------------------------------------------------------
 install_daytona() {
   if have brew; then
-    info "installing Daytona CLI via Homebrew…"
-    brew install daytonaio/cli/daytona && return 0
+    info "aligning Daytona CLI with v$DAYTONA_VERSION via Homebrew…"
+    brew upgrade daytonaio/cli/daytona >/dev/null 2>&1 +      || brew install daytonaio/cli/daytona
+    return $?
   fi
   info "installing Daytona CLI v$DAYTONA_VERSION…"
   curl -fsSL "https://github.com/daytona/clients/releases/download/v${DAYTONA_VERSION}/daytona-${OS}-${ARCH}" \
     -o "$INSTALL_DIR/daytona" || return 1
   chmod +x "$INSTALL_DIR/daytona"
+}
+
+daytona_version() {
+  daytona version 2>/dev/null | sed -n 's/.*v\([0-9][0-9.]*\).*/\1/p' | head -1
 }
 
 install_jq() {
@@ -103,7 +108,12 @@ install_gh() {
   return $rc
 }
 
-if have daytona; then ok "daytona already installed"; else install_daytona && ok "daytona installed" || warn "could not install daytona — see https://www.daytona.io/docs"; fi
+if have daytona && [ "$(daytona_version)" = "$DAYTONA_VERSION" ]; then
+  ok "daytona v$DAYTONA_VERSION already installed"
+else
+  install_daytona && ok "daytona v$DAYTONA_VERSION installed" || \
+    warn "could not install Daytona CLI v$DAYTONA_VERSION — see https://www.daytona.io/docs"
+fi
 if have jq;      then ok "jq already installed";      else install_jq && ok "jq installed"           || warn "could not install jq"; fi
 if have gh;      then ok "gh already installed";      else install_gh && ok "gh installed"           || warn "could not install gh — see https://cli.github.com"; fi
 if have fzf;     then ok "fzf found (nicer pickers)"; else info "optional: install fzf for fuzzy pickers"; fi

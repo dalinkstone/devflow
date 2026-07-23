@@ -45,8 +45,9 @@ devflow never sets it and sandboxes never receive it.
 ## Core workflow
 
 ```bash
-devflow up [REPO] [flags]      # create (or reattach to) a session
+devflow up [REPO] [flags]      # create, recover, or submit work to a session
 devflow attach [NAME]          # rejoin from anywhere; restarts stopped sandboxes
+devflow status [NAME]          # poll queued/running/completed/failed task state
 devflow peek [NAME] [-w WIN]   # view the agent's screen (or window: script)
 devflow ls                     # list devflow sandboxes
 devflow stop [NAME|--all]      # stop compute billing; disk preserved
@@ -55,8 +56,9 @@ devflow rm [NAME|--all] [-f]   # delete (unpushed work is lost)
 
 `up` REPO forms: `owner/name`, a GitHub URL, or omitted — inside a git repo it
 uses that repo's origin; outside one you get a picker of your GitHub repos
-(fzf if installed). `up` on an existing sandbox just attaches (idempotent);
-`--fresh` recreates it.
+(fzf if installed). On an existing sandbox, `up` resumes incomplete/outdated
+provisioning. A supplied `--task` starts in a fresh detached agent window when
+no task is already running. `--fresh` still deletes and recreates the sandbox.
 
 Sizes are Daytona's fixed classes (the API rejects raw cpu/memory/disk when a
 snapshot is involved — and even the default image is a snapshot). The old
@@ -76,23 +78,78 @@ deprecated: they still work but map to the smallest size that fits. A custom
 | `--blank` | no repo, scratch workspace | — |
 | `--pick` | force the repo picker | — |
 | `--fresh` | delete + recreate existing sandbox | — |
-| `--no-attach` | don't SSH in afterwards | attaches when on a TTY |
+| `--no-attach`, `--detach` | don't SSH in afterwards | attaches when on a TTY |
 | `-s, --size S` | `small` (1cpu/1gb/3gb) \| `medium` (2cpu/4gb/8gb) \| `large` (4cpu/8gb/10gb) | `medium` |
 | `--auto-stop MIN` | 0 = run until stopped | 0 |
-| `--snapshot S` | custom snapshot (its size is baked in; `--size` is ignored) | Daytona default image |
+| `--snapshot S` | explicit custom snapshot (its size is baked in); an explicit `--size` overrides only a configured default snapshot | Daytona default image |
+| `--aws-profile P` | forward named AWS profile as an expiring sandbox session; install AWS/EKS tools | — |
+| `--secret-env VAR` | forward one set local environment variable; repeatable | — |
+| `--env NAME=VALUE` | forward one non-secret runtime setting; repeatable | — |
+| `--allow-static-aws` | explicitly permit a non-expiring AWS credential (discouraged) | off |
+
+### AWS and secret forwarding
+
+AWS access and arbitrary environment secrets are always opt-in. Use a dedicated
+assumed-role profile with an expiring STS session, not a static default profile:
+
+```bash
+export DAYTONA_API_KEY=…
+export CLOUDFLARE_API_TOKEN=…
+
+TASK='Verify HEAD is exactly e6784823b969f7b1c4f29c4f1be1eff9e49cc159 and the worktree is clean. Use repository/script defaults except BASE_DOMAIN=long.forum, DAYTONA_API_URL=https://app.daytona.io/api, and the forwarded Cloudflare token. Derive non-secret AWS canary values from the selected account/profile, fill scripts/aws-setup/.state/canary.env, and run scripts/aws-setup/deploy-and-test.sh without interactive input. Verify sandbox creation, the infra tests, and every E2E stage; perform and verify one graceful runner reroll, including replacement readiness and a post-reroll sandbox creation; redact logs, preserve receipts, and do not teardown.'
+
+devflow up dalinkstone/helm-charts \
+  --agent codex --branch codex/daytona-v0199-canary \
+  --name dv-daytona-v0199 --size large \
+  --aws-profile devflow-deployer \
+  --secret-env DAYTONA_API_KEY \
+  --secret-env CLOUDFLARE_API_TOKEN \
+  --env BASE_DOMAIN=long.forum \
+  --env DAYTONA_API_URL=https://app.daytona.io/api \
+  --task "$TASK" \
+  --detach
+```
+
+Before Daytona creates or starts anything, devflow runs `aws configure
+export-credentials --profile P --format process`, requires
+`AccessKeyId`/`SecretAccessKey`/`SessionToken`/`Expiration`, and checks the
+identity with STS. Static credentials fail closed unless `--allow-static-aws`
+is present. The remote profile is always named `devflow`; devflow writes
+`~/.aws/credentials`, `~/.aws/config`, and `~/.devflow/{aws,forwarded}.env`
+mode 0600. The temporary upload is shredded after auth.
+
+When AWS forwarding is selected, the tools phase ensures AWS CLI v2, eksctl,
+kubectl, Helm, yq, helm-unittest, ShellCheck, Docker, Python/venv, and the
+supporting system packages are available. A running Docker daemon still
+depends on the Daytona snapshot being Docker-in-Docker capable.
+
+Use `--secret-env` only for values already present in the local environment.
+Use `--env NAME=VALUE` for non-secrets such as the BYOC base domain and API
+URL. Both are written to the sandbox's 0600 environment bundle; only
+`--secret-env` keeps the value out of the local command line.
 
 ### The fire-and-forget pattern
 
 ```bash
-devflow up -m "fix the flaky login test, open a PR" --no-attach
+devflow up -m "fix the flaky login test, open a PR" --detach
 # …close your laptop…
-devflow peek          # later, from anywhere: is it done?
+devflow status        # queued / running / completed / failed + process/tmux health
+devflow peek          # live/output screen
 devflow attach        # join the live session
 devflow mobile        # …or reconnect from your phone (see "Access paths")
 ```
 
-The agent keeps working while detached because the session lives in tmux
-inside the sandbox and sandboxes default to `--auto-stop 0`.
+Task-bearing Codex launches run with `codex exec` inside tmux. Output is kept
+in `~/.devflow/run/agent.log`, the final response in `last-message.txt`, and
+pollable metadata in `status`; all are mode 0600. The agent keeps working while
+detached because the session lives in tmux and sandboxes default to
+`--auto-stop 0`.
+
+Once `up` prints `agent task state: running`, the local terminal and laptop are
+no longer in the execution path: terminal closure, SSH loss, or laptop sleep
+does not stop the task. If the local process disappears before that
+confirmation, rerun the same command; the provision marker makes `up` resume
+the interrupted phases and submit the prompt instead of only attaching.
 
 ### Run a script in the sandbox
 
@@ -170,6 +227,8 @@ session still works (`--harness core` skips third-party entirely).
 ```bash
 devflow attach NAME        # daytona ssh + tmux auto-attach (primary)
 devflow ssh NAME           # same, explicit
+devflow status NAME        # detached task state without attaching
+devflow peek NAME          # recent agent output without attaching
 devflow mobile NAME        # phone hand-off: QR + every reconnect path (see below)
 devflow ssh-command NAME [--expires MIN]
                            # prints `ssh <token>@ssh.app.daytona.io` for
@@ -198,7 +257,7 @@ or a second machine:
 
 ```bash
 # 1. laptop: start the agent working and walk away
-devflow up -m "refactor the auth module, open a PR" --no-attach
+devflow up -m "refactor the auth module, open a PR" --detach
 
 # 2. laptop, before you leave: put the session on your phone
 devflow mobile              # (alias: devflow qr; name optional with one sandbox)
@@ -306,6 +365,19 @@ devflow token         # mint + store the 1-year Claude subscription token
 If Codex auth goes stale inside a sandbox: `devflow sync`, or run
 `codex login --device-auth` in the sandbox shell.
 
+Refresh cloud credentials and selected environment secrets with the same flags
+used on `up`:
+
+```bash
+devflow sync dv-daytona-v0199 \
+  --aws-profile devflow-deployer \
+  --secret-env DAYTONA_API_KEY \
+  --secret-env CLOUDFLARE_API_TOKEN
+```
+
+`sync` re-runs the tools phase when `--aws-profile` is supplied and then
+atomically replaces the credential files and recorded expiration.
+
 ## Configuration
 
 ```bash
@@ -356,6 +428,8 @@ automatically by the last build) picks which one `up` uses.
 | anything unclear | `devflow doctor` |
 | "not logged in to Daytona" | `daytona login` (or `devflow setup`) |
 | agent says logged out | `devflow sync NAME` |
+| AWS credentials expired | renew the local assumed-role STS session, then `devflow sync NAME --aws-profile PROFILE` |
+| Docker client cannot reach daemon | use a Daytona snapshot configured for Docker-in-Docker |
 | claude refuses bypass mode | sandbox user is root (custom image) — devflow falls back to acceptEdits; prefer non-root images |
 | harness missing | `devflow exec NAME -- 'tail -20 ~/.devflow/omc-install.log ~/.devflow/omx-install.log'` |
 | daytona CLI/API version-mismatch warning | `brew upgrade daytonaio/cli/daytona` |
