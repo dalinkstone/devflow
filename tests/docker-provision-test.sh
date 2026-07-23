@@ -62,6 +62,14 @@ userdel -r ubuntu 2>/dev/null || true
 useradd -m -s /bin/bash daytona
 echo 'daytona ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/91-daytona
 
+# Daytona snapshots can ship an old Codex. Provisioning must replace it,
+# rather than accepting any binary merely because it exists on PATH.
+cat > /usr/local/bin/codex <<'STALE_CODEX'
+#!/usr/bin/env bash
+echo 'codex-cli 0.128.0'
+STALE_CODEX
+chmod 0755 /usr/local/bin/codex
+
 install -d -o daytona -g daytona /home/daytona/.devflow /home/daytona/.devflow/stage
 install -o daytona -g daytona -m 700 /payload/provision.sh /home/daytona/.devflow/stage/provision.sh
 install -o daytona -g daytona -m 600 /payload/secrets.env /home/daytona/.devflow/stage/secrets.env
@@ -69,7 +77,7 @@ install -o daytona -g daytona -m 600 /payload/secrets.env /home/daytona/.devflow
 run_phase() {
   sudo -u daytona -H env \
     DV_PHASE="$1" DV_AGENT=none DV_REPO=octocat/Hello-World DV_BRANCH= \
-    DV_NAME=dv-dockertest DV_TASK_B64="$(printf 'fix the flaky test' | base64 | tr -d '\n')" \
+    DV_NAME=dv-dockertest DV_TASK_B64= \
     DV_WORKROOT=work DV_HARNESS=both \
     bash /home/daytona/.devflow/stage/provision.sh
 }
@@ -94,7 +102,7 @@ checkmode() { m="$(stat -c %a "$3")"; if [ "$m" = "$2" ]; then ok "$1"; else bad
 check "tmux installed"            'command -v tmux'
 check "gh installed"              'command -v gh && gh --version'
 check "claude installed + runs"   'command -v claude && claude --version'
-check "codex installed + runs"    'command -v codex && codex --version'
+check "stale codex upgraded"      'command -v codex && codex --version | grep -q "0.142.5"'
 check "jq installed"              'command -v jq'
 check "ripgrep installed"         'command -v rg'
 check "aws installed"             'command -v aws && aws --version'
@@ -134,19 +142,20 @@ check "AWS expiration exported"   "grep -q 'AWS_CREDENTIAL_EXPIRATION=2099-01-01
 
 check "repo cloned"               "test -d $H/work/Hello-World/.git"
 check "workdir recorded"          "grep -q Hello-World $H/.devflow/workdir"
-check "task queued"               "grep -q 'fix the flaky test' $H/.devflow/task"
 check "tmux.conf written"         "test -f $H/.tmux.conf"
 check "bashrc hook"               "grep -q devflow/shellrc $H/.bashrc"
 check "profile hook"              "grep -q devflow/shellrc $H/.profile"
 check "dv-agent executable"       "test -x $H/.devflow/bin/dv-agent"
+check "dv-task-start executable"  "test -x $H/.devflow/bin/dv-task-start"
 check "dv-ensure executable"      "test -x $H/.devflow/bin/dv-ensure"
 check "dv-statusline executable"  "test -x $H/.devflow/bin/dv-statusline"
 check "dv-agent parses"           "bash -n $H/.devflow/bin/dv-agent"
+check "dv-task-start parses"      "bash -n $H/.devflow/bin/dv-task-start"
 check "dv-ensure parses"          "bash -n $H/.devflow/bin/dv-ensure"
 check "shellrc parses"            "bash -n $H/.devflow/shellrc"
-check "provisioned marker"        "test -f $H/.devflow/provisioned"
+check "provisioned marker v5"     "grep -qx 5 $H/.devflow/provisioned"
 
-check "tmux session dv exists"    'tmux has-session -t dv'
+check "detached tmux survived the provisioning caller" 'tmux has-session -t dv'
 check "tmux window agent"         'tmux list-windows -t dv | grep -q agent'
 check "tmux window shell"         'tmux list-windows -t dv | grep -q shell'
 

@@ -73,6 +73,7 @@ run_devflow() { # args… (stdin=/dev/null, captures stdout+stderr, sets RC/OUT)
       FAKE_LOG="$T_LOG" FAKE_STATE_DIR="$T_STATE" FAKE_EXEC_STYLE="$EXEC_STYLE" \
       FAKE_QRENCODE_FAIL="${FAKE_QRENCODE_FAIL:-}" FAKE_OP_FAIL="${FAKE_OP_FAIL:-}" \
       FAKE_AWS_STATIC="${FAKE_AWS_STATIC:-0}" \
+      FAKE_UNPROVISIONED="${FAKE_UNPROVISIONED:-0}" FAKE_AGENT_STATE="${FAKE_AGENT_STATE:-running}" FAKE_FAIL_TOOLS="${FAKE_FAIL_TOOLS:-0}" \
       DAYTONA_API_KEY="${TEST_DAYTONA_API_KEY:-}" \
       CLOUDFLARE_API_TOKEN="${TEST_CLOUDFLARE_API_TOKEN:-}" \
       CODEX_HOME="$T_HOME/.codex" \
@@ -161,7 +162,14 @@ PROVISION="$(extract_pushed_file /tmp/.dv-provision.sh)"
 assert_contains "provisioner uploaded intact" "$PROVISION" "devflow sandbox provisioner"
 assert_contains "provisioner has claude install" "$PROVISION" "claude.ai/install.sh"
 assert_contains "provisioner has codex musl" "$PROVISION" "unknown-linux-musl"
+assert_contains "provisioner upgrades stale codex" "$PROVISION" 'version_lt "$codex_have" "$codex_want"'
+assert_contains "provisioner uses user-local npm fallback" "$PROVISION" 'npm install --prefix "$HOME/.local"'
+assert_contains "provisioner replaces stale codex launcher" "$PROVISION" 'rm -f "$HOME/.local/bin/codex"'
 assert_contains "provisioner writes codex config" "$PROVISION" 'approval_policy = "never"'
+assert_contains "provisioner launches detached Codex tasks" "$PROVISION" "codex exec --dangerously-bypass-approvals-and-sandbox"
+assert_contains "provisioner records agent task status" "$PROVISION" "status_write running"
+assert_contains "provisioner ships detached task starter" "$PROVISION" "dv-task-start"
+assert_contains "workspace launches queued task explicitly" "$PROVISION" '"$DV_BIN/dv-task-start"'
 assert_contains "provisioner sets token env var" "$PROVISION" "CLAUDE_CODE_OAUTH_TOKEN"
 assert_contains "provisioner installs omc" "$PROVISION" "oh-my-claude-sisyphus"
 assert_contains "provisioner runs omc setup headless" "$PROVISION" "omc setup --no-plugin --force --quiet"
@@ -191,6 +199,12 @@ assert_contains "up on existing prints the attach hint" "$OUT" "attach anytime"
 run_devflow peek
 assert_rc "peek (auto-resolve) exits 0" "$RC" 0
 assert_contains "peek shows agent pane" "$OUT" "fake agent output line"
+
+run_devflow status dv-alpha
+assert_rc "status exits 0" "$RC" 0
+assert_contains "status reports sandbox state" "$OUT" "sandbox_state=started"
+assert_contains "status reports detached task state" "$OUT" "agent_state=running"
+assert_contains "status reports tmux" "$OUT" "tmux_session=running"
 
 run_devflow stop
 assert_rc "stop exits 0" "$RC" 0
@@ -347,7 +361,7 @@ echo "# 4..blank sandbox with a queued task"
 # ===========================================================================
 fresh_env argv
 
-run_devflow up --blank -m "fix the flaky login test" --no-attach
+run_devflow up --blank --agent codex -m "fix the flaky login test" --detach
 assert_rc "blank up exits 0" "$RC" 0
 assert_contains "blank names dv-scratch" "$OUT" "spinning up dv-scratch"
 assert_not_contains "blank has no repo label" "$(cat "$T_LOG")" "devflow.repo"
@@ -355,10 +369,30 @@ assert_contains "task fire-and-forget hint" "$OUT" "devflow peek dv-scratch"
 
 TASK_B64="$(grep -o "DV_TASK_B64='[A-Za-z0-9+/=]*'" "$T_LOG" | head -1 | sed "s/DV_TASK_B64='//; s/'$//")"
 assert_eq "task delivered base64-intact" "$(printf '%s' "$TASK_B64" | base64 --decode)" "fix the flaky login test"
+assert_contains "task start is verified" "$OUT" "agent task state: running"
+assert_contains "--detach prints status polling hint" "$OUT" "devflow status dv-scratch"
+
+run_devflow up --blank --agent codex -m "run the second detached task" --detach
+assert_rc "task on existing sandbox exits 0" "$RC" 0
+assert_contains "existing sandbox task starts detached" "$OUT" "agent task started in tmux"
+assert_contains "existing sandbox task start is verified" "$OUT" "agent task state: running"
+assert_eq "existing task uploaded intact" "$(extract_pushed_file /tmp/.dv-task)" "run the second detached task"
+assert_file_contains "existing task honors explicit Codex agent" "$T_LOG" "dv-task-start\" /tmp/.dv-task codex"
+
+fresh_env argv
+run_devflow up tester/incomplete --agent codex --no-attach
+FAKE_UNPROVISIONED=1
+run_devflow up tester/incomplete --agent codex -m "resume provisioning and run" --detach
+assert_rc "incomplete sandbox recovery exits 0" "$RC" 0
+assert_contains "incomplete sandbox resumes provisioning" "$OUT" "provisioning is incomplete or outdated"
+assert_contains "recovered sandbox starts task" "$OUT" "agent task state: running"
+unset FAKE_UNPROVISIONED
 
 # ===========================================================================
 echo "# 5..--fresh recreates"
 # ===========================================================================
+fresh_env argv
+run_devflow up --blank --no-attach
 run_devflow up --blank --no-attach --fresh
 assert_rc "fresh up exits 0" "$RC" 0
 assert_contains "fresh recreates" "$OUT" "recreating 'dv-scratch'"
@@ -447,9 +481,14 @@ assert_file_contains "DEVFLOW_SIZE beats legacy config" "$T_LOG" "--snapshot=day
 
 run_devflow config set DEVFLOW_SNAPSHOT custom-snap
 run_devflow up tester/zeta --size large --no-attach
-assert_rc "custom snapshot up exits 0" "$RC" 0
-assert_file_contains "custom snapshot passed through" "$T_LOG" "--snapshot=custom-snap"
-assert_contains "custom snapshot ignores --size" "$OUT" "has its size baked in"
+assert_rc "explicit size over configured snapshot exits 0" "$RC" 0
+assert_file_contains "explicit size uses requested large class" "$T_LOG" "--snapshot=daytona-large"
+assert_contains "explicit size explains configured snapshot override" "$OUT" "explicit --size overrides configured snapshot"
+
+run_devflow up tester/zeta-explicit --snapshot custom-snap --size large --no-attach
+assert_rc "explicit custom snapshot up exits 0" "$RC" 0
+assert_file_contains "explicit custom snapshot passed through" "$T_LOG" "--snapshot=custom-snap"
+assert_contains "explicit custom snapshot ignores size" "$OUT" "has its size baked in"
 
 # ===========================================================================
 echo "# 9..custom snapshot build"
@@ -539,7 +578,8 @@ TEST_DAYTONA_API_KEY="dtn_DEPLOY_FAKE"
 TEST_CLOUDFLARE_API_TOKEN="cf_DEPLOY_FAKE"
 
 run_devflow up tester/aws-deploy --agent codex --aws-profile devflow-deployer \
-  --secret-env DAYTONA_API_KEY --secret-env CLOUDFLARE_API_TOKEN --no-attach
+  --secret-env DAYTONA_API_KEY --secret-env CLOUDFLARE_API_TOKEN \
+  --env BASE_DOMAIN=long.forum --env DAYTONA_API_URL=https://app.daytona.io/api --detach
 assert_rc "AWS forwarding up exits 0" "$RC" 0
 assert_contains "AWS forwarding announces temporary expiry" "$OUT" "temporary profile 'devflow-deployer'"
 assert_contains "AWS forwarding announces toolchain" "$OUT" "AWS deployment toolchain"
@@ -558,16 +598,19 @@ assert_contains "AWS session token forwarded" "$DECODED_AWS_CREDS" "temporary-se
 assert_contains "AWS region forwarded" "$DECODED_AWS_CONFIG" "us-west-2"
 assert_contains "named Daytona secret forwarded" "$DECODED_FORWARDED" "DAYTONA_API_KEY=dtn_DEPLOY_FAKE"
 assert_contains "named Cloudflare secret forwarded" "$DECODED_FORWARDED" "CLOUDFLARE_API_TOKEN=cf_DEPLOY_FAKE"
+assert_contains "base domain forwarded" "$DECODED_FORWARDED" "BASE_DOMAIN=long.forum"
+assert_contains "default Daytona API forwarded" "$DECODED_FORWARDED" "DAYTONA_API_URL=https://app.daytona.io/api"
 assert_not_contains "secret values never appear in user output" "$OUT" "dtn_DEPLOY_FAKE"
 
-run_devflow sync dv-aws-deploy --aws-profile devflow-deployer --secret-env DAYTONA_API_KEY
+run_devflow sync dv-aws-deploy --aws-profile devflow-deployer --secret-env DAYTONA_API_KEY \
+  --env BASE_DOMAIN=long.forum
 assert_rc "AWS credential sync exits 0" "$RC" 0
 assert_contains "AWS credential sync reports refresh" "$OUT" "auth refreshed"
 
 FAKE_AWS_STATIC=1
 run_devflow up tester/static-rejected --aws-profile default --no-attach
 assert_rc "static AWS credentials rejected by default" "$RC" 1
-assert_contains "static rejection explains the safe path" "$OUT" "assumed-role/SSO profile"
+assert_contains "static rejection explains the safe path" "$OUT" "assumed-role profile with an expiring STS session"
 assert_not_contains "rejected static credentials create no sandbox" "$(cat "$T_LOG")" "--name=dv-static-rejected"
 
 run_devflow up tester/static-allowed --aws-profile default --allow-static-aws --no-attach
@@ -585,6 +628,7 @@ assert_contains "provision is phased" "$PROV" 'case "$DV_PHASE" in'
 assert_contains "provision writes CLAUDE.md" "$PROV" "devflow sandbox"
 assert_contains "provision guards root bypass" "$PROV" "acceptEdits"
 assert_contains "provision autotmux marker" "$PROV" "autotmux"
+assert_contains "provision detaches agent from local caller" "$PROV" "tmux new-session -d -s dv"
 assert_contains "provision installs AWS deployment tools" "$PROV" "installing AWS deployment toolchain"
 assert_contains "provision installs Python venv support" "$PROV" "python3-venv"
 assert_contains "provision writes AWS credentials securely" "$PROV" '"$HOME/.aws/credentials"'
@@ -599,6 +643,16 @@ assert_contains "dockerfile installs bun" "$DOCKERFILE" "bun.sh/install"
 assert_contains "dockerfile installs uv" "$DOCKERFILE" "astral.sh/uv"
 assert_contains "dockerfile installs build tools" "$DOCKERFILE" "build-essential"
 assert_contains "dockerfile links node for non-interactive shells" "$DOCKERFILE" '.local/bin/node'
+
+FAIL_LOG_START="$(wc -l < "$T_LOG")"
+FAKE_FAIL_TOOLS=1
+run_devflow up tester/phase-failure --name dv-phase-failure --no-attach
+assert_rc "tools phase failure stops provisioning" "$RC" 1
+assert_contains "tools phase failure explains task was not queued" "$OUT" "sandbox tools phase failed; task was not queued"
+FAIL_LOG="$(tail -n "+$((FAIL_LOG_START + 1))" "$T_LOG")"
+assert_not_contains "tools phase failure never reaches auth" "$FAIL_LOG" "DV_PHASE='auth'"
+assert_not_contains "tools phase failure never reaches workspace" "$FAIL_LOG" "DV_PHASE='workspace'"
+FAKE_FAIL_TOOLS=0
 
 # ===========================================================================
 printf '\n# results: %d passed, %d failed, %d total\n' "$PASS" "$FAIL" "$TESTN"

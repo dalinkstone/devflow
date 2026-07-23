@@ -7,7 +7,7 @@ session lives in tmux in the cloud: start a task, close your laptop, reattach
 from any machine later. It just keeps working.
 
 ```console
-$ devflow up dalinkstone/myapp -m "add rate limiting to the API" --no-attach
+$ devflow up dalinkstone/myapp -m "add rate limiting to the API" --detach
 devflow spinning up dv-myapp  agent=claude repo=dalinkstone/myapp size=medium (2cpu/4gb/8gb) auto-stop=0m
 ✓ Claude Code: long-lived subscription token
 ✓ Codex: ChatGPT sign-in will be copied
@@ -19,6 +19,7 @@ devflow spinning up dv-myapp  agent=claude repo=dalinkstone/myapp size=medium (2
 ▸ setting up workspace + starting agent session…
 ✓ provisioned
 devflow the agent is on it. it keeps working even when you're not attached.
+▸ poll state:     devflow status dv-myapp
 ▸ peek progress:  devflow peek dv-myapp
 ▸ join session:   devflow attach dv-myapp
 ```
@@ -27,8 +28,15 @@ Now close the laptop. Later, from any machine:
 
 ```console
 $ devflow attach          # drops you straight into the live tmux session
+$ devflow status          # queued / running / completed / failed
 $ devflow peek            # or just glance at the agent's screen
 ```
+
+After `agent task state: running`, the laptop is no longer in the execution
+path. Codex and its network connection live in the sandbox; closing the local
+terminal or sleeping the laptop does not stop the task. If launch is interrupted
+before that confirmation, rerun the same command and devflow resumes the
+incomplete provisioning phases.
 
 ## How it works
 
@@ -51,6 +59,7 @@ $ devflow peek            # or just glance at the agent's screen
   your Claude subscription token (or credentials), your Codex ChatGPT login,
   your `gh` token, and your git identity. Deployment credentials are forwarded
   only when explicitly requested with `--aws-profile` / `--secret-env`.
+  Non-secret runtime settings use repeatable `--env NAME=VALUE`.
 - **The session is tmux**, so SSH disconnects are meaningless. Attaching from
   a fresh machine lands you in the same screen, and if the sandbox was
   stopped, attach restarts it and the agent **resumes its conversation**
@@ -98,8 +107,9 @@ Both agents bill your subscriptions, exactly like running them on your laptop.
 
 ```
 devflow up [REPO]             new session (repo picker outside a repo; auto-detects inside one)
-devflow up -m "task" --no-attach     fire-and-forget: agent starts working, you walk away
+devflow up -m "task" --detach        fire-and-forget: agent starts working, you walk away
 devflow attach [NAME]         reattach from anywhere (detach: Ctrl-b d)
+devflow status [NAME]         poll detached task state and process/tmux health
 devflow peek [NAME]           see the agent's last screenful without attaching
 devflow ls                    what's running
 devflow stop [NAME|--all]     stop billing CPU (disk kept); attach resumes the agent
@@ -119,8 +129,9 @@ devflow config set K V        defaults: DEVFLOW_AGENT, DEVFLOW_SIZE, DEVFLOW_AUT
 
 `devflow up --agent codex` runs Codex instead of Claude; `--agent both` gives
 you a tmux window for each (and OMC can even drive Codex workers: `omc team
-2:codex "review the auth flow"`). `up` on an existing sandbox just reattaches
-— it's idempotent.
+2:codex "review the auth flow"`). `up` automatically finishes an interrupted
+provisioning run. Supplying a new `--task` to a ready sandbox starts it in a
+fresh detached agent window; it refuses to replace a task that is still running.
 
 ## Opt-in cloud deployment credentials
 
@@ -131,6 +142,8 @@ needs:
 export DAYTONA_API_KEY=…
 export CLOUDFLARE_API_TOKEN=…
 
+TASK='Verify HEAD is exactly e6784823b969f7b1c4f29c4f1be1eff9e49cc159 and the worktree is clean. Use repository/script defaults except BASE_DOMAIN=long.forum, DAYTONA_API_URL=https://app.daytona.io/api, and the forwarded Cloudflare token. Derive non-secret AWS canary values from the selected account/profile, fill scripts/aws-setup/.state/canary.env, and run scripts/aws-setup/deploy-and-test.sh without interactive input. Verify sandbox creation, the infra tests, and every E2E stage; perform and verify one graceful runner reroll, including replacement readiness and a post-reroll sandbox creation; redact logs, preserve receipts, and do not teardown.'
+
 devflow up dalinkstone/helm-charts \
   --agent codex \
   --branch codex/daytona-v0199-canary \
@@ -139,7 +152,10 @@ devflow up dalinkstone/helm-charts \
   --aws-profile devflow-deployer \
   --secret-env DAYTONA_API_KEY \
   --secret-env CLOUDFLARE_API_TOKEN \
-  --task "Verify HEAD is exactly 6ba15ea, deploy the AWS canary, and run every test."
+  --env BASE_DOMAIN=long.forum \
+  --env DAYTONA_API_URL=https://app.daytona.io/api \
+  --task "$TASK" \
+  --detach
 ```
 
 `--aws-profile` resolves the local profile with `aws configure
@@ -153,13 +169,15 @@ an expiring session without rebuilding the sandbox:
 devflow sync dv-daytona-v0199 \
   --aws-profile devflow-deployer \
   --secret-env DAYTONA_API_KEY \
-  --secret-env CLOUDFLARE_API_TOKEN
+  --secret-env CLOUDFLARE_API_TOKEN \
+  --env BASE_DOMAIN=long.forum \
+  --env DAYTONA_API_URL=https://app.daytona.io/api
 ```
 
-Use a dedicated assumed-role or IAM Identity Center profile with a session long
-enough for provisioning and tests. `--secret-env` is repeatable and names only
-variables already set in the local environment; values are never command-line
-arguments or console output.
+Use a dedicated assumed-role profile with a session long enough for provisioning
+and tests. `--secret-env` is repeatable and names only variables already set in
+the local environment; values are never command-line arguments or console
+output. `--env NAME=VALUE` is for non-secrets such as domains and API URLs.
 
 ## The multi-agent harness
 
@@ -203,8 +221,16 @@ Plus the base setup every sandbox gets:
   safety boundary), a statusline, and `~/.claude/CLAUDE.md` sandbox
   etiquette: commit early, push feature branches, `gh pr create`, re-orient
   after a resume, delegate to the subagent team.
-- **Codex**: `approval_policy = "never"`, `sandbox_mode =
-  "danger-full-access"`, workdir pre-trusted, matching `~/.codex/AGENTS.md`.
+- **Codex**: task-bearing launches run `codex exec` in detached tmux with
+  `approval_policy = "never"`, `sandbox_mode = "danger-full-access"`, a
+  pre-trusted workdir, a 0600 log, and durable run status for polling.
+  Provisioning upgrades stale Codex binaries baked into snapshots to the
+  current release (or devflow's tested pin), preventing obsolete defaults
+  from breaking ChatGPT-authenticated sessions at startup. If the native
+  release download is unavailable, it installs the matching CLI package under
+  `~/.local` rather than attempting to modify the snapshot's system Node tree.
+  Reprovisioning with a queued task replaces any idle or previously failed
+  tmux agent window before launch.
 - **Tools**: `gh`, `tmux`, `jq`, `ripgrep`; `claude`/`codex` as native
   binaries (no Node needed — node is bootstrapped via nvm only when a
   harness needs it). Aliases: `dv-work`, `yolo`.
@@ -241,9 +267,10 @@ custom snapshot.
   all. If that's not acceptable, this tool isn't the right fit.
 - devflow itself stores secrets only in `~/.config/devflow/secrets` (0600),
   and nothing is ever hardcoded in the repo.
-- Forwarded AWS sessions and `--secret-env` values exist only in memory on the
-  client and in `0600` sandbox files. The staging bundle is shredded during
-  auth; `devflow sync` replaces the files and refreshes recorded expiration.
+- Forwarded AWS sessions, `--secret-env` values, and non-secret `--env`
+  settings exist only in memory on the client and in `0600` sandbox files.
+  The staging bundle is shredded during auth; `devflow sync` replaces the
+  files and refreshes recorded expiration.
 - Free-tier note: Daytona Tier 1/2 sandboxes have a network egress whitelist
   (GitHub, npm/pip, Anthropic, OpenAI, …) — agents work fine, but arbitrary
   outbound hosts need Tier 3+.
@@ -255,7 +282,7 @@ auto-attach lives in the sandbox's shell rc (not the client), **every** SSH
 login lands you back in the same running agent:
 
 ```bash
-devflow up -m "fix the bug, open a PR" --no-attach   # laptop: start + walk away
+devflow up -m "fix the bug, open a PR" --detach      # laptop: start + walk away
 devflow mobile                                        # laptop: scan the QR with your phone
 ```
 
