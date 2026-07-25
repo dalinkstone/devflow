@@ -571,7 +571,61 @@ assert_contains "sandbox got the minted key" "$(extract_pushed_file /tmp/.dv-day
 assert_contains "sandbox config carries the org" "$(extract_pushed_file /tmp/.dv-daytona-config)" "org-123"
 
 # ===========================================================================
-echo "# 11..AWS + explicit secret forwarding"
+echo "# 11..multi-agent teams (one sandbox or linked sandboxes)"
+# ===========================================================================
+fresh_env argv
+
+run_devflow team up tester/teamrepo --name alpha --mode one --agent codex \
+  --task "ship the feature" --worker "builder=implement it" --worker "reviewer=review it"
+assert_rc "one-sandbox team exits 0" "$RC" 0
+assert_eq "one-sandbox team creates one sandbox" "$(find "$T_STATE" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')" "1"
+assert_eq "one-sandbox team label" "$(jq -r '.labels["devflow.team"]' "$T_STATE/dv-alpha.json")" "alpha"
+assert_eq "one-sandbox mode label" "$(jq -r '.labels["devflow.team.mode"]' "$T_STATE/dv-alpha.json")" "one"
+assert_eq "one-sandbox leader label" "$(jq -r '.labels["devflow.team.role"]' "$T_STATE/dv-alpha.json")" "leader"
+TEAM_TASK_B64="$(grep -o "DV_TASK_B64='[A-Za-z0-9+/=]*'" "$T_LOG" | tail -1 | sed "s/DV_TASK_B64='//; s/'$//")"
+TEAM_TASK="$(printf '%s' "$TEAM_TASK_B64" | base64 --decode)"
+assert_contains "one-sandbox team asks harness to delegate" "$TEAM_TASK" "Delegate these roles"
+assert_contains "one-sandbox team carries builder task" "$TEAM_TASK" "builder: implement it"
+
+run_devflow team status alpha
+assert_rc "one-sandbox team status exits 0" "$RC" 0
+assert_contains "one-sandbox team status shows leader" "$OUT" "leader"
+assert_contains "one-sandbox team status shows running task" "$OUT" "running"
+
+run_devflow team task alpha leader "do a follow-up"
+assert_rc "team task exits 0" "$RC" 0
+assert_eq "team follow-up task uploaded intact" "$(extract_pushed_file /tmp/.dv-task)" "do a follow-up"
+
+run_devflow team rm alpha --force
+assert_rc "one-sandbox team rm exits 0" "$RC" 0
+assert_eq "one-sandbox team rm deletes sandbox" "$(find "$T_STATE" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')" "0"
+
+fresh_env argv
+run_devflow team up tester/teamrepo --name swarm --mode linked --agent codex \
+  --agents 3 --task "build and verify the feature"
+assert_rc "linked team exits 0" "$RC" 0
+assert_eq "linked team creates leader plus two workers" "$(find "$T_STATE" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')" "3"
+assert_eq "linked worker points at leader id" "$(jq -r '.linkedSandbox' "$T_STATE/dv-swarm-worker-1.json")" "id-dv-swarm"
+assert_eq "linked worker is delete-on-stop" "$(jq -r '.autoDeleteInterval' "$T_STATE/dv-swarm-worker-1.json")" "0"
+assert_eq "linked worker role label" "$(jq -r '.labels["devflow.team.role"]' "$T_STATE/dv-swarm-worker-2.json")" "worker-2"
+assert_file_contains "linked create uses Daytona linkedSandbox API" "$T_LOG" '"linkedSandbox"'
+assert_contains "linked team prints management command" "$OUT" "devflow team status swarm"
+
+run_devflow team status swarm
+assert_rc "linked team status exits 0" "$RC" 0
+assert_contains "linked status shows first worker" "$OUT" "worker-1"
+assert_contains "linked status shows second worker" "$OUT" "worker-2"
+
+run_devflow team peek swarm worker-1
+assert_rc "linked team peek exits 0" "$RC" 0
+assert_contains "linked team peek targets worker" "$OUT" "dv-swarm-worker-1"
+
+run_devflow team rm swarm --force
+assert_rc "linked team rm exits 0" "$RC" 0
+assert_eq "linked parent deletion cascades workers" "$(find "$T_STATE" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')" "0"
+
+# ===========================================================================
+echo "# 12..AWS + explicit secret forwarding"
 # ===========================================================================
 fresh_env argv
 TEST_DAYTONA_API_KEY="dtn_DEPLOY_FAKE"
@@ -619,7 +673,7 @@ assert_contains "static override is visibly warned" "$OUT" "static profile 'defa
 unset FAKE_AWS_STATIC TEST_DAYTONA_API_KEY TEST_CLOUDFLARE_API_TOKEN
 
 # ===========================================================================
-echo "# 12..payload self-checks"
+echo "# 13..payload self-checks"
 # ===========================================================================
 PROV="$("$DEVFLOW" __provision-script)"
 printf '%s\n' "$PROV" > "$WORK/prov.sh"

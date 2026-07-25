@@ -16,10 +16,9 @@ user ──▶ bin/devflow (bash, single file)
          (keychain / files / gh)         claude+codex+gh+tmux, harness
 ```
 
-devflow deliberately has **no runtime dependency on the Daytona REST API**
-except one endpoint (`ssh-access`, used by `devflow ssh-command` and
-`devflow mobile`); everything
-else goes through the `daytona` CLI so auth/transport stay Daytona's problem.
+Most operations use the Daytona CLI. REST is limited to `ssh-access`,
+scoped API-key management for `--with-daytona`, and linked-worker creation
+for `devflow team up --mode linked` (the CLI has no linked-sandbox flag).
 
 ## bin/devflow file map (one file, ordered sections)
 
@@ -34,8 +33,9 @@ else goes through the `daytona` CLI so auth/transport stay Daytona's problem.
 | **Embedded payloads** | `emit_provision_script` (the in-sandbox provisioner), `emit_dockerfile` (snapshot image) |
 | Orchestration | `upload_provisioner`, `run_phase`, `provision_sandbox`, `ensure_running` |
 | Listing | `devflow_sandboxes_json` (label-filtered), `resolve_name` |
-| Commands | `cmd_up`, `cmd_attach`, `cmd_ssh`, `cmd_ssh_command`, `cmd_exec`, `cmd_peek`, `cmd_ls`, `cmd_stop`, `cmd_rm`, `cmd_sync`, `cmd_token`, `cmd_config`, `cmd_dashboard`, `cmd_doctor`, `cmd_setup`, `cmd_snapshot` |
-| Help + main | `usage`, `usage_up`, `main` dispatch |
+| Teams | `create_linked_sandbox`, `team_sandboxes_json`, `team_role_sandbox`, `cmd_team_*` |
+| Commands | `cmd_up`, `cmd_team`, `cmd_attach`, `cmd_ssh`, `cmd_ssh_command`, `cmd_exec`, `cmd_peek`, `cmd_ls`, `cmd_stop`, `cmd_rm`, `cmd_sync`, `cmd_token`, `cmd_config`, `cmd_dashboard`, `cmd_doctor`, `cmd_setup`, `cmd_snapshot` |
+| Help + main | `usage`, `usage_up`, `usage_team`, `main` dispatch |
 
 Hidden commands: `devflow __provision-script` and `devflow __dockerfile`
 print the embedded payloads — tests and the Docker validation consume them.
@@ -93,6 +93,20 @@ older markers resume all four phases. A new `--task` on a current sandbox is
 uploaded separately and launched through `dv-task-start` instead of being
 silently ignored.
 
+## Teams
+
+`team up --mode one` composes the goal/worker roles into one prompt and uses
+the sandbox's installed harness. `--mode linked` creates a normal persistent
+leader, forwards Daytona/devflow into it, then creates ephemeral workers with
+the REST fields `linkedSandbox=<leader id>` and `autoDeleteInterval=0`.
+
+Every member has `devflow.team`, `devflow.team.role`, and
+`devflow.team.mode` labels. Team discovery and management are label-based.
+Workers get separate filesystems and prompts that require distinct
+`devflow/<team>-<role>` branches; the leader integrates their pushed commits.
+The link supplies private bidirectional networking and DNS, not shared disk.
+Deleting the leader cascades to linked workers.
+
 ### Sandbox state directory (`~/.devflow/`)
 
 `env`, `aws.env`, `forwarded.env` (0600 forwarded env files),
@@ -139,6 +153,9 @@ silently ignored.
   resources (its `--memory` is **GB**); `info` reports memory/disk in GB.
 - Auto-stop default is 15 min and its timer **ignores running processes**
   (only SSH/API traffic resets it) → devflow defaults to `--auto-stop=0`.
+- Linked children require `autoDeleteInterval=0`, cannot resume after stop,
+  share a private bidirectional network with the parent, resolve one another
+  by sandbox name/ID, and are cascade-deleted with the parent.
 - stop kills processes, preserves disk; archive (default after 7d stopped)
   moves disk to object storage; start restores either.
 - Tier 1/2 egress whitelist covers github.com, *.githubusercontent.com, npm,
@@ -167,7 +184,8 @@ silently ignored.
   `~/.profile`/`~/.bashrc`, so any interactive SSH login — CLI or raw token —
   lands in the running agent; the client does nothing special.
 - Sandboxes are found/filtered via labels: `devflow=1`, `devflow.agent`,
-  `devflow.repo`, `devflow.harness`.
+  `devflow.repo`, `devflow.harness`; teams add `devflow.team`,
+  `devflow.team.role`, and `devflow.team.mode`.
 
 ## Subscription auth model
 

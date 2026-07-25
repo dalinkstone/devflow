@@ -15,9 +15,10 @@ uninstall:
 	rm -f $(BINDIR)/devflow $(BINDIR)/dv
 
 lint:
+	sh -n i
 	bash -n bin/devflow
 	bash -n install.sh
-	shellcheck -S warning bin/devflow install.sh tests/run-tests.sh tests/docker-provision-test.sh
+	shellcheck -S warning i bin/devflow install.sh tests/run-tests.sh tests/docker-provision-test.sh
 	bin/devflow __provision-script > /tmp/devflow-provision-lint.sh
 	bash -n /tmp/devflow-provision-lint.sh
 	shellcheck -S warning /tmp/devflow-provision-lint.sh

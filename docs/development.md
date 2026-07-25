@@ -7,6 +7,7 @@ follow the checklists literally.
 
 ```
 bin/devflow                     the entire CLI (one self-contained file)
+i                               short POSIX curl bootstrap
 install.sh                      curl|bash installer (also works from checkout)
 Formula/devflow.rb              Homebrew formula (this repo doubles as the tap)
 Makefile                        install / lint / test / test-docker
@@ -68,6 +69,7 @@ All green before every commit. CI runs the same three on push/PR
 | `daytona exec` buffers all output | keep provisioning phased; print progress from the local side |
 | Daytona auto-stop ignores running processes | never lower the `--auto-stop=0` default |
 | Daytona API ≥0.194 rejects `create --cpu/--memory/--disk` whenever a snapshot is involved — and the default image is a snapshot | size via the fixed snapshots `daytona-small\|medium\|large` (`--size`); resources only on `snapshot create`. (A `create --class` flag exists in unreleased CLI docs only — switch when it ships. `--sandbox-class` is a different axis: container\|linux-vm\|android.) |
+| Daytona's CLI has no `linkedSandbox` create flag | `team up --mode linked` uses the documented REST create field, sets `autoDeleteInterval=0`, and keeps all other sandbox shell work behind `dt_run` |
 | claude refuses `--dangerously-skip-permissions` as root | dv-agent falls back to `--permission-mode acceptEdits` |
 | the sandbox image ships a `daytona` binary that is the **in-sandbox daemon** (terminal/ssh/toolbox servers), not the CLI — `command -v daytona` inside a sandbox finds it and running it spews daemon logs | `--with-daytona` installs the real CLI at `~/.local/bin/daytona` unconditionally (shadows the daemon on PATH) and sanity-checks `daytona version` says "Daytona CLI" |
 | the CLI refuses ALL `organization` subcommands under api-key auth ("reauthenticate with browser") — api-key is exactly how sandboxes and CI authenticate | `dt_auth_check` probes with `daytona list`, which works under both auth modes |
@@ -109,8 +111,8 @@ when the sandbox can't query the GitHub API) and mirrored in
   `$FAKE_STATE_DIR/fs/<remote-path>` so tests assert on the exact decoded
   bytes (log-parsing proved environment-brittle — don't go back to it).
 - `gh` / `aws` / `security` / `curl` — canned auth fixtures, temporary/static
-  credential export and STS identity, the ssh-access API, and
-  a silent-accept ntfy push endpoint.
+  credential export and STS identity, ssh-access and linked-sandbox REST
+  creation, and a silent-accept ntfy push endpoint.
 - `qrencode` / `pbcopy` — deterministic `FAKE-QR[payload]` marker instead of
   a real QR (`FAKE_QRENCODE_FAIL=1` simulates a broken install) and a
   clipboard sink so tests never clobber the real clipboard.

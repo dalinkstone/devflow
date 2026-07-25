@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # devflow installer
 #
-#   curl -fsSL https://raw.githubusercontent.com/dalinkstone/devflow/main/install.sh | bash
+#   curl -fsSL https://github.com/dalinkstone/devflow/raw/main/i | sh
 #
 # Installs the `devflow` CLI (plus a `dv` alias) and, when missing, its
 # dependencies: the Daytona CLI, jq, and gh. Nothing here needs sudo unless
@@ -61,7 +61,8 @@ ok "devflow → $INSTALL_DIR/devflow (alias: dv)"
 install_daytona() {
   if have brew; then
     info "aligning Daytona CLI with v$DAYTONA_VERSION via Homebrew…"
-    brew upgrade daytonaio/cli/daytona >/dev/null 2>&1 +      || brew install daytonaio/cli/daytona
+    brew upgrade daytonaio/cli/daytona >/dev/null 2>&1 \
+      || brew install daytonaio/cli/daytona
     return $?
   fi
   info "installing Daytona CLI v$DAYTONA_VERSION…"
@@ -139,6 +140,6 @@ esac
 
 echo
 bold "installed! next steps:"
-printf '  1. %s\n' "devflow setup     # connect Daytona + your Claude/ChatGPT subscriptions"
-printf '  2. %s\n' "devflow up        # start an agent session in the cloud"
-printf '  3. %s\n' "devflow attach    # ...from anywhere, anytime"
+printf '  1. %s\n' "dv setup"
+printf '  2. %s\n' "dv up"
+printf '  3. %s\n' "dv attach"

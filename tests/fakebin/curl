@@ -1,21 +1,53 @@
 #!/usr/bin/env bash
-# Fake curl for devflow tests (Daytona ssh-access API + ntfy push endpoint).
+# Fake curl for devflow tests (Daytona API + ntfy push endpoint).
 set -u
 [ -n "${FAKE_LOG:-}" ] && printf 'curl %s\n' "$*" >> "$FAKE_LOG"
-for a in "$@"; do
-  case "$a" in
-    *"/ssh-access"*)
-      printf '{"token":"faketok123","sshCommand":"ssh faketok123@ssh.app.daytona.io"}'
-      exit 0 ;;
-    *"/api-keys"*)
-      printf '{"name":"devflow-sandboxes","value":"dtn_MINTEDFAKE"}'
-      exit 0 ;;
-    *"/sandbox"*)
-      # key-validation probe (GET /sandbox) — accept
-      exit 0 ;;
-    *"ntfy.sh/"*)
-      # ntfy push endpoint — accept silently (argv already logged above)
-      exit 0 ;;
+
+method=GET
+data=""
+url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -X|--request) method="${2:-}"; shift 2 ;;
+    -d|--data|--data-raw) data="${2:-}"; shift 2 ;;
+    http://*|https://*) url="$1"; shift ;;
+    *) shift ;;
   esac
 done
+
+case "$url" in
+  *"/ssh-access"*)
+    printf '{"token":"faketok123","sshCommand":"ssh faketok123@ssh.app.daytona.io"}'
+    exit 0 ;;
+  *"/api-keys"*)
+    printf '{"name":"devflow-sandboxes","value":"dtn_MINTEDFAKE"}'
+    exit 0 ;;
+  *"/sandbox")
+    if [ "$method" = POST ] && [ -n "$data" ]; then
+      name="$(printf '%s' "$data" | jq -r '.name // empty')"
+      parent="$(printf '%s' "$data" | jq -r '.linkedSandbox // empty')"
+      snapshot="$(printf '%s' "$data" | jq -r '.snapshot // empty')"
+      labels="$(printf '%s' "$data" | jq -c '.labels // {}')"
+      auto_stop="$(printf '%s' "$data" | jq -r '.autoStopInterval // 0')"
+      auto_delete="$(printf '%s' "$data" | jq -r '.autoDeleteInterval // -1')"
+      [ -n "$name" ] && [ -n "$parent" ] || exit 22
+      case "$snapshot" in
+        daytona-small) cpu=1; memory=1; disk=3 ;;
+        daytona-large) cpu=4; memory=8; disk=10 ;;
+        *)             cpu=2; memory=4; disk=8 ;;
+      esac
+      jq -n --arg name "$name" --arg parent "$parent" --arg snapshot "$snapshot" \
+        --argjson labels "$labels" --argjson cpu "$cpu" --argjson memory "$memory" \
+        --argjson disk "$disk" --arg autoStop "$auto_stop" --arg autoDelete "$auto_delete" \
+        '{id:("id-" + $name), name:$name, state:"started", labels:$labels,
+          cpu:$cpu, memory:$memory, disk:$disk, snapshot:$snapshot,
+          linkedSandbox:$parent, autoStopInterval:$autoStop,
+          autoDeleteInterval:$autoDelete}' > "$FAKE_STATE_DIR/$name.json"
+      printf '{"id":"id-%s","name":"%s","state":"started"}' "$name" "$name"
+    fi
+    # GET /sandbox is the key-validation probe.
+    exit 0 ;;
+  *"ntfy.sh/"*)
+    exit 0 ;;
+esac
 exit 22

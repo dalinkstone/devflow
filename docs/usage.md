@@ -6,21 +6,18 @@ Everything you can do with devflow, with exact commands. `dv` is an alias for
 ## Install
 
 ```bash
-# curl (macOS / Linux)
-curl -fsSL https://raw.githubusercontent.com/dalinkstone/devflow/main/install.sh | bash
+# curl
+curl -fsSL https://github.com/dalinkstone/devflow/raw/main/i | sh
 
-# Homebrew
-brew tap dalinkstone/devflow https://github.com/dalinkstone/devflow
+# or Homebrew
 brew install dalinkstone/devflow/devflow
-brew install daytonaio/cli/daytona     # the sandbox engine
 
 # from a checkout
-make install                            # → ~/.local/bin/devflow (+ dv)
+make install
 ```
 
 Dependencies: `daytona`, `jq`, `git`, `gh` (required); `fzf` (optional, nicer
-pickers). `install.sh` installs missing ones (brew when available, otherwise
-static binaries into `~/.local/bin`).
+pickers). Both install commands add the required tools. Then run `dv setup`.
 
 ## One-time setup
 
@@ -87,46 +84,18 @@ deprecated: they still work but map to the smallest size that fits. A custom
 | `--env NAME=VALUE` | forward one non-secret runtime setting; repeatable | — |
 | `--allow-static-aws` | explicitly permit a non-expiring AWS credential (discouraged) | off |
 
-### AWS and secret forwarding
-
-AWS access and arbitrary environment secrets are always opt-in. Use a dedicated
-assumed-role profile with an expiring STS session, not a static default profile:
+### AWS
 
 ```bash
-export DAYTONA_API_KEY=…
-export CLOUDFLARE_API_TOKEN=…
-
-TASK='Verify HEAD is exactly e6784823b969f7b1c4f29c4f1be1eff9e49cc159 and the worktree is clean. Use repository/script defaults except BASE_DOMAIN=long.forum, DAYTONA_API_URL=https://app.daytona.io/api, and the forwarded Cloudflare token. Derive non-secret AWS canary values from the selected account/profile, fill scripts/aws-setup/.state/canary.env, and run scripts/aws-setup/deploy-and-test.sh without interactive input. Verify sandbox creation, the infra tests, and every E2E stage; perform and verify one graceful runner reroll, including replacement readiness and a post-reroll sandbox creation; redact logs, preserve receipts, and do not teardown.'
-
-devflow up dalinkstone/helm-charts \
-  --agent codex --branch codex/daytona-v0199-canary \
-  --name dv-daytona-v0199 --size large \
-  --aws-profile devflow-deployer \
-  --secret-env DAYTONA_API_KEY \
-  --secret-env CLOUDFLARE_API_TOKEN \
-  --env BASE_DOMAIN=long.forum \
-  --env DAYTONA_API_URL=https://app.daytona.io/api \
-  --task "$TASK" \
-  --detach
+export DEPLOY_TOKEN=…
+devflow up owner/repo --aws-profile deployer \
+  --secret-env DEPLOY_TOKEN --env STAGE=test --detach
+devflow sync NAME --aws-profile deployer
 ```
 
-Before Daytona creates or starts anything, devflow runs `aws configure
-export-credentials --profile P --format process`, requires
-`AccessKeyId`/`SecretAccessKey`/`SessionToken`/`Expiration`, and checks the
-identity with STS. Static credentials fail closed unless `--allow-static-aws`
-is present. The remote profile is always named `devflow`; devflow writes
-`~/.aws/credentials`, `~/.aws/config`, and `~/.devflow/{aws,forwarded}.env`
-mode 0600. The temporary upload is shredded after auth.
-
-When AWS forwarding is selected, the tools phase ensures AWS CLI v2, eksctl,
-kubectl, Helm, yq, helm-unittest, ShellCheck, Docker, Python/venv, and the
-supporting system packages are available. A running Docker daemon still
-depends on the Daytona snapshot being Docker-in-Docker capable.
-
-Use `--secret-env` only for values already present in the local environment.
-Use `--env NAME=VALUE` for non-secrets such as the BYOC base domain and API
-URL. Both are written to the sandbox's 0600 environment bundle; only
-`--secret-env` keeps the value out of the local command line.
+Use an expiring AWS profile. Static keys require `--allow-static-aws`.
+`--secret-env` forwards a set local variable; `--env` forwards a non-secret.
+AWS flags also install the AWS/EKS toolchain.
 
 ### The fire-and-forget pattern
 
@@ -209,20 +178,62 @@ sandbox) see them all; make repro scripts delete what they create.
   agent continues its previous conversation (`claude --continue` /
   `codex resume --last`).
 
-### Multi-agent harness
+## Teams
 
-| Harness | Comes with | Try |
-|---|---|---|
-| oh-my-claudecode (claude) | 29 agents (architect, designer, security-reviewer, …), skills, HUD | `autopilot: build X` · `/team 3:executor "fix type errors"` · `ultrawork …` |
-| oh-my-codex (codex) | 34-agent catalog, `omx` launcher, worktree teams | `$ultragoal "…"` · `omx team 3:executor "…"` |
-| devflow core (always) | native subagents dv-engineer / dv-designer / dv-security | `@agent-dv-security review this diff` |
+`team up` turns a goal and optional worker roles into a managed workflow.
 
-Notes: everything bills the subscriptions (OMC/OMX drive the official CLIs).
-Parallel teams burn plan quota faster; OMC auto-pauses/resumes across Max
-rate-limit windows. Harness installs are best-effort — failures warn and the
-session still works (`--harness core` skips third-party entirely).
+### One sandbox
 
-## Access paths
+```bash
+devflow team up owner/repo -m "ship the feature" \
+  --worker "builder=implement it" \
+  --worker "reviewer=review and test it"
+```
+
+This is the default `--mode one`. One lead agent delegates inside one sandbox:
+Claude uses oh-my-claudecode, Codex uses oh-my-codex, and `--harness core`
+uses the built-in engineer/designer/security agents. Change the selection with
+`--agent` and `--harness`.
+
+### Linked sandboxes
+
+```bash
+# Three agents total: one leader and two workers.
+devflow team up owner/repo --mode linked --agents 3 -m "ship the feature"
+
+# Or name every worker and task.
+devflow team up owner/repo --mode linked -n release -m "ship v2" \
+  --worker "api=implement the API" \
+  --worker "tests=add integration tests"
+```
+
+Linked mode creates one persistent leader plus one ephemeral Daytona sandbox
+per worker. Daytona gives the group a private bidirectional network and DNS by
+sandbox name. Filesystems stay separate, so workers use
+`devflow/<team>-<role>` branches and push commits for the leader to integrate.
+The leader receives Daytona/devflow control after all workers are ready.
+
+Linked workers are deleted when stopped and deleting the leader cascades to
+the workers. This follows Daytona's
+[linked sandbox model](https://www.daytona.io/docs/en/sandboxes/#linked-sandboxes).
+
+### Manage
+
+```bash
+devflow team ls
+devflow team status release
+devflow team peek release api
+devflow team attach release             # leader
+devflow team attach release api         # worker
+devflow team task release api "fix CI"  # after its current task ends
+devflow team rm release                  # whole team
+```
+
+Useful creation flags: `--size`, `--snapshot`, `--branch`, `--auto-stop`,
+`--fresh`, and `--attach`. Each linked agent consumes its own Daytona compute
+and model subscription capacity.
+
+## Access
 
 ```bash
 devflow attach NAME        # daytona ssh + tmux auto-attach (primary)
@@ -409,17 +420,11 @@ second zero. A snapshot bakes its resources, so the name carries the size
 than one size? Build each once — they coexist; `DEVFLOW_SNAPSHOT` (set
 automatically by the last build) picks which one `up` uses.
 
-## Costs & lifecycle
+## Cost
 
-- Daytona bills usage (~$0.05/vCPU-h + RAM/disk); the default `medium` size
-  (2cpu/4GB) ≈ **$0.13/h while running**. New accounts: $200 free.
-- devflow defaults to **auto-stop 0** because Daytona's idle timer ignores
-  running processes (only SSH/API traffic resets it) — a 15-min auto-stop
-  would kill detached agents mid-task. So run `devflow stop --all` when done.
-- stopped → disk-only cost; `attach` restarts + resumes. ~7 days stopped →
-  archived to object storage (slower first attach). `rm` deletes.
-- Free-tier note: Tier 1/2 sandboxes have an egress whitelist (GitHub, npm,
-  pip, Anthropic, OpenAI, …) — agents work; arbitrary hosts need Tier 3+.
+Running sandboxes incur Daytona compute charges.
+`devflow stop --all` stops compute and keeps disks; `attach` restarts them.
+`devflow rm --all` deletes every devflow sandbox.
 
 ## Troubleshooting
 

@@ -41,7 +41,7 @@ gh release create vX.Y.Z --repo dalinkstone/devflow \
 
 # 5. verify the real user paths
 brew update && brew upgrade dalinkstone/devflow/devflow && devflow version
-curl -fsSL https://raw.githubusercontent.com/dalinkstone/devflow/main/install.sh | head -3
+curl -fsSL https://github.com/dalinkstone/devflow/raw/main/i | head -3
 
 # 6. confirm CI green for the pushed commits
 gh run list --repo dalinkstone/devflow --limit 2
@@ -74,8 +74,7 @@ A release is not done until the release commits are green.
 
 ## Distribution surfaces (what must keep working)
 
-1. `curl -fsSL https://raw.githubusercontent.com/dalinkstone/devflow/main/install.sh | bash`
-   (installs devflow + `dv`, plus daytona/jq/gh if missing)
-2. `brew tap dalinkstone/devflow https://github.com/dalinkstone/devflow` +
-   `brew install dalinkstone/devflow/devflow` (formula test: `devflow version`)
+1. `curl -fsSL https://github.com/dalinkstone/devflow/raw/main/i | sh`
+   (bootstraps install.sh, which installs devflow + `dv` and dependencies)
+2. `brew install dalinkstone/devflow/devflow` (formula test: `devflow version`)
 3. `make install` from a checkout

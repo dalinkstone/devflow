@@ -22,7 +22,8 @@ tools → auth → workspace → harness), and leaves a tmux session (`dv`)
 running the agent so the user can detach, close the laptop, and
 `devflow attach` from any machine. The multi-agent harness layer installs
 oh-my-claudecode / oh-my-codex plus devflow's native
-dv-engineer/dv-designer/dv-security subagents.
+dv-engineer/dv-designer/dv-security subagents; `devflow team` can keep the
+workflow in one sandbox or create linked Daytona worker sandboxes.
 
 ## Ground rules (all contributors, human or agent)
 

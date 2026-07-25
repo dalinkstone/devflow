@@ -98,7 +98,17 @@ case "$cmd" in
 
   delete)
     name="${1:-}"
+    f="$(sbx_file "$name")"
+    parent_id=""
+    [ ! -f "$f" ] || parent_id="$(jq -r '.id // empty' "$f")"
     rm -f "$(sbx_file "$name")"
+    # Daytona deletes linked children when their parent is deleted.
+    if [ -n "$parent_id" ]; then
+      for f in "$FAKE_STATE_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        [ "$(jq -r '.linkedSandbox // empty' "$f")" != "$parent_id" ] || rm -f "$f"
+      done
+    fi
     echo "deleted $name"
     exit 0
     ;;

@@ -13,7 +13,7 @@
 set -u
 set -o pipefail
 
-DEVFLOW_VERSION="0.4.0"
+DEVFLOW_VERSION="0.5.0"
 
 # ----------------------------------------------------------------------------
 # Config (precedence: environment > config file > built-in default)
@@ -1685,11 +1685,52 @@ refresh_forwarded_auth() { # NAME [RUN_TOOLS]
   ok "auth refreshed in '$name'"
 }
 
+create_linked_sandbox() { # NAME PARENT AUTO_STOP SNAPSHOT AGENT HARNESS REPO TEAM ROLE MODE
+  local name="$1" parent="$2" auto_stop="$3" snapshot="$4" agent="$5"
+  local harness="$6" repo="$7" team="$8" role="$9" mode="${10}"
+  local parent_id labels payload resp created_id
+  need_cmd curl "install curl"
+  resolve_daytona_api || die "linked teams need Daytona API credentials — run: daytona login"
+  parent_id="$(dt_info_json "$parent" | jq -r '.id // .sandboxId // empty')"
+  [ -n "$parent_id" ] || die "could not resolve linked-team parent '$parent'"
+  case "$auto_stop" in ''|*[!0-9]*) die "--auto-stop must be a non-negative integer" ;; esac
+
+  labels="$(jq -n \
+    --arg agent "$agent" --arg harness "$harness" --arg repo "$repo" \
+    --arg team "$team" --arg role "$role" --arg mode "$mode" \
+    '{"devflow":"1","devflow.agent":$agent,"devflow.harness":$harness,
+      "devflow.team":$team,"devflow.team.role":$role,"devflow.team.mode":$mode}
+      + (if $repo == "" then {} else {"devflow.repo":$repo} end)')"
+  payload="$(jq -n \
+    --arg name "$name" --arg parent "$parent_id" --arg snapshot "$snapshot" \
+    --arg auto_stop "$auto_stop" --argjson labels "$labels" \
+    '{name:$name, linkedSandbox:$parent, autoDeleteInterval:0,
+      autoStopInterval:($auto_stop|tonumber), snapshot:$snapshot, labels:$labels}')"
+
+  if [ -n "$DT_ORG_ID" ]; then
+    resp="$(curl -fsSL -X POST \
+      -H "Authorization: Bearer $DT_API_KEY" \
+      -H "X-Daytona-Organization-ID: $DT_ORG_ID" \
+      -H "Content-Type: application/json" \
+      -d "$payload" "$DT_API_URL/sandbox" 2>/dev/null)" \
+      || die "linked sandbox create failed (team '$team', role '$role')"
+  else
+    resp="$(curl -fsSL -X POST \
+      -H "Authorization: Bearer $DT_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d "$payload" "$DT_API_URL/sandbox" 2>/dev/null)" \
+      || die "linked sandbox create failed (team '$team', role '$role')"
+  fi
+  created_id="$(printf '%s' "$resp" | jq -r '.id // .sandboxId // empty' 2>/dev/null)"
+  [ -n "$created_id" ] || die "Daytona returned no sandbox id for team '$team' role '$role'"
+}
+
 cmd_up() {
   local repo="" name="" branch="" agent="$DEVFLOW_AGENT" task="" attach=1 fresh=0 blank=0
   local size="" cpu="$DEVFLOW_CPU" memory="$DEVFLOW_MEMORY" disk="$DEVFLOW_DISK" auto_stop="$DEVFLOW_AUTO_STOP"
   local snapshot="$DEVFLOW_SNAPSHOT" explicit_resources=0 harness="$DEVFLOW_HARNESS"
   local script="" with_daytona=0 aws_profile="" secret_env_names="" env_items="" allow_static_aws=0
+  local team="" team_role="" team_mode="" linked_parent=""
   local size_explicit=0 snapshot_explicit=0 agent_explicit=0
 
   while [ $# -gt 0 ]; do
@@ -1711,6 +1752,10 @@ cmd_up() {
       --env) need_val "$1" "${2:-}"; env_items="${env_items}${env_items:+ }$(printf '%s' "$2" | b64_encode)"; shift 2 ;;
       --allow-static-aws) allow_static_aws=1; shift ;;
       --with-daytona) with_daytona=1; shift ;;
+      --team)        need_val "$1" "${2:-}"; team="$2"; shift 2 ;;
+      --team-role)   need_val "$1" "${2:-}"; team_role="$2"; shift 2 ;;
+      --team-mode)   need_val "$1" "${2:-}"; team_mode="$2"; shift 2 ;;
+      --linked-parent) need_val "$1" "${2:-}"; linked_parent="$2"; shift 2 ;;
       --no-attach|--detach) attach=0; shift ;;
       --fresh)      fresh=1; shift ;;
       --blank)      blank=1; shift ;;
@@ -1844,6 +1889,9 @@ cmd_up() {
                --label devflow=1 --label "devflow.agent=$agent"
                --label "devflow.harness=$harness")
   [ -n "$repo" ] && create_args+=(--label "devflow.repo=$repo")
+  [ -n "$team" ] && create_args+=(--label "devflow.team=$team")
+  [ -n "$team_role" ] && create_args+=(--label "devflow.team.role=$team_role")
+  [ -n "$team_mode" ] && create_args+=(--label "devflow.team.mode=$team_mode")
   if [ -n "$snapshot" ]; then
     create_args+=("--snapshot=$snapshot")
   else
@@ -1852,7 +1900,13 @@ cmd_up() {
   [ -n "$DEVFLOW_TARGET" ] && create_args+=("--target=$DEVFLOW_TARGET")
 
   step "creating sandbox…"
-  dt "${create_args[@]}" || die "sandbox create failed (check quota/billing at app.daytona.io)"
+  if [ -n "$linked_parent" ]; then
+    create_linked_sandbox "$name" "$linked_parent" "$auto_stop" \
+      "${snapshot:-daytona-$size}" "$agent" "$harness" "$repo" \
+      "$team" "$team_role" "$team_mode"
+  else
+    dt "${create_args[@]}" || die "sandbox create failed (check quota/billing at app.daytona.io)"
+  fi
   wait_for_state "$name" started 300
   ok "sandbox running"
 
@@ -2301,7 +2355,7 @@ cmd_mobile() { # hand the session to your phone: camera-scannable QR + ssh line 
          "$C_DIM" "$expires" "$C_RESET"
   printf '\n'
   step "2) Full devflow — Android (Termux / UserLAnd Ubuntu) or another Mac/Linux"
-  printf '     %scurl -fsSL https://raw.githubusercontent.com/dalinkstone/devflow/main/install.sh | bash%s\n' "$C_DIM" "$C_RESET"
+  printf '     %scurl -fsSL https://github.com/dalinkstone/devflow/raw/main/i | sh%s\n' "$C_DIM" "$C_RESET"
   printf '     %sdaytona login && devflow attach %s%s   (also restarts it if stopped)\n' "$C_DIM" "$name" "$C_RESET"
   printf '\n'
   step "3) Just a browser — https://app.daytona.io → $name → open its Terminal"
@@ -2461,6 +2515,335 @@ cmd_sync() {
   [ -n "$aws_profile$secret_env_names$env_items" ] && harvest_all
   name="$(resolve_name "$name")" || exit 1
   refresh_forwarded_auth "$name" "$([ -n "$aws_profile" ] && printf 1 || printf 0)"
+}
+
+# ----------------------------------------------------------------------------
+# Multi-agent teams: one sandbox harness or linked Daytona sandboxes
+# ----------------------------------------------------------------------------
+normalize_team_name() {
+  local team="${1#dv-}" clean
+  clean="$(sanitize_name "$team")"
+  printf '%s' "$clean" | cut -c1-20
+}
+
+normalize_team_role() {
+  local clean
+  clean="$(sanitize_name "$1")"
+  printf '%s' "$clean" | cut -c1-16
+}
+
+team_sandboxes_json() { # TEAM (empty = all team sandboxes)
+  local team="${1:-}"
+  devflow_sandboxes_json | jq --arg team "$team" '
+    [ .[] | select((((.labels // {})["devflow.team"] // "") != "")
+      and ($team == "" or ((.labels // {})["devflow.team"] == $team))) ]'
+}
+
+team_role_sandbox() { # TEAM ROLE -> sandbox name
+  local team="$1" role="$2" json names count
+  json="$(team_sandboxes_json "$team")"
+  names="$(printf '%s' "$json" | jq -r --arg role "$role" '
+    .[] | select(((.labels // {})["devflow.team.role"] // "") == $role)
+    | (.name // .id // empty)')"
+  count="$(printf '%s\n' "$names" | grep -c . 2>/dev/null || true)"
+  [ "$count" = 1 ] || die "team '$team' has no unique role '$role' (check: devflow team status $team)"
+  printf '%s\n' "$names"
+}
+
+team_add_worker() { # CURRENT_SPECS ROLE=TASK -> updated base64 specs
+  local specs="$1" spec="$2" role task encoded
+  case "$spec" in *=*) role="${spec%%=*}"; task="${spec#*=}" ;; *)
+    die "--worker expects ROLE=TASK" ;;
+  esac
+  [ -n "$role" ] && [ -n "$task" ] || die "--worker expects non-empty ROLE=TASK"
+  role="$(normalize_team_role "$role")"
+  [ "$role" != "leader" ] || die "worker role 'leader' is reserved"
+  if [ -n "$specs" ]; then
+    local existing decoded existing_role
+    for existing in $specs; do
+      decoded="$(printf '%s' "$existing" | b64_decode)"
+      existing_role="${decoded%%	*}"
+      [ "$existing_role" != "$role" ] || die "duplicate worker role '$role'"
+    done
+  fi
+  encoded="$(printf '%s\t%s' "$role" "$task" | b64_encode)"
+  printf '%s%s%s' "$specs" "${specs:+ }" "$encoded"
+}
+
+usage_team() {
+cat <<EOF
+devflow team up [REPO] [flags]
+  --mode one|linked       one sandbox harness (default) or one linked sandbox per agent
+  -m, --task TEXT         team goal / leader task
+  -w, --worker ROLE=TASK  named worker and task (repeatable)
+      --agents N          total agents; creates worker-1..N-1 from the team goal
+  -n, --name NAME         team name (default: repo name)
+  -a, --agent A           claude | codex | both
+  -H, --harness H         auto | omc | omx | both | core
+  -s, --size S            small | medium | large
+  -b, --branch B          base branch
+      --snapshot S        custom snapshot
+      --auto-stop MIN     0 = disabled
+      --blank             no repository
+      --fresh             recreate existing team sandboxes
+      --attach            attach to the leader when ready
+
+Manage:
+  devflow team ls
+  devflow team status TEAM
+  devflow team task TEAM ROLE "new task"
+  devflow team peek TEAM [ROLE]
+  devflow team attach TEAM [ROLE]
+  devflow team rm TEAM [-f]
+EOF
+}
+
+cmd_team_up() {
+  local repo="" team="" mode="one" task="" worker_specs="" agents=""
+  local agent="$DEVFLOW_AGENT" harness="$DEVFLOW_HARNESS" size="" branch=""
+  local snapshot="" auto_stop="$DEVFLOW_AUTO_STOP" blank=0 fresh=0 attach=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --mode) need_val "$1" "${2:-}"; mode="$2"; shift 2 ;;
+      -m|--task) need_val "$1" "${2:-}"; task="$2"; shift 2 ;;
+      -w|--worker) need_val "$1" "${2:-}"; worker_specs="$(team_add_worker "$worker_specs" "$2")" || exit 1; shift 2 ;;
+      --agents) need_val "$1" "${2:-}"; agents="$2"; shift 2 ;;
+      -n|--name) need_val "$1" "${2:-}"; team="$2"; shift 2 ;;
+      -a|--agent) need_val "$1" "${2:-}"; agent="$2"; shift 2 ;;
+      -H|--harness) need_val "$1" "${2:-}"; harness="$2"; shift 2 ;;
+      -s|--size) need_val "$1" "${2:-}"; size="$2"; shift 2 ;;
+      -b|--branch) need_val "$1" "${2:-}"; branch="$2"; shift 2 ;;
+      --snapshot) need_val "$1" "${2:-}"; snapshot="$2"; shift 2 ;;
+      --auto-stop) need_val "$1" "${2:-}"; auto_stop="$2"; shift 2 ;;
+      --blank) blank=1; shift ;;
+      --fresh) fresh=1; shift ;;
+      --attach) attach=1; shift ;;
+      -h|--help) usage_team; return 0 ;;
+      -*) die "unknown flag for team up: $1 (see: devflow team --help)" ;;
+      *) [ -z "$repo" ] || die "team up accepts at most one repository"; repo="$1"; shift ;;
+    esac
+  done
+
+  case "$mode" in one|linked) ;; *) die "invalid team mode '$mode' (one|linked)" ;; esac
+  case "$agent" in claude|codex|both) ;; *) die "invalid --agent '$agent' (claude|codex|both)" ;; esac
+  if [ -n "$agents" ]; then
+    case "$agents" in
+      ''|*[!0-9]*) die "--agents must be an integer from 2 to 9" ;;
+      *) [ "$agents" -ge 2 ] && [ "$agents" -le 9 ] || die "--agents must be an integer from 2 to 9" ;;
+    esac
+  fi
+  [ -z "$agents" ] || [ -z "$worker_specs" ] || die "use either --agents or --worker, not both"
+  if [ -n "$agents" ]; then
+    local wi=1 worker_total=$((agents - 1))
+    [ -n "$task" ] || die "--agents needs --task"
+    while [ "$wi" -le "$worker_total" ]; do
+      worker_specs="$(team_add_worker "$worker_specs" "worker-$wi=$task")" || exit 1
+      wi=$((wi + 1))
+    done
+  fi
+  [ -n "$task$worker_specs" ] || die "team up needs --task, --worker, or --agents"
+
+  if [ -z "$team" ]; then
+    local team_repo="$repo"
+    [ -n "$team_repo" ] || [ "$blank" = 1 ] || team_repo="$(current_repo)"
+    if [ -n "$team_repo" ]; then team="${team_repo##*/}"; else team="team"; fi
+  fi
+  team="$(normalize_team_name "$team")"
+  local parent
+  parent="$(sanitize_name "dv-$team")"
+
+  local common
+  common=(--name "$parent" --agent "$agent" --harness "$harness"
+          --team "$team" --team-role leader --team-mode "$mode" --no-attach
+          --auto-stop "$auto_stop")
+  [ -n "$size" ] && common+=(--size "$size")
+  [ -n "$branch" ] && common+=(--branch "$branch")
+  [ -n "$snapshot" ] && common+=(--snapshot "$snapshot")
+  [ "$blank" = 1 ] && common+=(--blank)
+  [ "$fresh" = 1 ] && common+=(--fresh)
+  [ -n "$repo" ] && common+=("$repo")
+
+  if [ "$mode" = "one" ]; then
+    local shared_task="Use the installed multi-agent harness. Lead this workflow inside one sandbox."
+    [ -n "$task" ] && shared_task="$shared_task"$'\n\n'"Goal: $task"
+    if [ -n "$worker_specs" ]; then
+      shared_task="$shared_task"$'\n\n'"Delegate these roles:"
+      local one_spec one_decoded one_role one_task
+      for one_spec in $worker_specs; do
+        one_decoded="$(printf '%s' "$one_spec" | b64_decode)"
+        one_role="${one_decoded%%	*}"
+        one_task="${one_decoded#*	}"
+        shared_task="$shared_task"$'\n'"- $one_role: $one_task"
+      done
+    fi
+    shared_task="$shared_task"$'\n\n'"Integrate the work and verify the final result."
+    cmd_up "${common[@]}" --task "$shared_task"
+  else
+    [ -n "$worker_specs" ] || die "linked mode needs --worker or --agents"
+    need_cmd curl "install curl"
+    # Provision the durable leader first and forward Daytona control before its
+    # task starts. It can then inspect and manage every linked worker.
+    cmd_up "${common[@]}" --with-daytona
+
+    local roster="" worker_spec decoded role worker_task child worker_prompt
+    local worker_args
+    for worker_spec in $worker_specs; do
+      decoded="$(printf '%s' "$worker_spec" | b64_decode)"
+      role="${decoded%%	*}"
+      worker_task="${decoded#*	}"
+      child="$(sanitize_name "dv-$team-$role")"
+      roster="$roster"$'\n'"- $role ($child): $worker_task"
+      worker_prompt="You are the '$role' worker in devflow team '$team'."$'\n'
+      worker_prompt="$worker_prompt""Leader sandbox: $parent. Linked sandboxes share private DNS by name."$'\n'
+      worker_prompt="$worker_prompt""Task: $worker_task"$'\n'
+      worker_prompt="$worker_prompt""Work on git branch devflow/$team-$role. Push commits, then report the branch and commit."
+
+      worker_args=(--name "$child" --agent "$agent" --harness "$harness"
+                   --team "$team" --team-role "$role" --team-mode linked
+                   --linked-parent "$parent" --no-attach --auto-stop "$auto_stop")
+      [ -n "$size" ] && worker_args+=(--size "$size")
+      [ -n "$branch" ] && worker_args+=(--branch "$branch")
+      [ -n "$snapshot" ] && worker_args+=(--snapshot "$snapshot")
+      [ "$blank" = 1 ] && worker_args+=(--blank)
+      [ "$fresh" = 1 ] && worker_args+=(--fresh)
+      [ -n "$repo" ] && worker_args+=("$repo")
+      cmd_up "${worker_args[@]}" --task "$worker_prompt"
+    done
+
+    local leader_task="Lead devflow team '$team'. Workers are ready on Daytona's private link network:"
+    leader_task="$leader_task$roster"$'\n\n'
+    [ -n "$task" ] && leader_task="$leader_task""Goal: $task"$'\n'
+    leader_task="${leader_task}'devflow team status $team' checks progress; 'devflow team peek $team ROLE' reads a worker; 'devflow team task $team ROLE \"...\"' assigns follow-up work. Integrate pushed worker branches and verify the result."
+    ensure_running "$parent"
+    queue_agent_task "$parent" "$leader_task" "$agent"
+    ok "linked team '$team' is running — manage: devflow team status $team"
+  fi
+
+  if [ "$attach" = 1 ]; then
+    cmd_attach "$parent"
+  fi
+}
+
+cmd_team_ls() {
+  need_cmd daytona "brew install daytonaio/cli/daytona"
+  need_cmd jq "brew install jq"
+  local json count
+  json="$(team_sandboxes_json "")"
+  count="$(printf '%s' "$json" | jq 'length')"
+  if [ "$count" = 0 ]; then say "no teams"; return 0; fi
+  printf '%-20s %-8s %s\n' "TEAM" "MODE" "SANDBOXES"
+  printf '%s' "$json" | jq -r '
+    sort_by((.labels // {})["devflow.team"]) | group_by((.labels // {})["devflow.team"])[] |
+    [((.[0].labels // {})["devflow.team"]),
+     ((.[0].labels // {})["devflow.team.mode"] // "one"),
+     (length|tostring)] | @tsv' |
+    while IFS=$'\t' read -r team mode count; do
+      printf '%-20s %-8s %s\n' "$team" "$mode" "$count"
+    done
+}
+
+cmd_team_status() {
+  local team
+  team="$(normalize_team_name "${1:-}")"
+  [ -n "${1:-}" ] || { cmd_team_ls; return 0; }
+  local json count
+  json="$(team_sandboxes_json "$team")"
+  count="$(printf '%s' "$json" | jq 'length')"
+  [ "$count" != 0 ] || die "no team '$team'"
+  printf '%-18s %-24s %-10s %s\n' "ROLE" "SANDBOX" "SANDBOX" "TASK"
+  printf '%s' "$json" | jq -r '.[] | [
+      ((.labels // {})["devflow.team.role"] // "?"),
+      (.name // .id // "?"),
+      (.state // .status // "?")] | @tsv' |
+    while IFS=$'\t' read -r role name state; do
+      local task_state="-"
+      [ "$state" = started ] && task_state="$(agent_task_state "$name")"
+      printf '%-18s %-24s %-10s %s\n' "$role" "$name" "$state" "$task_state"
+    done
+}
+
+cmd_team_task() {
+  local team="${1:-}" role="${2:-}"
+  [ -n "$team" ] && [ -n "$role" ] && [ $# -ge 3 ] \
+    || die "usage: devflow team task TEAM ROLE \"task\""
+  shift 2
+  team="$(normalize_team_name "$team")"
+  role="$(normalize_team_role "$role")"
+  local name
+  name="$(team_role_sandbox "$team" "$role")" || exit 1
+  ensure_running "$name"
+  queue_agent_task "$name" "$*"
+}
+
+cmd_team_peek() {
+  local team="${1:-}" role="${2:-leader}"
+  [ -n "$team" ] || die "usage: devflow team peek TEAM [ROLE]"
+  team="$(normalize_team_name "$team")"
+  role="$(normalize_team_role "$role")"
+  local name
+  name="$(team_role_sandbox "$team" "$role")" || exit 1
+  cmd_peek "$name"
+}
+
+cmd_team_attach() {
+  local team="${1:-}" role="${2:-leader}"
+  [ -n "$team" ] || die "usage: devflow team attach TEAM [ROLE]"
+  team="$(normalize_team_name "$team")"
+  role="$(normalize_team_role "$role")"
+  local name
+  name="$(team_role_sandbox "$team" "$role")" || exit 1
+  cmd_attach "$name"
+}
+
+cmd_team_rm() {
+  local team="" force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -f|--force) force=1; shift ;;
+      -*) die "unknown flag for team rm: $1" ;;
+      *) [ -z "$team" ] || die "team rm accepts one team"; team="$1"; shift ;;
+    esac
+  done
+  [ -n "$team" ] || die "usage: devflow team rm TEAM [-f]"
+  team="$(normalize_team_name "$team")"
+  local json count leader name
+  json="$(team_sandboxes_json "$team")"
+  count="$(printf '%s' "$json" | jq 'length')"
+  [ "$count" != 0 ] || die "no team '$team'"
+  [ "$force" = 1 ] || confirm "delete team '$team' ($count sandboxes; unpushed work is lost)?" || exit 1
+  leader="$(printf '%s' "$json" | jq -r '.[] | select(((.labels // {})["devflow.team.role"] // "") == "leader") | (.name // .id // empty)' | head -1)"
+  # Daytona cascades linked children when the parent is deleted.
+  [ -z "$leader" ] || dt delete "$leader" >/dev/null 2>&1 || true
+  printf '%s' "$json" | jq -r '.[] | (.name // .id // empty)' | while read -r name; do
+    [ -n "$name" ] && [ "$name" != "$leader" ] || continue
+    [ "$(sandbox_state "$name")" = missing ] || dt delete "$name" </dev/null >/dev/null 2>&1 || true
+  done
+  ok "team '$team' deleted"
+}
+
+cmd_team() {
+  local sub="${1:-ls}"
+  [ $# -gt 0 ] && shift
+  case "$sub" in
+    up|start|new|help|-h|--help) ;;
+    *)
+      need_cmd daytona "brew install daytonaio/cli/daytona"
+      need_cmd jq "brew install jq"
+      dt_auth_check || die "not logged in to Daytona — run: devflow setup"
+      ;;
+  esac
+  case "$sub" in
+    up|start|new) cmd_team_up "$@" ;;
+    ls|list) cmd_team_ls "$@" ;;
+    status|state) cmd_team_status "$@" ;;
+    task|run) cmd_team_task "$@" ;;
+    peek|watch) cmd_team_peek "$@" ;;
+    attach|open) cmd_team_attach "$@" ;;
+    rm|delete|down) cmd_team_rm "$@" ;;
+    help|-h|--help) usage_team ;;
+    *) die "unknown team command '$sub' (up|ls|status|task|peek|attach|rm)" ;;
+  esac
 }
 
 cmd_token() {
@@ -2806,6 +3189,9 @@ ${C_BOLD}start here${C_RESET}
   devflow setup                 one-time: accounts + auth (no API keys needed)
   devflow up [REPO]             spin up Claude Code / Codex on a repo & attach
   devflow up -m "fix bug X" --detach       fire-and-forget, close your laptop
+  devflow team up [REPO] --task "build X"  run a multi-agent workflow in one
+                                           sandbox; add --mode linked --agents 3
+                                           for one linked sandbox per agent
   devflow up repro.sh --with-daytona       run a script in a sandbox; it can
                                            even spin up sibling sandboxes
 
@@ -2817,6 +3203,7 @@ ${C_BOLD}daily driving${C_RESET}
   devflow attach [NAME]   (a)   reattach from anywhere — tmux keeps it alive
   devflow status [NAME]         poll detached task state (queued/running/completed/failed)
   devflow peek [NAME] [-w W]    glance at the agent (or window W, e.g. script)
+  devflow team status TEAM      inspect a one- or multi-sandbox agent team
   devflow ls                    list sandboxes
   devflow stop [NAME|--all]     stop (disk kept) — attach restarts + resumes
   devflow rm [NAME|--all]       delete sandbox
@@ -2828,7 +3215,7 @@ ${C_BOLD}more${C_RESET}
   devflow ssh [NAME]            SSH in (lands in tmux; detach: Ctrl-b d)
   devflow ssh-command [NAME]    print a plain ssh command for any machine
   devflow ssh-config [NAME]     managed ~/.ssh/config Host block — plain
-                                `ssh NAME`, VS Code/Cursor Remote-SSH, scp
+                                ssh NAME, VS Code/Cursor Remote-SSH, scp
   devflow mobile [NAME]         hand the session to your phone — camera QR +
                                 ssh line; --send pushes it to the phone
                                 (ntfy notification / 1Password / Apple Notes)
@@ -2866,6 +3253,7 @@ main() {
     stop)                 cmd_stop "$@" ;;
     rm|delete|down)       cmd_rm "$@" ;;
     sync)                 cmd_sync "$@" ;;
+    team|teams)           cmd_team "$@" ;;
     token)                cmd_token "$@" ;;
     setup|init)           cmd_setup "$@" ;;
     doctor|check)         cmd_doctor "$@" ;;
