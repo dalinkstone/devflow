@@ -1,9 +1,8 @@
 # Release runbook
 
-Exact, ordered steps. The repo doubles as the Homebrew tap, so a release is:
-tag → pin tarball sha in the formula on main → GitHub release. Users get it
-via `brew upgrade dalinkstone/devflow/devflow` or by re-running install.sh
-(which always pulls `main`).
+Exact, ordered steps. This repo owns the formula source; it is mirrored to
+`dalinkstone/homebrew-devflow` so Homebrew can auto-tap it. A release is:
+tag → pin the formula on main → sync the tap → GitHub release.
 
 Versioning: semver-ish — patch for fixes, minor for features. The single
 source of truth is `DEVFLOW_VERSION` in `bin/devflow`.
@@ -35,22 +34,30 @@ git add Formula/devflow.rb
 git commit -m "formula: pin vX.Y.Z tarball sha256"
 git push origin main
 
-# 4. GitHub release (notes: what changed + upgrade line)
+# 4. sync the conventional Homebrew tap
+TAP_DIR=$(mktemp -d)
+git clone https://github.com/dalinkstone/homebrew-devflow "$TAP_DIR"
+cp Formula/devflow.rb "$TAP_DIR/Formula/devflow.rb"
+git -C "$TAP_DIR" add Formula/devflow.rb
+git -C "$TAP_DIR" commit -m "devflow vX.Y.Z"
+git -C "$TAP_DIR" push origin main
+
+# 5. GitHub release (notes: what changed + upgrade line)
 gh release create vX.Y.Z --repo dalinkstone/devflow \
   --title "devflow vX.Y.Z" --notes "…"
 
-# 5. verify the real user paths
+# 6. verify the real user paths
 brew update && brew upgrade dalinkstone/devflow/devflow && devflow version
 curl -fsSL https://github.com/dalinkstone/devflow/raw/main/i | head -3
 
-# 6. confirm CI green for the pushed commits
+# 7. confirm CI green for the pushed commits
 gh run list --repo dalinkstone/devflow --limit 2
 ```
 
 Note the ordering in steps 2–3: the tag must exist on GitHub **before** you
 can hash its tarball, so the formula pin is always a follow-up commit on
-main. Tap users read the formula from main; the sha refers to the tagged
-tarball. This is intentional — don't try to fold it into one commit.
+main. The tap is then updated from that exact formula. This is intentional —
+don't try to fold the pin into the tagged commit.
 
 ## CI
 
