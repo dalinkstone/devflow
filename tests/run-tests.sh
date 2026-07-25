@@ -99,6 +99,11 @@ assert_contains "version prints version" "$OUT" "devflow 0."
 run_devflow help
 assert_rc "help exits 0" "$RC" 0
 assert_contains "help lists up" "$OUT" "devflow up"
+assert_contains "help lists stable web URLs" "$OUT" "devflow web"
+
+run_devflow web dv-alpha
+assert_rc "web exits 0" "$RC" 0
+assert_contains "web prints stable sandbox URL" "$OUT" "https://alpha.devflow.sh"
 
 run_devflow bogus-command
 assert_rc "unknown command exits 1" "$RC" 1

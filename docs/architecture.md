@@ -34,7 +34,7 @@ for `devflow team up --mode linked` (the CLI has no linked-sandbox flag).
 | Orchestration | `upload_provisioner`, `run_phase`, `provision_sandbox`, `ensure_running` |
 | Listing | `devflow_sandboxes_json` (label-filtered), `resolve_name` |
 | Teams | `create_linked_sandbox`, `team_sandboxes_json`, `team_role_sandbox`, `cmd_team_*` |
-| Commands | `cmd_up`, `cmd_team`, `cmd_attach`, `cmd_ssh`, `cmd_ssh_command`, `cmd_exec`, `cmd_peek`, `cmd_ls`, `cmd_stop`, `cmd_rm`, `cmd_sync`, `cmd_token`, `cmd_config`, `cmd_dashboard`, `cmd_doctor`, `cmd_setup`, `cmd_snapshot` |
+| Commands | `cmd_up`, `cmd_team`, `cmd_attach`, `cmd_ssh`, `cmd_web`, `cmd_ssh_command`, `cmd_exec`, `cmd_peek`, `cmd_ls`, `cmd_stop`, `cmd_rm`, `cmd_sync`, `cmd_token`, `cmd_config`, `cmd_dashboard`, `cmd_doctor`, `cmd_setup`, `cmd_snapshot` |
 | Help + main | `usage`, `usage_up`, `usage_team`, `main` dispatch |
 
 Hidden commands: `devflow __provision-script` and `devflow __dockerfile`

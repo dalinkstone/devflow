@@ -1,0 +1,31 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "devflow-preview-proxy",
+  "main": "dist/server/index.js",
+  "compatibility_date": "2026-05-15",
+  "compatibility_flags": ["nodejs_compat"],
+  "no_bundle": true,
+  "rules": [
+    {
+      "type": "ESModule",
+      "globs": ["**/*.js", "**/*.mjs"]
+    }
+  ],
+  "routes": [
+    {
+      "pattern": "*.devflow.sh/*",
+      "zone_name": "devflow.sh"
+    }
+  ],
+  "assets": {
+    "directory": "dist/client"
+  },
+  "vars": {
+    "DAYTONA_API_URL": "https://app.daytona.io/api",
+    "DEVFLOW_HOST_SUFFIX": "devflow.sh",
+    "DEVFLOW_REQUIRE_ACCESS": "true"
+  },
+  "observability": {
+    "enabled": true
+  }
+}

@@ -7,7 +7,7 @@ Everything you can do with devflow, with exact commands. `dv` is an alias for
 
 ```bash
 # curl
-curl -fsSL https://github.com/dalinkstone/devflow/raw/main/i | sh
+curl -fsSL https://devflow.sh/install | sh
 
 # or Homebrew
 brew install dalinkstone/devflow/devflow
@@ -44,6 +44,7 @@ devflow never sets it and sandboxes never receive it.
 ```bash
 devflow up [REPO] [flags]      # create, recover, or submit work to a session
 devflow attach [NAME]          # rejoin from anywhere; restarts stopped sandboxes
+devflow web [NAME] [--open]    # stable browser terminal: NAME.devflow.sh
 devflow status [NAME]          # poll queued/running/completed/failed task state
 devflow peek [NAME] [-w WIN]   # view the agent's screen (or window: script)
 devflow ls                     # list devflow sandboxes
@@ -237,6 +238,7 @@ and model subscription capacity.
 
 ```bash
 devflow attach NAME        # daytona ssh + tmux auto-attach (primary)
+devflow web NAME [--open]  # print or open https://NAME.devflow.sh
 devflow ssh NAME           # same, explicit
 devflow status NAME        # detached task state without attaching
 devflow peek NAME          # recent agent output without attaching
@@ -289,7 +291,7 @@ opt out.
 | **Android** | Point the camera (or Google Lens) at the QR → opens in **Termius**/**ConnectBot**. **Termux** has no `ssh://` handler — paste the printed line there instead. For the full CLI: Termux → `pkg install curl` → run devflow's `install.sh`, `daytona login`, `devflow attach`. A UserLAnd/Ubuntu shell works the same way. |
 | **iPhone/iPad** | Point the camera at the QR → one tap opens **Termius**/**Blink**. Or paste the line — the clipboard auto-copy plus Universal Clipboard means it's often already on the phone. |
 | **another Mac/Linux** | Paste the `ssh …` line into Terminal (it's on your clipboard) — or install devflow + `daytona login` + `devflow attach` for the richer client (peek, stop, restart-on-attach). For your editor: `devflow ssh-config NAME` → open the host in VS Code/Cursor Remote-SSH. |
-| **only a browser** | Open [app.daytona.io](https://app.daytona.io), pick the sandbox, open its Terminal. Zero install. |
+| **only a browser** | Open `https://NAME.devflow.sh`. Cloudflare Access signs you in, and stopped sandboxes start automatically. |
 
 The QR / `ssh …` line needs nothing installed but an SSH app and works until
 the token expires. The full-devflow path is more capable (it restarts a
@@ -330,8 +332,7 @@ which channels you have.
   later or drop it in a folder your phone syncs. `chmod 600`, embeds the
   live token.
 - **Mint nothing, use your logins** — from any browser on any device:
-  [app.daytona.io](https://app.daytona.io) → sandbox → Terminal (just your
-  Daytona login). Or any machine with devflow installed: `daytona login` +
+  `https://NAME.devflow.sh`. Or any machine with devflow installed: `daytona login` +
   `devflow attach`. Both need zero preparation on the laptop.
 
 Which channels cover which laptop/phone pair:

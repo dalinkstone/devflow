@@ -13,7 +13,7 @@
 set -u
 set -o pipefail
 
-DEVFLOW_VERSION="0.5.0"
+DEVFLOW_VERSION="0.6.0"
 
 # ----------------------------------------------------------------------------
 # Config (precedence: environment > config file > built-in default)
@@ -27,7 +27,7 @@ CODEX_PIN_TAG="rust-v0.142.5"    # fallback for in-sandbox codex install
 DT_PIN_VERSION="0.199.0"         # fallback for in-sandbox daytona install (--with-daytona)
 DV_EXPECTED_PROVISION_VERSION=5
 
-_CONFIG_KEYS="DEVFLOW_AGENT DEVFLOW_SIZE DEVFLOW_CPU DEVFLOW_MEMORY DEVFLOW_DISK DEVFLOW_AUTO_STOP DEVFLOW_TARGET DEVFLOW_SNAPSHOT DEVFLOW_CLAUDE_AUTH DEVFLOW_EXEC_STYLE DEVFLOW_WORKROOT DEVFLOW_HARNESS DEVFLOW_NTFY_URL DEVFLOW_NTFY_TOPIC DEVFLOW_AUTO_HANDOFF"
+_CONFIG_KEYS="DEVFLOW_AGENT DEVFLOW_SIZE DEVFLOW_CPU DEVFLOW_MEMORY DEVFLOW_DISK DEVFLOW_AUTO_STOP DEVFLOW_TARGET DEVFLOW_SNAPSHOT DEVFLOW_CLAUDE_AUTH DEVFLOW_EXEC_STYLE DEVFLOW_WORKROOT DEVFLOW_HARNESS DEVFLOW_NTFY_URL DEVFLOW_NTFY_TOPIC DEVFLOW_AUTO_HANDOFF DEVFLOW_DOMAIN"
 
 load_config() {
   # 1) preserve values that came from the caller's environment
@@ -61,6 +61,7 @@ load_config() {
   : "${DEVFLOW_NTFY_URL:=https://ntfy.sh}"  # push server (self-hostable)
   : "${DEVFLOW_NTFY_TOPIC:=}"           # private topic; set by 'mobile --setup-push'
   : "${DEVFLOW_AUTO_HANDOFF:=}"         # ""=off | auto|push|op|bw|note — send reconnect line after every 'up'
+  : "${DEVFLOW_DOMAIN:=devflow.sh}"      # stable browser terminals: NAME.devflow.sh
   : "${DEVFLOW_CLAUDE_TOKEN:=}"
   : "${DEVFLOW_DAYTONA_SANDBOX_KEY:=}"  # minted API key forwarded by --with-daytona
   return 0
@@ -1961,6 +1962,36 @@ cmd_ssh() {
   exec daytona ssh "$name"
 }
 
+sandbox_web_url() { # NAME -> stable browser terminal URL
+  local name="$1" slug domain
+  slug="${name#dv-}"
+  slug="$(sanitize_name "$slug")"
+  domain="${DEVFLOW_DOMAIN#https://}"
+  domain="${domain#http://}"
+  domain="${domain%/}"
+  [ -n "$domain" ] || die "DEVFLOW_DOMAIN is empty"
+  printf 'https://%s.%s\n' "$slug" "$domain"
+}
+
+cmd_web() {
+  local name="" want_open=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --open) want_open=1; shift ;;
+      -h|--help) printf 'devflow web [NAME] [--open] — print the stable browser terminal URL\n'; return 0 ;;
+      -*) die "unknown web flag: $1" ;;
+      *)  name="$1"; shift ;;
+    esac
+  done
+  name="$(resolve_name "$name")" || exit 1
+  local url
+  url="$(sandbox_web_url "$name")"
+  printf '%s\n' "$url"
+  if [ "$want_open" = 1 ]; then
+    open_file "$url" || warn "couldn't open a browser; use: $url"
+  fi
+}
+
 # Mint a tokenized `ssh …@ssh.app.daytona.io` line via Daytona's ssh-access
 # API. Prints ONLY the ssh line on stdout (so it's safe in $(…)); dies on
 # stderr on any failure. Caller handles resolve_name + ensure_running.
@@ -2227,7 +2258,8 @@ setup_push_channel() {
 handoff_body() { # NAME SSHCMD URI EXPIRES_MIN -> message body on stdout
   printf 'devflow reconnect — %s\n%s\n' "$1" "$2"
   [ -n "$3" ] && printf 'one-tap: %s\n' "$3"
-  printf 'minted %s · valid %sm · lands in the live tmux agent (detach: Ctrl-b d)\nno SSH app? https://app.daytona.io → %s → Terminal' "$(date)" "$4" "$1"
+  printf 'minted %s · valid %sm · lands in the live tmux agent (detach: Ctrl-b d)\nno SSH app? %s' \
+    "$(date)" "$4" "$(sandbox_web_url "$1")"
 }
 
 # Send the reconnect info through a channel that already syncs to the phone —
@@ -2355,10 +2387,10 @@ cmd_mobile() { # hand the session to your phone: camera-scannable QR + ssh line 
          "$C_DIM" "$expires" "$C_RESET"
   printf '\n'
   step "2) Full devflow — Android (Termux / UserLAnd Ubuntu) or another Mac/Linux"
-  printf '     %scurl -fsSL https://github.com/dalinkstone/devflow/raw/main/i | sh%s\n' "$C_DIM" "$C_RESET"
+  printf '     %scurl -fsSL https://devflow.sh/install | sh%s\n' "$C_DIM" "$C_RESET"
   printf '     %sdaytona login && devflow attach %s%s   (also restarts it if stopped)\n' "$C_DIM" "$name" "$C_RESET"
   printf '\n'
-  step "3) Just a browser — https://app.daytona.io → $name → open its Terminal"
+  step "3) Just a browser — $(sandbox_web_url "$name")"
   printf '\n'
   if [ -n "$sent_via" ]; then
     ok "sent via ${C_BOLD}$sent_via${C_RESET} — it's already waiting on your phone"
@@ -3213,6 +3245,7 @@ ${C_BOLD}daily driving${C_RESET}
 
 ${C_BOLD}more${C_RESET}
   devflow ssh [NAME]            SSH in (lands in tmux; detach: Ctrl-b d)
+  devflow web [NAME]            print NAME.devflow.sh; pass --open to launch it
   devflow ssh-command [NAME]    print a plain ssh command for any machine
   devflow ssh-config [NAME]     managed ~/.ssh/config Host block — plain
                                 ssh NAME, VS Code/Cursor Remote-SSH, scp
@@ -3243,6 +3276,7 @@ main() {
     up|start|new)         cmd_up "$@" ;;
     attach|a|open)        cmd_attach "$@" ;;
     ssh)                  cmd_ssh "$@" ;;
+    web|url)              cmd_web "$@" ;;
     ssh-command|ssh-cmd)  cmd_ssh_command "$@" ;;
     ssh-config|sshconfig) cmd_ssh_config "$@" ;;
     mobile|phone|qr)      cmd_mobile "$@" ;;

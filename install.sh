@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # devflow installer
 #
-#   curl -fsSL https://github.com/dalinkstone/devflow/raw/main/i | sh
+#   curl -fsSL https://devflow.sh/install | sh
 #
 # Installs the `devflow` CLI (plus a `dv` alias) and, when missing, its
 # dependencies: the Daytona CLI, jq, and gh. Nothing here needs sudo unless

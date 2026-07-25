@@ -5,9 +5,7 @@ Cloud Claude/Codex sessions on Daytona.
 ## Install
 
 ```sh
-curl -fsSL https://github.com/dalinkstone/devflow/raw/main/i|sh
-# or
-brew install dalinkstone/devflow/devflow
+curl -fsSL https://devflow.sh/install | sh
 dv setup
 ```
 
@@ -36,7 +34,7 @@ Add `--aws-profile NAME`, `--secret-env VAR`, or `--env NAME=VALUE`.
 
 ## Access
 
-Run `dv mobile` and scan, or run `dv attach` elsewhere.
+Run `dv web NAME`, `dv mobile`, or `dv attach`.
 
 ## Cost
 
