@@ -5,8 +5,8 @@
 class Devflow < Formula
   desc "Run Claude Code and Codex in Daytona cloud sandboxes"
   homepage "https://github.com/dalinkstone/devflow"
-  url "https://github.com/dalinkstone/devflow/archive/refs/tags/v0.6.0.tar.gz"
-  sha256 "1f78e8c020a798871cf2ed3c345eab98daca90d5a6823e59c40e2ce66ab9c495"
+  url "https://github.com/dalinkstone/devflow/archive/refs/tags/v0.6.1.tar.gz"
+  sha256 "1a85fb620a207ca905aab7c92cf14357b5593a1a198a64068c39903b31bf70a7"
   license "MIT"
   head "https://github.com/dalinkstone/devflow.git", branch: "main"
 
