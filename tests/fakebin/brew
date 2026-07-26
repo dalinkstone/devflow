@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -u
+
+case "${1:-}" in
+  upgrade|install) exit 0 ;;
+  --prefix)
+    printf '%s\n' "${FAKE_BREW_PREFIX:?FAKE_BREW_PREFIX must be set}"
+    exit 0
+    ;;
+  *) exit 0 ;;
+esac

@@ -11,7 +11,8 @@ set -o pipefail
 
 REPO="dalinkstone/devflow"
 RAW="https://raw.githubusercontent.com/$REPO/main"
-DAYTONA_VERSION="${DAYTONA_VERSION:-0.199.0}"
+DAYTONA_MIN_VERSION="${DAYTONA_MIN_VERSION:-0.200.0}"
+DAYTONA_VERSION="${DAYTONA_VERSION:-0.200.1}"
 INSTALL_DIR="${DEVFLOW_INSTALL_DIR:-$HOME/.local/bin}"
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
@@ -60,10 +61,18 @@ ok "devflow → $INSTALL_DIR/devflow (alias: dv)"
 # --- dependencies -----------------------------------------------------------
 install_daytona() {
   if have brew; then
-    info "aligning Daytona CLI with v$DAYTONA_VERSION via Homebrew…"
+    local prefix brew_bin
+    info "aligning Daytona CLI with v$DAYTONA_MIN_VERSION+ via Homebrew…"
     brew upgrade daytonaio/cli/daytona >/dev/null 2>&1 \
-      || brew install daytonaio/cli/daytona
-    return $?
+      || brew install daytonaio/cli/daytona \
+      || return 1
+    prefix="$(brew --prefix daytona 2>/dev/null || brew --prefix daytonaio/cli/daytona 2>/dev/null)" \
+      || return 1
+    brew_bin="$prefix/bin/daytona"
+    [ -x "$brew_bin" ] || return 1
+    ln -sf "$brew_bin" "$INSTALL_DIR/daytona"
+    hash -r
+    return 0
   fi
   info "installing Daytona CLI v$DAYTONA_VERSION…"
   curl -fsSL "https://github.com/daytona/clients/releases/download/v${DAYTONA_VERSION}/daytona-${OS}-${ARCH}" \
@@ -73,6 +82,24 @@ install_daytona() {
 
 daytona_version() {
   daytona version 2>/dev/null | sed -n 's/.*v\([0-9][0-9.]*\).*/\1/p' | head -1
+}
+
+version_lt() {
+  awk -v have="$1" -v want="$2" 'BEGIN {
+    split(have, h, "."); split(want, w, ".")
+    for (i = 1; i <= 3; i++) {
+      h[i] += 0; w[i] += 0
+      if (h[i] < w[i]) exit 0
+      if (h[i] > w[i]) exit 1
+    }
+    exit 1
+  }'
+}
+
+daytona_compatible() {
+  local have_version
+  have_version="$(daytona_version)"
+  [ -n "$have_version" ] && ! version_lt "$have_version" "$DAYTONA_MIN_VERSION"
 }
 
 install_jq() {
@@ -109,11 +136,14 @@ install_gh() {
   return $rc
 }
 
-if have daytona && [ "$(daytona_version)" = "$DAYTONA_VERSION" ]; then
-  ok "daytona v$DAYTONA_VERSION already installed"
+if have daytona && daytona_compatible; then
+  ok "daytona v$(daytona_version) already installed"
 else
-  install_daytona && ok "daytona v$DAYTONA_VERSION installed" || \
-    warn "could not install Daytona CLI v$DAYTONA_VERSION — see https://www.daytona.io/docs"
+  if install_daytona && daytona_compatible; then
+    ok "daytona v$(daytona_version) installed"
+  else
+    warn "could not install Daytona CLI v$DAYTONA_MIN_VERSION+ — see https://www.daytona.io/docs"
+  fi
 fi
 if have jq;      then ok "jq already installed";      else install_jq && ok "jq installed"           || warn "could not install jq"; fi
 if have gh;      then ok "gh already installed";      else install_gh && ok "gh installed"           || warn "could not install gh — see https://cli.github.com"; fi

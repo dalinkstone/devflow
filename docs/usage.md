@@ -44,7 +44,7 @@ devflow never sets it and sandboxes never receive it.
 ```bash
 devflow up [REPO] [flags]      # create, recover, or submit work to a session
 devflow attach [NAME]          # rejoin from anywhere; restarts stopped sandboxes
-devflow web [NAME] [--open]    # stable browser terminal: NAME.devflow.sh
+devflow web [NAME] [--port P]  # terminal: NAME.devflow.sh; app: NAME--P.devflow.sh
 devflow status [NAME]          # poll queued/running/completed/failed task state
 devflow peek [NAME] [-w WIN]   # view the agent's screen (or window: script)
 devflow ls                     # list devflow sandboxes
@@ -238,7 +238,8 @@ and model subscription capacity.
 
 ```bash
 devflow attach NAME        # daytona ssh + tmux auto-attach (primary)
-devflow web NAME [--open]  # print or open https://NAME.devflow.sh
+devflow web NAME [--open]  # terminal: https://NAME.devflow.sh
+devflow web NAME --port 3000 [--open]  # app: https://NAME--3000.devflow.sh
 devflow ssh NAME           # same, explicit
 devflow status NAME        # detached task state without attaching
 devflow peek NAME          # recent agent output without attaching
@@ -291,7 +292,7 @@ opt out.
 | **Android** | Point the camera (or Google Lens) at the QR → opens in **Termius**/**ConnectBot**. **Termux** has no `ssh://` handler — paste the printed line there instead. For the full CLI: Termux → `pkg install curl` → run devflow's `install.sh`, `daytona login`, `devflow attach`. A UserLAnd/Ubuntu shell works the same way. |
 | **iPhone/iPad** | Point the camera at the QR → one tap opens **Termius**/**Blink**. Or paste the line — the clipboard auto-copy plus Universal Clipboard means it's often already on the phone. |
 | **another Mac/Linux** | Paste the `ssh …` line into Terminal (it's on your clipboard) — or install devflow + `daytona login` + `devflow attach` for the richer client (peek, stop, restart-on-attach). For your editor: `devflow ssh-config NAME` → open the host in VS Code/Cursor Remote-SSH. |
-| **only a browser** | Open `https://NAME.devflow.sh`. Cloudflare Access signs you in, and stopped sandboxes start automatically. |
+| **only a browser** | Open `https://NAME.devflow.sh` for the terminal, or run `devflow web NAME --port PORT` for an app. Cloudflare Access signs you in, and stopped sandboxes start automatically. |
 
 The QR / `ssh …` line needs nothing installed but an SSH app and works until
 the token expires. The full-devflow path is more capable (it restarts a
@@ -438,6 +439,6 @@ Running sandboxes incur Daytona compute charges.
 | Docker client cannot reach daemon | use a Daytona snapshot configured for Docker-in-Docker |
 | claude refuses bypass mode | sandbox user is root (custom image) — devflow falls back to acceptEdits; prefer non-root images |
 | harness missing | `devflow exec NAME -- 'tail -20 ~/.devflow/omc-install.log ~/.devflow/omx-install.log'` |
-| daytona CLI/API version-mismatch warning | `brew upgrade daytonaio/cli/daytona` |
+| daytona CLI/API version-mismatch warning | `curl -fsSL https://devflow.sh/install \| sh` updates Daytona and repairs an older `~/.local/bin/daytona` shadow |
 | create fails: "Cannot specify Sandbox resources when using a snapshot" | you're on an old devflow that passes raw `--cpu/--memory/--disk` — update it; sizes are now `--size small\|medium\|large` |
 | deep inspection | `devflow ssh NAME`, then `~/.devflow/` holds all state/logs |

@@ -34,7 +34,7 @@ Add `--aws-profile NAME`, `--secret-env VAR`, or `--env NAME=VALUE`.
 
 ## Access
 
-Run `dv web NAME`, `dv mobile`, or `dv attach`.
+Run `dv web NAME`, or add `--port 3000` for an app. Use `dv mobile` or `dv attach` for SSH.
 
 ## Cost
 

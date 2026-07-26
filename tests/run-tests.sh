@@ -73,6 +73,7 @@ run_devflow() { # args… (stdin=/dev/null, captures stdout+stderr, sets RC/OUT)
       FAKE_LOG="$T_LOG" FAKE_STATE_DIR="$T_STATE" FAKE_EXEC_STYLE="$EXEC_STYLE" \
       FAKE_QRENCODE_FAIL="${FAKE_QRENCODE_FAIL:-}" FAKE_OP_FAIL="${FAKE_OP_FAIL:-}" \
       FAKE_AWS_STATIC="${FAKE_AWS_STATIC:-0}" \
+      FAKE_DAYTONA_VERSION="${FAKE_DAYTONA_VERSION:-0.200.1}" \
       FAKE_UNPROVISIONED="${FAKE_UNPROVISIONED:-0}" FAKE_AGENT_STATE="${FAKE_AGENT_STATE:-running}" FAKE_FAIL_TOOLS="${FAKE_FAIL_TOOLS:-0}" \
       DAYTONA_API_KEY="${TEST_DAYTONA_API_KEY:-}" \
       CLOUDFLARE_API_TOKEN="${TEST_CLOUDFLARE_API_TOKEN:-}" \
@@ -105,6 +106,10 @@ run_devflow web dv-alpha
 assert_rc "web exits 0" "$RC" 0
 assert_contains "web prints stable sandbox URL" "$OUT" "https://alpha.devflow.sh"
 
+run_devflow web dv-alpha --port 3000
+assert_rc "web app port exits 0" "$RC" 0
+assert_contains "web app port stays on devflow domain" "$OUT" "https://alpha--3000.devflow.sh"
+
 run_devflow bogus-command
 assert_rc "unknown command exits 1" "$RC" 1
 assert_contains "unknown command message" "$OUT" "unknown command: bogus-command"
@@ -116,6 +121,12 @@ assert_contains "doctor sees claude creds" "$OUT" "local credentials found"
 assert_contains "doctor shows phone hand-off channels" "$OUT" "phone hand-off"
 assert_contains "doctor sees codex auth" "$OUT" ".codex/auth.json present"
 
+FAKE_DAYTONA_VERSION=0.199.0
+run_devflow doctor
+assert_contains "doctor flags stale Daytona" "$OUT" "v0.199.0"
+assert_contains "doctor gives one-step Daytona repair" "$OUT" "https://devflow.sh/install"
+unset FAKE_DAYTONA_VERSION
+
 # ===========================================================================
 echo "# 2..up (argv exec style)"
 # ===========================================================================
@@ -124,6 +135,8 @@ fresh_env argv
 run_devflow up tester/alpha --no-attach
 assert_rc "up exits 0" "$RC" 0
 assert_contains "up announces sandbox" "$OUT" "spinning up dv-alpha"
+assert_contains "up prints stable web terminal" "$OUT" "https://alpha.devflow.sh"
+assert_not_contains "up hides Daytona's temporary preview host" "$OUT" "daytonaproxy01.net"
 assert_contains "up ran provision phases" "$OUT" "fake provision phase ran"
 assert_contains "up final hint" "$OUT" "devflow attach dv-alpha"
 assert_not_contains "up stays quiet without auto-handoff" "$OUT" "auto-handoff"
@@ -712,6 +725,29 @@ FAIL_LOG="$(tail -n "+$((FAIL_LOG_START + 1))" "$T_LOG")"
 assert_not_contains "tools phase failure never reaches auth" "$FAIL_LOG" "DV_PHASE='auth'"
 assert_not_contains "tools phase failure never reaches workspace" "$FAIL_LOG" "DV_PHASE='workspace'"
 FAKE_FAIL_TOOLS=0
+
+# ===========================================================================
+echo "# 14..installer repairs a stale ~/.local/bin Daytona shadow"
+# ===========================================================================
+INSTALL_HOME="$WORK/install-home"
+INSTALL_BIN="$INSTALL_HOME/.local/bin"
+INSTALL_OPT="$WORK/daytona-opt"
+mkdir -p "$INSTALL_BIN" "$INSTALL_OPT/bin" "$WORK/install-state"
+printf '%s\n' '#!/usr/bin/env bash' 'echo "Daytona CLI version v0.200.1"' > "$INSTALL_OPT/bin/daytona"
+chmod +x "$INSTALL_OPT/bin/daytona"
+: > "$WORK/install-log"
+INSTALL_OUT="$(env \
+  PATH="$INSTALL_BIN:$FAKEBIN:$PATH" \
+  HOME="$INSTALL_HOME" \
+  DEVFLOW_INSTALL_DIR="$INSTALL_BIN" \
+  FAKE_BREW_PREFIX="$INSTALL_OPT" \
+  FAKE_DAYTONA_VERSION=0.199.0 \
+  FAKE_LOG="$WORK/install-log" \
+  FAKE_STATE_DIR="$WORK/install-state" \
+  bash "$ROOT/install.sh" 2>&1)"
+assert_contains "installer reports the repaired Daytona version" "$INSTALL_OUT" "daytona v0.200.1 installed"
+assert_eq "installer points the shadow at Homebrew's stable opt path" \
+  "$(readlink "$INSTALL_BIN/daytona")" "$INSTALL_OPT/bin/daytona"
 
 # ===========================================================================
 printf '\n# results: %d passed, %d failed, %d total\n' "$PASS" "$FAIL" "$TESTN"

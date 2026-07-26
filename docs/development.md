@@ -96,9 +96,10 @@ All green before every commit. CI runs the same three on push/PR
    already-provisioned sandboxes (marker: `~/.devflow/provisioned`).
 
 ### Change version pins
-`GH_PIN_VERSION` / `CODEX_PIN_TAG` near the top of `bin/devflow` (fallbacks
-when the sandbox can't query the GitHub API) and mirrored in
-`emit_dockerfile`. Verify the release assets exist before bumping.
+`GH_PIN_VERSION` / `CODEX_PIN_TAG` / `DT_PIN_VERSION` near the top of
+`bin/devflow` are fallbacks when a release cannot be discovered. Daytona's
+minimum also lives in `DT_MIN_VERSION` and `install.sh`. Mirror Dockerfile pins
+where applicable, and verify release assets exist before bumping.
 
 ## Test harness anatomy
 

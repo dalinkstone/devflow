@@ -25,6 +25,11 @@ interface PreviewInfo {
   url?: string;
 }
 
+export interface PreviewTarget {
+  sandbox: string;
+  port: number;
+}
+
 export function installerResponse(): Response {
   return new Response(INSTALL_SCRIPT, {
     headers: {
@@ -35,22 +40,40 @@ export function installerResponse(): Response {
   });
 }
 
-export function sandboxFromHostname(
+export function previewFromHostname(
   hostname: string,
   suffix = "devflow.sh",
-): string | null {
+): PreviewTarget | null {
   const ending = `.${suffix}`;
   if (!hostname.endsWith(ending)) return null;
-  const label = hostname.slice(0, -ending.length);
+  let label = hostname.slice(0, -ending.length);
+  let port = 22222;
+  const portMatch = label.match(/^(.*)--([0-9]{1,5})$/);
+  if (portMatch) {
+    label = portMatch[1];
+    port = Number(portMatch[2]);
+  }
   if (
     !label ||
     label === "www" ||
     label.includes(".") ||
+    port < 1 ||
+    port > 65535 ||
     !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label)
   ) {
     return null;
   }
-  return label.startsWith("dv-") ? label : `dv-${label}`;
+  return {
+    sandbox: label.startsWith("dv-") ? label : `dv-${label}`,
+    port,
+  };
+}
+
+export function sandboxFromHostname(
+  hostname: string,
+  suffix = "devflow.sh",
+): string | null {
+  return previewFromHostname(hostname, suffix)?.sandbox ?? null;
 }
 
 function html(message: string, status = 200, refresh = false): Response {
@@ -100,6 +123,7 @@ export async function proxySandbox(
   request: Request,
   env: DevflowEnv,
   requestedName: string,
+  port = 22222,
 ): Promise<Response> {
   if (!env.DAYTONA_API_KEY) {
     return html("Preview proxy is not configured.", 503);
@@ -133,10 +157,10 @@ export async function proxySandbox(
   }
 
   const previewResponse = await fetch(
-    `${apiUrl}/sandbox/${encodeURIComponent(resolved.name)}/ports/22222/preview-url`,
+    `${apiUrl}/sandbox/${encodeURIComponent(resolved.name)}/ports/${port}/preview-url`,
     { headers: apiHeaders(env) },
   );
-  if (!previewResponse.ok) return html("Could not open the web terminal.", 502);
+  if (!previewResponse.ok) return html(`Could not open port <code>${port}</code>.`, 502);
   const preview = (await previewResponse.json()) as PreviewInfo;
   if (!preview.url || !preview.token) return html("Daytona returned an invalid preview.", 502);
 
@@ -153,21 +177,45 @@ export async function proxySandbox(
     "cf-connecting-ip",
     "cf-ipcountry",
     "cf-ray",
-    "cookie",
     "host",
     "x-forwarded-for",
   ]) {
     headers.delete(name);
+  }
+  const cookie = headers.get("cookie");
+  if (cookie) {
+    const kept = cookie
+      .split(";")
+      .map((part) => part.trim())
+      .filter((part) => !/^CF_[^=]*=/i.test(part));
+    if (kept.length > 0) headers.set("cookie", kept.join("; "));
+    else headers.delete("cookie");
   }
   headers.set("x-daytona-preview-token", preview.token);
   headers.set("x-daytona-skip-preview-warning", "true");
   headers.set("x-daytona-trust-forwarded-host", "true");
   headers.set("x-forwarded-host", incoming.host);
 
-  return fetch(upstream, {
+  const response = await fetch(upstream, {
     method: request.method,
     headers,
     body: request.method === "GET" || request.method === "HEAD" ? undefined : request.body,
     redirect: "manual",
   });
+  const location = response.headers.get("location");
+  if (location && response.status >= 300 && response.status < 400) {
+    const redirect = new URL(location, upstream);
+    if (redirect.origin === upstream.origin) {
+      redirect.protocol = incoming.protocol;
+      redirect.host = incoming.host;
+      const responseHeaders = new Headers(response.headers);
+      responseHeaders.set("location", redirect.toString());
+      return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: responseHeaders,
+      });
+    }
+  }
+  return response;
 }

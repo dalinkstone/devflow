@@ -23,7 +23,7 @@ npm test
 ## Preview proxy
 
 Cloudflare Access protects `*.devflow.sh`. The Worker maps `box.devflow.sh` to
-the `dv-box` sandbox and proxies its web terminal.
+port 22222 on `dv-box`, and `box--3000.devflow.sh` to port 3000.
 
 `DAYTONA_API_KEY` is a Worker secret. Deploy the wildcard Worker with:
 

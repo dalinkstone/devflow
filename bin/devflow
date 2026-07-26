@@ -13,7 +13,7 @@
 set -u
 set -o pipefail
 
-DEVFLOW_VERSION="0.6.0"
+DEVFLOW_VERSION="0.6.1"
 
 # ----------------------------------------------------------------------------
 # Config (precedence: environment > config file > built-in default)
@@ -24,7 +24,8 @@ SECRETS_FILE="$CONFIG_DIR/secrets"
 
 GH_PIN_VERSION="2.96.0"          # fallback for in-sandbox gh install
 CODEX_PIN_TAG="rust-v0.142.5"    # fallback for in-sandbox codex install
-DT_PIN_VERSION="0.199.0"         # fallback for in-sandbox daytona install (--with-daytona)
+DT_MIN_VERSION="0.200.0"         # older clients spam API mismatch warnings
+DT_PIN_VERSION="0.200.1"         # fallback for in-sandbox daytona install (--with-daytona)
 DV_EXPECTED_PROVISION_VERSION=5
 
 _CONFIG_KEYS="DEVFLOW_AGENT DEVFLOW_SIZE DEVFLOW_CPU DEVFLOW_MEMORY DEVFLOW_DISK DEVFLOW_AUTO_STOP DEVFLOW_TARGET DEVFLOW_SNAPSHOT DEVFLOW_CLAUDE_AUTH DEVFLOW_EXEC_STYLE DEVFLOW_WORKROOT DEVFLOW_HARNESS DEVFLOW_NTFY_URL DEVFLOW_NTFY_TOPIC DEVFLOW_AUTO_HANDOFF DEVFLOW_DOMAIN"
@@ -155,6 +156,50 @@ need_cmd() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1 — 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 need_val() { [ -n "${2:-}" ] || die "flag $1 requires a value"; }
 
+version_lt() { # VERSION MINIMUM; release versions only
+  awk -v have="$1" -v want="$2" 'BEGIN {
+    split(have, h, "."); split(want, w, ".")
+    for (i = 1; i <= 3; i++) {
+      h[i] += 0; w[i] += 0
+      if (h[i] < w[i]) exit 0
+      if (h[i] > w[i]) exit 1
+    }
+    exit 1
+  }'
+}
+
+daytona_cli_version() {
+  command daytona version 2>/dev/null | sed -n 's/.*v\([0-9][0-9.]*\).*/\1/p' | head -1
+}
+
+require_daytona_cli() {
+  local have path
+  need_cmd daytona "curl -fsSL https://devflow.sh/install | sh"
+  have="$(daytona_cli_version)"
+  path="$(command -v daytona)"
+  [ -n "$have" ] || die "could not read the Daytona CLI version at $path — reinstall: curl -fsSL https://devflow.sh/install | sh"
+  version_lt "$have" "$DT_MIN_VERSION" \
+    && die "Daytona CLI v$have is too old at $path (need v$DT_MIN_VERSION+) — update: curl -fsSL https://devflow.sh/install | sh"
+  return 0
+}
+
+upgrade_daytona_cli() {
+  local prefix brew_bin current
+  have_cmd brew || return 1
+  brew upgrade daytonaio/cli/daytona \
+    || brew install daytonaio/cli/daytona \
+    || return 1
+  prefix="$(brew --prefix daytona 2>/dev/null || brew --prefix daytonaio/cli/daytona 2>/dev/null)" \
+    || return 1
+  brew_bin="$prefix/bin/daytona"
+  [ -x "$brew_bin" ] || return 1
+  current="$(command -v daytona 2>/dev/null || true)"
+  if [ "$current" = "$HOME/.local/bin/daytona" ]; then
+    ln -sf "$brew_bin" "$current" || return 1
+  fi
+  return 0
+}
+
 b64_encode() { # portable, single-line output
   if base64 --help 2>&1 | grep -q -- '-w'; then base64 -w0; else base64 | tr -d '\n'; fi
 }
@@ -198,11 +243,18 @@ current_repo() { # owner/name of cwd's github origin, or empty
 # ----------------------------------------------------------------------------
 # Daytona wrappers
 # ----------------------------------------------------------------------------
-dt() { command daytona "$@"; }
+_DT_VERSION_CHECKED=0
+dt() {
+  if [ "$_DT_VERSION_CHECKED" != 1 ]; then
+    require_daytona_cli
+    _DT_VERSION_CHECKED=1
+  fi
+  command daytona "$@"
+}
 
 # NOTE: must be an org-scoped call that works under BOTH auth modes — the CLI
 # refuses `organization` subcommands entirely under api-key auth
-dt_auth_check() { dt list >/dev/null 2>&1; }
+dt_auth_check() { command daytona list >/dev/null 2>&1; }
 
 dt_info_json() { dt info "$1" -f json 2>/dev/null; }
 
@@ -1797,7 +1849,7 @@ cmd_up() {
     case "$size" in small|medium|large) ;; *) die "invalid --size '$size' (small|medium|large)" ;; esac
   fi
 
-  need_cmd daytona "brew install daytonaio/cli/daytona"
+  require_daytona_cli
   need_cmd jq "brew install jq"
   dt_auth_check || die "not logged in to Daytona — run: devflow setup   (or: daytona login)"
 
@@ -1873,6 +1925,7 @@ cmd_up() {
         return $?
       fi
       ok "up. attach anytime, from any machine:  ${C_BOLD}devflow attach $name${C_RESET}"
+      step "web terminal:   ${C_BOLD}$(sandbox_web_url "$name")${C_RESET}"
       return 0
     fi
   fi
@@ -1900,16 +1953,21 @@ cmd_up() {
   fi
   [ -n "$DEVFLOW_TARGET" ] && create_args+=("--target=$DEVFLOW_TARGET")
 
+  local create_output=""
   step "creating sandbox…"
   if [ -n "$linked_parent" ]; then
     create_linked_sandbox "$name" "$linked_parent" "$auto_stop" \
       "${snapshot:-daytona-$size}" "$agent" "$harness" "$repo" \
       "$team" "$team_role" "$team_mode"
   else
-    dt "${create_args[@]}" || die "sandbox create failed (check quota/billing at app.daytona.io)"
+    if ! create_output="$(dt "${create_args[@]}" 2>&1)"; then
+      [ -z "$create_output" ] || printf '%s\n' "$create_output" >&2
+      die "sandbox create failed (check quota/billing at app.daytona.io)"
+    fi
   fi
   wait_for_state "$name" started 300
   ok "sandbox running"
+  step "web terminal:   ${C_BOLD}$(sandbox_web_url "$name")${C_RESET}"
 
   provision_sandbox "$name" "$agent" "$repo" "$branch" "$task" "$harness"
   ok "provisioned"
@@ -1940,7 +1998,7 @@ cmd_up() {
 }
 
 cmd_attach() {
-  need_cmd daytona "brew install daytonaio/cli/daytona"
+  require_daytona_cli
   need_cmd jq "brew install jq"
   dt_auth_check || die "not logged in to Daytona — run: devflow setup"
   local name
@@ -1954,7 +2012,7 @@ cmd_attach() {
 }
 
 cmd_ssh() {
-  need_cmd daytona "brew install daytonaio/cli/daytona"
+  require_daytona_cli
   need_cmd jq "brew install jq"
   local name
   name="$(resolve_name "${1:-}")" || exit 1
@@ -1962,10 +2020,13 @@ cmd_ssh() {
   exec daytona ssh "$name"
 }
 
-sandbox_web_url() { # NAME -> stable browser terminal URL
-  local name="$1" slug domain
+sandbox_web_url() { # NAME [PORT] -> stable browser URL
+  local name="$1" port="${2:-22222}" slug domain
   slug="${name#dv-}"
   slug="$(sanitize_name "$slug")"
+  case "$port" in ''|*[!0-9]*) die "invalid preview port: $port" ;; esac
+  [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "invalid preview port: $port"
+  [ "$port" = 22222 ] || slug="${slug}--${port}"
   domain="${DEVFLOW_DOMAIN#https://}"
   domain="${domain#http://}"
   domain="${domain%/}"
@@ -1974,18 +2035,21 @@ sandbox_web_url() { # NAME -> stable browser terminal URL
 }
 
 cmd_web() {
-  local name="" want_open=0
+  local name="" port=22222 want_open=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --open) want_open=1; shift ;;
-      -h|--help) printf 'devflow web [NAME] [--open] — print the stable browser terminal URL\n'; return 0 ;;
+      --port) need_val "$1" "${2:-}"; port="$2"; shift 2 ;;
+      --port=*) port="${1#--port=}"; shift ;;
+      -h|--help) printf 'devflow web [NAME] [--port PORT] [--open] — print a stable terminal or app URL\n'; return 0 ;;
       -*) die "unknown web flag: $1" ;;
-      *)  name="$1"; shift ;;
+      *)  [ -z "$name" ] || die "unexpected web argument: $1"
+          name="$1"; shift ;;
     esac
   done
   name="$(resolve_name "$name")" || exit 1
   local url
-  url="$(sandbox_web_url "$name")"
+  url="$(sandbox_web_url "$name" "$port")"
   printf '%s\n' "$url"
   if [ "$want_open" = 1 ]; then
     open_file "$url" || warn "couldn't open a browser; use: $url"
@@ -2457,7 +2521,7 @@ cmd_status() {
 }
 
 cmd_ls() {
-  need_cmd daytona "brew install daytonaio/cli/daytona"
+  require_daytona_cli
   need_cmd jq "brew install jq"
   dt_auth_check || die "not logged in to Daytona — run: devflow setup"
   local json count
@@ -2758,7 +2822,7 @@ cmd_team_up() {
 }
 
 cmd_team_ls() {
-  need_cmd daytona "brew install daytonaio/cli/daytona"
+  require_daytona_cli
   need_cmd jq "brew install jq"
   local json count
   json="$(team_sandboxes_json "")"
@@ -2860,7 +2924,7 @@ cmd_team() {
   case "$sub" in
     up|start|new|help|-h|--help) ;;
     *)
-      need_cmd daytona "brew install daytonaio/cli/daytona"
+      require_daytona_cli
       need_cmd jq "brew install jq"
       dt_auth_check || die "not logged in to Daytona — run: devflow setup"
       ;;
@@ -2931,8 +2995,18 @@ cmd_doctor() {
   say "$DEVFLOW_VERSION — environment check"
   echo
   printf '%s\n' "${C_BOLD}local tools${C_RESET}"
-  local spec c fix
-  for spec in "daytona|brew install daytonaio/cli/daytona" "jq|brew install jq" "git|xcode-select --install / apt install git" "gh|brew install gh" "fzf|brew install fzf (optional: nicer pickers)" "qrencode|brew install qrencode (optional: scan-to-phone QR in 'devflow mobile')"; do
+  local spec c fix daytona_have
+  if have_cmd daytona; then
+    daytona_have="$(daytona_cli_version)"
+    if [ -z "$daytona_have" ] || version_lt "$daytona_have" "$DT_MIN_VERSION"; then
+      check_row "daytona" warn "v${daytona_have:-unknown} at $(command -v daytona) — update: curl -fsSL https://devflow.sh/install | sh"
+    else
+      check_row "daytona" ok "v$daytona_have · $(command -v daytona)"
+    fi
+  else
+    check_row "daytona" fail "missing — curl -fsSL https://devflow.sh/install | sh"
+  fi
+  for spec in "jq|brew install jq" "git|xcode-select --install / apt install git" "gh|brew install gh" "fzf|brew install fzf (optional: nicer pickers)" "qrencode|brew install qrencode (optional: scan-to-phone QR in 'devflow mobile')"; do
     c="${spec%%|*}"; fix="${spec#*|}"
     if have_cmd "$c"; then check_row "$c" ok "$(command -v "$c")"
     else
@@ -2989,7 +3063,7 @@ cmd_setup() {
   echo
 
   step "1/5 dependencies…"
-  local missing="" c
+  local missing="" c daytona_have
   for c in daytona jq git gh qrencode; do have_cmd "$c" || missing="$missing $c"; done
   if [ -n "$missing" ]; then
     if have_cmd brew; then
@@ -3005,7 +3079,21 @@ cmd_setup() {
       warn "missing:$missing — install them and re-run devflow setup"
     fi
   fi
-  ok "dependencies"
+  if have_cmd daytona; then
+    daytona_have="$(daytona_cli_version)"
+    if [ -z "$daytona_have" ] || version_lt "$daytona_have" "$DT_MIN_VERSION"; then
+      warn "Daytona CLI v${daytona_have:-unknown} is too old (need v$DT_MIN_VERSION+)"
+      if have_cmd brew && confirm "upgrade Daytona and repair the ~/.local/bin PATH shadow?"; then
+        upgrade_daytona_cli || warn "upgrade failed — run: curl -fsSL https://devflow.sh/install | sh"
+        daytona_have="$(daytona_cli_version)"
+      fi
+    fi
+  fi
+  if [ -n "${daytona_have:-}" ] && ! version_lt "$daytona_have" "$DT_MIN_VERSION"; then
+    ok "dependencies"
+  else
+    warn "Daytona still needs an update — run: curl -fsSL https://devflow.sh/install | sh"
+  fi
 
   step "2/5 Daytona account (sandbox cloud — \$200 free compute for new accounts)…"
   if have_cmd daytona && dt_auth_check; then
@@ -3141,7 +3229,7 @@ cmd_snapshot() {
         large)  cpu=4 mem_gb=8 disk_gb=10 ;;
         *) die "invalid size '$size' (small|medium|large)" ;;
       esac
-      need_cmd daytona "brew install daytonaio/cli/daytona"
+      require_daytona_cli
       dt_auth_check || die "not logged in to Daytona — run: devflow setup"
       local snap_name="devflow-base-$DEVFLOW_VERSION-$size" tmp
       tmp="$(mktemp -d "${TMPDIR:-/tmp}/devflow-snap.XXXXXX")"
@@ -3245,7 +3333,7 @@ ${C_BOLD}daily driving${C_RESET}
 
 ${C_BOLD}more${C_RESET}
   devflow ssh [NAME]            SSH in (lands in tmux; detach: Ctrl-b d)
-  devflow web [NAME]            print NAME.devflow.sh; pass --open to launch it
+  devflow web [NAME]            print NAME.devflow.sh; add --port PORT for an app
   devflow ssh-command [NAME]    print a plain ssh command for any machine
   devflow ssh-config [NAME]     managed ~/.ssh/config Host block — plain
                                 ssh NAME, VS Code/Cursor Remote-SSH, scp
@@ -3276,7 +3364,7 @@ main() {
     up|start|new)         cmd_up "$@" ;;
     attach|a|open)        cmd_attach "$@" ;;
     ssh)                  cmd_ssh "$@" ;;
-    web|url)              cmd_web "$@" ;;
+    web|url|preview)      cmd_web "$@" ;;
     ssh-command|ssh-cmd)  cmd_ssh_command "$@" ;;
     ssh-config|sshconfig) cmd_ssh_config "$@" ;;
     mobile|phone|qr)      cmd_mobile "$@" ;;

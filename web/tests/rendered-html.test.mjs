@@ -153,3 +153,58 @@ test("proxies a running sandbox terminal", async () => {
     globalThis.fetch = originalFetch;
   }
 });
+
+test("proxies a stable app port without leaking Access cookies or redirects", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    calls.push({ init, url });
+    if (url.endsWith("/sandbox/dv-my-box")) {
+      return Response.json({ name: "dv-my-box", state: "started" });
+    }
+    if (url.endsWith("/ports/4173/preview-url")) {
+      return Response.json({
+        url: "https://4173-sandbox.proxy.daytona.work",
+        token: "preview-token",
+      });
+    }
+    if (url.startsWith("https://4173-sandbox.proxy.daytona.work")) {
+      const headers = new Headers(init.headers);
+      assert.equal(headers.get("cookie"), "session=app-cookie");
+      assert.equal(headers.get("x-daytona-preview-token"), "preview-token");
+      return new Response(null, {
+        status: 302,
+        headers: { location: "https://4173-sandbox.proxy.daytona.work/login" },
+      });
+    }
+    return new Response("Not found", { status: 404 });
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://my-box--4173.devflow.sh/dashboard", {
+        headers: {
+          "cf-access-jwt-assertion": "access-jwt",
+          cookie: "CF_Authorization=secret; session=app-cookie",
+        },
+      }),
+      {
+        ASSETS: assets,
+        DAYTONA_API_KEY: "test-key",
+        DEVFLOW_HOST_SUFFIX: "devflow.sh",
+      },
+      context,
+    );
+    assert.equal(response.status, 302);
+    assert.equal(
+      response.headers.get("location"),
+      "https://my-box--4173.devflow.sh/login",
+    );
+    assert.equal(
+      calls.at(-2).url,
+      "https://app.daytona.io/api/sandbox/dv-my-box/ports/4173/preview-url",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

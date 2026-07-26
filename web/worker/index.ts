@@ -3,8 +3,8 @@ import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } fr
 import handler from "vinext/server/app-router-entry";
 import {
   installerResponse,
+  previewFromHostname,
   proxySandbox,
-  sandboxFromHostname,
   type DevflowEnv,
 } from "./devflow";
 
@@ -34,14 +34,14 @@ const worker = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const suffix = env.DEVFLOW_HOST_SUFFIX || "devflow.sh";
-    const sandbox = sandboxFromHostname(url.hostname, suffix);
+    const preview = previewFromHostname(url.hostname, suffix);
 
-    if (!sandbox && (url.pathname === "/install" || url.pathname === "/i")) {
+    if (!preview && (url.pathname === "/install" || url.pathname === "/i")) {
       return installerResponse();
     }
 
-    if (sandbox) {
-      return proxySandbox(request, env, sandbox);
+    if (preview) {
+      return proxySandbox(request, env, preview.sandbox, preview.port);
     }
 
     if (url.pathname === "/_vinext/image") {
