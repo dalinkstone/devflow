@@ -13,7 +13,7 @@
 set -u
 set -o pipefail
 
-DEVFLOW_VERSION="0.6.1"
+DEVFLOW_VERSION="0.7.0"
 
 # ----------------------------------------------------------------------------
 # Config (precedence: environment > config file > built-in default)
@@ -142,6 +142,103 @@ warn() { printf '%s\n' "${C_YELLOW}!${C_RESET} $*" >&2; }
 err()  { printf '%s\n' "${C_RED}✗${C_RESET} $*" >&2; }
 die()  { err "$@"; exit 1; }
 
+ui_state_value() {
+  local state="$1" color="$C_DIM"
+  case "$state" in
+    started|running|completed|interactive) color="$C_GREEN" ;;
+    queued|starting|restoring|creating)     color="$C_YELLOW" ;;
+    failed|error|stale|destroyed|missing)  color="$C_RED" ;;
+  esac
+  printf '%s%s%s' "$color" "$state" "$C_RESET"
+}
+
+ui_title() { printf '%s%s%s\n' "$C_BOLD" "$1" "$C_RESET"; }
+ui_row()   { printf '  %s%-9s%s %s\n' "$C_DIM" "$1" "$C_RESET" "$2"; }
+
+kv_field() { # KEY-VALUE_TEXT KEY
+  printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -1
+}
+
+peek_meta_field() { # META KEY
+  printf '%s\n' "$1" | sed -n "s/.*[[:space:]]$2=\([^[:space:]]*\).*/\1/p"
+}
+
+clean_peek_output() {
+  LC_ALL=C awk '
+    BEGIN {
+      esc = sprintf("%c", 27); bel = sprintf("%c", 7)
+      bs = sprintf("%c", 8); cr = sprintf("%c", 13)
+      osc = esc "]"; st = esc "\\"
+      csi = esc "\\[[0-9;?]*[ -/]*[@-~]"
+    }
+    function strip_osc(s, p, rest, bell_end, st_end) {
+      while ((p = index(s, osc)) > 0) {
+        rest = substr(s, p + 2)
+        bell_end = index(rest, bel); st_end = index(rest, st)
+        if (bell_end > 0 && (st_end == 0 || bell_end < st_end))
+          s = substr(s, 1, p - 1) substr(rest, bell_end + 1)
+        else if (st_end > 0)
+          s = substr(s, 1, p - 1) substr(rest, st_end + 2)
+        else
+          return substr(s, 1, p - 1)
+      }
+      return s
+    }
+    {
+      line = strip_osc($0)
+      gsub(csi, "", line)
+      while ((p = index(line, cr)) > 0) line = substr(line, p + 1)
+      while ((p = index(line, bs)) > 0) {
+        before = substr(line, 1, p - 1); after = substr(line, p + 1)
+        if (length(before) > 0) before = substr(before, 1, length(before) - 1)
+        line = before after
+      }
+      gsub(/[[:cntrl:]]/, "", line)
+      sub(/[[:space:]]+$/, "", line)
+
+      # Codex occasionally paints these local session bookkeeping errors and
+      # its token footer into the pane. They are not part of the agent result;
+      # --raw remains available when the full transcript is needed.
+      if (line ~ /ERROR codex_core::session: failed to record rollout/) next
+      if (line ~ /^items: thread [0-9a-f-]+ not found$/) next
+      if (line == "tokens used") { skip_tokens = 1; next }
+      if (skip_tokens && line ~ /^[0-9,]+$/) { skip_tokens = 0; next }
+      skip_tokens = 0
+      lines[++count] = line
+    }
+    END {
+      first = 1
+      while (first <= count && lines[first] == "") first++
+      last = count
+      while (last >= first && lines[last] == "") last--
+      blank = 0
+      for (i = first; i <= last; i++) {
+        if (lines[i] == "") {
+          if (!blank) print ""
+          blank = 1
+        } else {
+          print lines[i]
+          blank = 0
+        }
+      }
+    }
+  '
+}
+
+trim_peek_padding() {
+  awk '
+    {
+      lines[++count] = $0
+      if ($0 != "") last = count
+    }
+    END {
+      first = 1
+      while (first <= last && lines[first] == "") first++
+      for (i = first; i <= last; i++) print lines[i]
+    }
+  '
+}
+
 confirm() { # confirm "question" -> 0 yes / 1 no
   local ans
   printf '%s' "${C_YELLOW}?${C_RESET} $1 [y/N] "
@@ -250,6 +347,13 @@ dt() {
     _DT_VERSION_CHECKED=1
   fi
   command daytona "$@"
+}
+
+dt_quiet() { # Daytona command with curated success output from the caller
+  local output
+  if output="$(dt "$@" 2>&1)"; then return 0; fi
+  [ -z "$output" ] || printf '%s\n' "$output" >&2
+  return 1
 }
 
 # NOTE: must be an org-scoped call that works under BOTH auth modes — the CLI
@@ -450,16 +554,17 @@ build_secrets_bundle() { # stdout: env file consumed by the sandbox provisioner
 
 auth_summary() { # print what will be synced (no secret values)
   harvest_all
+  local ready=""
   case "$CLAUDE_MODE" in
-    token) ok "Claude Code: long-lived subscription token" ;;
-    creds) ok "Claude Code: local subscription credentials will be copied"
-           step "${C_DIM}tip: 'devflow token' creates a dedicated 1-year token (avoids logout races)${C_RESET}" ;;
+    token) ready="claude" ;;
+    creds) ready="claude" ;;
     none)  warn "Claude Code: no subscription auth found — run 'devflow token' (or log in to claude locally)" ;;
   esac
-  if [ -n "$CODEX_AUTH_B64" ]; then ok "Codex: ChatGPT sign-in will be copied"
+  if [ -n "$CODEX_AUTH_B64" ]; then ready="${ready}${ready:+ · }codex"
   else warn "Codex: no ~/.codex/auth.json — run 'codex' locally and sign in with ChatGPT first"; fi
-  if [ -n "$GH_TOKEN_VAL" ]; then ok "GitHub: gh token will be forwarded"
+  if [ -n "$GH_TOKEN_VAL" ]; then ready="${ready}${ready:+ · }github"
   else warn "GitHub: gh not authenticated — private clones/pushes won't work (gh auth login)"; fi
+  [ -z "$ready" ] || ok "auth ready: $ready"
   if [ "$AWS_ENABLED" = 1 ]; then
     if [ -n "$AWS_EXPIRATION" ]; then ok "AWS: temporary profile '$AWS_SOURCE_PROFILE' (expires $AWS_EXPIRATION)"
     else warn "AWS: static profile '$AWS_SOURCE_PROFILE' explicitly allowed"; fi
@@ -1494,6 +1599,23 @@ run_phase() { # NAME PHASE AGENT REPO BRANCH TASK_B64 [HARNESS]
   dt_run "$name" "DV_PHASE='$phase' DV_AGENT='$agent' DV_REPO='$repo' DV_BRANCH='$branch' DV_NAME='$name' DV_TASK_B64='$task_b64' DV_WORKROOT='$DEVFLOW_WORKROOT' DV_HARNESS='$harness' bash \"\$HOME/.devflow/stage/provision.sh\"" 0
 }
 
+run_phase_clean() { # successful phases stay quiet; warnings and failures remain visible
+  local output rc warnings
+  if output="$(run_phase "$@" 2>&1)"; then
+    warnings="$(printf '%s\n' "$output" | sed -n 's/^\[devflow\] warn: //p')"
+    if [ -n "$warnings" ]; then
+      while IFS= read -r line; do warn "$line"; done <<EOF
+$warnings
+EOF
+    fi
+    return 0
+  else
+    rc=$?
+  fi
+  [ -z "$output" ] || printf '%s\n' "$output" >&2
+  return "$rc"
+}
+
 provision_sandbox() { # NAME AGENT REPO BRANCH TASK HARNESS
   local name="$1" agent="$2" repo="$3" branch="$4" task="$5" harness="$6" task_b64=""
   [ -n "$task" ] && task_b64="$(printf '%s' "$task" | b64_encode)"
@@ -1501,20 +1623,20 @@ provision_sandbox() { # NAME AGENT REPO BRANCH TASK HARNESS
   step "uploading provisioner + syncing subscription auth…"
   upload_provisioner "$name" 1
 
-  step "installing tools (tmux, gh, claude, codex — output appears when done)…"
-  run_phase "$name" tools "$agent" "$repo" "$branch" "$task_b64" "$harness" \
+  step "installing tools (tmux, gh, claude, codex)…"
+  run_phase_clean "$name" tools "$agent" "$repo" "$branch" "$task_b64" "$harness" \
     || die "sandbox tools phase failed; task was not queued"
 
   step "applying auth…"
-  run_phase "$name" auth "$agent" "$repo" "$branch" "$task_b64" "$harness" \
+  run_phase_clean "$name" auth "$agent" "$repo" "$branch" "$task_b64" "$harness" \
     || die "sandbox auth phase failed; task was not queued"
 
   step "setting up workspace + starting agent session…"
-  run_phase "$name" workspace "$agent" "$repo" "$branch" "$task_b64" "$harness" \
+  run_phase_clean "$name" workspace "$agent" "$repo" "$branch" "$task_b64" "$harness" \
     || die "sandbox workspace phase failed; task was not queued"
 
   step "installing multi-agent harness ($harness)…"
-  run_phase "$name" harness "$agent" "$repo" "$branch" "$task_b64" "$harness" \
+  run_phase_clean "$name" harness "$agent" "$repo" "$branch" "$task_b64" "$harness" \
     || die "sandbox harness phase failed; task was not queued"
 }
 
@@ -1539,11 +1661,12 @@ verify_agent_task_started() { # NAME
 }
 
 queue_agent_task() { # NAME TASK [AGENT_OVERRIDE]
-  local name="$1" task="$2" agent_override="${3:-}"
+  local name="$1" task="$2" agent_override="${3:-}" start_output
   [ -n "$task" ] || return 0
   printf '%s' "$task" | dt_push_file "$name" "/tmp/.dv-task"
   step "starting detached agent task…"
-  if ! dt_run "$name" '"$HOME/.devflow/bin/dv-task-start" /tmp/.dv-task '"$agent_override" 60; then
+  if ! start_output="$(dt_run "$name" '"$HOME/.devflow/bin/dv-task-start" /tmp/.dv-task '"$agent_override" 60 2>&1)"; then
+    [ -z "$start_output" ] || printf '%s\n' "$start_output" >&2
     dt_run "$name" 'rm -f /tmp/.dv-task' 60 >/dev/null 2>&1 || true
     die "could not start task — another agent task may already be running (check: devflow status $name)"
   fi
@@ -1635,12 +1758,15 @@ DV_SCRIPTEXEC
 }
 
 run_user_script() { # NAME LOCAL_FILE — upload + launch; best-effort (caller warns)
-  local name="$1" file="$2"
+  local name="$1" file="$2" launch_output
   step "uploading ${C_BOLD}$(basename "$file")${C_RESET} → running in tmux window 'script'…"
   dt_push_file "$name" "/tmp/.dv-user-script" < "$file" || return 1
   emit_script_launcher | dt_push_file "$name" "/tmp/.dv-script" || return 1
   emit_script_exec | dt_push_file "$name" "/tmp/.dv-script-exec" || return 1
-  dt_run "$name" 'mkdir -p "$HOME/.devflow/bin" && mv /tmp/.dv-user-script "$HOME/.devflow/user-script.sh" && mv /tmp/.dv-script "$HOME/.devflow/bin/dv-script" && mv /tmp/.dv-script-exec "$HOME/.devflow/bin/dv-script-exec" && chmod +x "$HOME/.devflow/user-script.sh" "$HOME/.devflow/bin/dv-script" "$HOME/.devflow/bin/dv-script-exec" && "$HOME/.devflow/bin/dv-script"' 60 || return 1
+  if ! launch_output="$(dt_run "$name" 'mkdir -p "$HOME/.devflow/bin" && mv /tmp/.dv-user-script "$HOME/.devflow/user-script.sh" && mv /tmp/.dv-script "$HOME/.devflow/bin/dv-script" && mv /tmp/.dv-script-exec "$HOME/.devflow/bin/dv-script-exec" && chmod +x "$HOME/.devflow/user-script.sh" "$HOME/.devflow/bin/dv-script" "$HOME/.devflow/bin/dv-script-exec" && "$HOME/.devflow/bin/dv-script"' 60 2>&1)"; then
+    [ -z "$launch_output" ] || printf '%s\n' "$launch_output" >&2
+    return 1
+  fi
   ok "script running — watch: ${C_BOLD}devflow peek $name -w script${C_RESET} · log: devflow exec $name -- 'cat ~/.devflow/script.log'"
   return 0
 }
@@ -1916,9 +2042,8 @@ cmd_up() {
       [ "$with_daytona" = 1 ] && { forward_daytona "$name" || warn "daytona forwarding failed"; }
       [ -n "$script" ] && { run_user_script "$name" "$script" || warn "script launch failed"; }
       if [ -n "$task" ]; then
-        say "the agent is on it. it keeps working even when you're not attached."
-        step "poll state:     ${C_BOLD}devflow status $name${C_RESET}"
-        step "peek progress:  ${C_BOLD}devflow peek $name${C_RESET}"
+        ok "agent working in $name"
+        step "watch: ${C_BOLD}devflow peek $name${C_RESET} · state: ${C_BOLD}devflow status $name${C_RESET}"
       fi
       if [ "$attach" = 1 ] && [ -t 0 ]; then
         cmd_attach "$name"
@@ -1981,13 +2106,8 @@ cmd_up() {
   [ -n "$DEVFLOW_AUTO_HANDOFF" ] && { auto_handoff "$name" || true; }
 
   if [ -n "$task" ]; then
-    say "the agent is on it. it keeps working even when you're not attached."
-    step "poll state:     ${C_BOLD}devflow status $name${C_RESET}"
-    step "peek progress:  ${C_BOLD}devflow peek $name${C_RESET}"
-    step "join session:   ${C_BOLD}devflow attach $name${C_RESET}"
-  fi
-  if [ -n "$script" ]; then
-    step "script output:  ${C_BOLD}devflow peek $name -w script${C_RESET}"
+    ok "agent working in $name"
+    step "watch: ${C_BOLD}devflow peek $name${C_RESET} · state: ${C_BOLD}devflow status $name${C_RESET}"
   fi
 
   if [ "$attach" = 1 ] && [ -t 0 ]; then
@@ -2483,41 +2603,108 @@ cmd_exec() {
 }
 
 cmd_peek() {
-  local name="" lines=40 window=agent
+  local name="" lines=40 window=agent raw=0 prefer_final=1
   while [ $# -gt 0 ]; do
     case "$1" in
-      --lines) need_val "$1" "${2:-}"; lines="$2"; shift 2 ;;
+      -n|--lines) need_val "$1" "${2:-}"; lines="$2"; shift 2 ;;
+      --lines=*) lines="${1#--lines=}"; shift ;;
       -w|--window) need_val "$1" "${2:-}"; window="$2"; shift 2 ;;
-      *) name="$1"; shift ;;
+      --window=*) window="${1#--window=}"; shift ;;
+      --raw) raw=1; prefer_final=0; shift ;;
+      -h|--help)
+        printf 'usage: devflow peek [NAME] [-n|--lines N] [-w|--window W] [--raw]\n'
+        return 0 ;;
+      -*) die "unknown flag for peek: $1" ;;
+      *) [ -z "$name" ] || die "peek accepts at most one sandbox name"; name="$1"; shift ;;
     esac
   done
+  case "$lines" in ''|*[!0-9]*) die "peek --lines/-n must be a number from 1 to 1000" ;; esac
+  [ "$lines" -ge 1 ] && [ "$lines" -le 1000 ] \
+    || die "peek --lines/-n must be a number from 1 to 1000"
+  case "$window" in
+    ''|*[!a-zA-Z0-9_.-]*) die "peek window may contain only letters, numbers, dot, underscore, and hyphen" ;;
+  esac
   name="$(resolve_name "$name")" || exit 1
-  local st
+  local st payload remote history meta source agent content cleaned
   st="$(sandbox_state "$name")"
   if [ "$st" != "started" ]; then
     say "'$name' is ${st} — nothing running to peek at. ${C_DIM}devflow attach $name restarts it.${C_RESET}"
     return 0
   fi
-  say "$window pane in ${C_BOLD}$name${C_RESET} (last $lines lines):"
-  dt_run "$name" "tmux capture-pane -p -t dv:$window -S -$lines 2>/dev/null || echo '(no $window window — windows: agent/shell, plus codex/script when used)'" 60
+  history=$((lines * 4))
+  [ "$history" -le 4000 ] || history=4000
+  remote="window=$window; prefer_final=$prefer_final; history=$history; "
+  remote="${remote}"'run="$HOME/.devflow/run"; state="$(sed -n "s/^state=//p" "$run/status" 2>/dev/null | head -1)"; agent="$(sed -n "s/^agent=//p" "$run/status" 2>/dev/null | head -1)"; [ -n "$state" ] || state=not-started; [ -n "$agent" ] || agent=unknown; source=pane; if [ "$prefer_final" = 1 ] && [ "$window" = agent ] && [ "$agent" = codex ] && [ -s "$run/last-message.txt" ]; then case "$state" in completed|failed) source=final ;; esac; fi; if [ "$source" = pane ] && ! tmux list-windows -t dv -F "#{window_name}" 2>/dev/null | grep -Fxq "$window"; then source=missing; fi; printf "__DEVFLOW_PEEK_META__ state=%s agent=%s source=%s window=%s\n" "$state" "$agent" "$source" "$window"; printf "__DEVFLOW_PEEK_BEGIN__\n"; case "$source" in final) tail -n "$history" "$run/last-message.txt" ;; pane) tmux capture-pane -p -J -t "dv:$window" -S "-$history" 2>/dev/null ;; missing) printf "window %s is not running\n" "$window" ;; esac; printf "\n__DEVFLOW_PEEK_END__\n"'
+  if ! payload="$(dt_run "$name" "$remote" 60 2>&1)"; then
+    [ -z "$payload" ] || printf '%s\n' "$payload" >&2
+    die "could not read '$window' from '$name'"
+  fi
+  meta="$(printf '%s\n' "$payload" | sed -n '/^__DEVFLOW_PEEK_META__ /{p;q;}')"
+  if [ -z "$meta" ]; then
+    [ -z "$payload" ] || printf '%s\n' "$payload" >&2
+    die "could not read '$window' from '$name'"
+  fi
+  st="$(peek_meta_field "$meta" state)"
+  agent="$(peek_meta_field "$meta" agent)"
+  source="$(peek_meta_field "$meta" source)"
+  content="$(printf '%s\n' "$payload" | awk '$0 == "__DEVFLOW_PEEK_BEGIN__" { inside=1; next } $0 == "__DEVFLOW_PEEK_END__" { exit } inside { print }')"
+
+  if [ "$raw" = 1 ]; then
+    printf '%s\n' "$content" | trim_peek_padding | tail -n "$lines"
+    return 0
+  fi
+
+  printf '%s%s%s  %s%s · %s · %s%s\n' \
+    "$C_BOLD" "$name" "$C_RESET" "$C_DIM" "$window" "$agent" "$(ui_state_value "$st")" "$C_RESET"
+  [ "$source" != final ] || printf '%sfinal response%s\n' "$C_DIM" "$C_RESET"
+  printf '\n'
+  cleaned="$(printf '%s\n' "$content" | clean_peek_output | tail -n "$lines")"
+  if [ -n "$cleaned" ]; then printf '%s\n' "$cleaned"
+  else printf '%s(no output yet)%s\n' "$C_DIM" "$C_RESET"; fi
 }
 
 cmd_status() {
-  local name=""
+  local name="" raw=0
   while [ $# -gt 0 ]; do
     case "$1" in
-      -h|--help) echo "usage: devflow status [NAME]"; return 0 ;;
+      --raw) raw=1; shift ;;
+      -h|--help) echo "usage: devflow status [NAME] [--raw]"; return 0 ;;
       -*) die "unknown flag for status: $1" ;;
       *) [ -z "$name" ] || die "status accepts at most one sandbox name"; name="$1"; shift ;;
     esac
   done
   name="$(resolve_name "$name")" || exit 1
-  local st
+  local st details agent_state agent alive tmux_state started completed exit_code
   st="$(sandbox_state "$name")"
-  say "status for ${C_BOLD}$name${C_RESET}"
-  printf 'sandbox_state=%s\n' "$st"
+  if [ "$raw" = 1 ]; then printf 'sandbox_state=%s\n' "$st"
+  else ui_title "$name"; ui_row "sandbox" "$(ui_state_value "$st")"; fi
   [ "$st" = "started" ] || return 0
-  dt_run "$name" 'run="$HOME/.devflow/run"; field() { sed -n "s/^$1=//p" "$run/status" 2>/dev/null | head -1; }; state="$(field state)"; agent="$(field agent)"; pid="$(field pid)"; started="$(field started_at)"; completed="$(field completed_at)"; exit_code="$(field exit_code)"; prompt_sha="$(field prompt_sha256)"; alive=no; [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && alive=yes; [ "$state" = running ] && [ "$alive" = no ] && state=stale; [ -n "$state" ] || state=not-started; tmux_state=absent; tmux has-session -t dv 2>/dev/null && tmux_state=running; printf "agent_state=%s\nagent=%s\nprocess_alive=%s\ntmux_session=%s\nstarted_at=%s\ncompleted_at=%s\nexit_code=%s\nprompt_sha256=%s\n" "$state" "${agent:-unknown}" "$alive" "$tmux_state" "${started:-}" "${completed:-}" "${exit_code:-}" "${prompt_sha:-}"' 60
+  if ! details="$(dt_run "$name" 'run="$HOME/.devflow/run"; field() { sed -n "s/^$1=//p" "$run/status" 2>/dev/null | head -1; }; state="$(field state)"; agent="$(field agent)"; pid="$(field pid)"; started="$(field started_at)"; completed="$(field completed_at)"; exit_code="$(field exit_code)"; prompt_sha="$(field prompt_sha256)"; alive=no; [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && alive=yes; [ "$state" = running ] && [ "$alive" = no ] && state=stale; [ -n "$state" ] || state=not-started; tmux_state=absent; tmux has-session -t dv 2>/dev/null && tmux_state=running; printf "agent_state=%s\nagent=%s\nprocess_alive=%s\ntmux_session=%s\nstarted_at=%s\ncompleted_at=%s\nexit_code=%s\nprompt_sha256=%s\n" "$state" "${agent:-unknown}" "$alive" "$tmux_state" "${started:-}" "${completed:-}" "${exit_code:-}" "${prompt_sha:-}"' 60 2>&1)"; then
+    [ -z "$details" ] || printf '%s\n' "$details" >&2
+    die "could not read status from '$name'"
+  fi
+  if [ "$raw" = 1 ]; then
+    printf '%s\n' "$details" | awk -F= '
+      $1 == "agent_state" || $1 == "agent" || $1 == "process_alive" ||
+      $1 == "tmux_session" || $1 == "started_at" ||
+      $1 == "completed_at" || $1 == "exit_code" ||
+      $1 == "prompt_sha256" { print }
+    '
+    return 0
+  fi
+  agent_state="$(kv_field "$details" agent_state)"
+  agent="$(kv_field "$details" agent)"
+  alive="$(kv_field "$details" process_alive)"
+  tmux_state="$(kv_field "$details" tmux_session)"
+  started="$(kv_field "$details" started_at)"
+  completed="$(kv_field "$details" completed_at)"
+  exit_code="$(kv_field "$details" exit_code)"
+  ui_row "task" "$(ui_state_value "${agent_state:-unknown}")${C_DIM} · ${agent:-unknown}${C_RESET}"
+  ui_row "process" "$([ "$alive" = yes ] && printf alive || printf stopped)"
+  ui_row "session" "tmux ${tmux_state:-absent}"
+  [ -z "$started" ] || ui_row "started" "$started"
+  [ -z "$completed" ] || ui_row "finished" "$completed"
+  [ -z "$exit_code" ] || ui_row "exit" "$exit_code"
 }
 
 cmd_ls() {
@@ -2560,7 +2747,7 @@ cmd_stop() {
   fi
   local name
   name="$(resolve_name "${1:-}")" || exit 1
-  dt stop "$name"
+  dt_quiet stop "$name" || die "could not stop '$name'"
   ok "stopped '$name' — disk preserved; 'devflow attach $name' restarts and resumes the agent"
 }
 
@@ -2587,7 +2774,7 @@ cmd_rm() {
   fi
   name="$(resolve_name "$name")" || exit 1
   if [ "$force" != 1 ]; then confirm "delete sandbox '$name'? unpushed work in it is lost" || exit 1; fi
-  dt delete "$name"
+  dt_quiet delete "$name" || die "could not delete '$name'"
   ok "deleted '$name'"
 }
 
@@ -2847,7 +3034,7 @@ cmd_team_status() {
   json="$(team_sandboxes_json "$team")"
   count="$(printf '%s' "$json" | jq 'length')"
   [ "$count" != 0 ] || die "no team '$team'"
-  printf '%-18s %-24s %-10s %s\n' "ROLE" "SANDBOX" "SANDBOX" "TASK"
+  printf '%-18s %-24s %-10s %s\n' "ROLE" "SANDBOX" "STATE" "TASK"
   printf '%s' "$json" | jq -r '.[] | [
       ((.labels // {})["devflow.team.role"] // "?"),
       (.name // .id // "?"),
@@ -3321,8 +3508,8 @@ ${C_BOLD}start here${C_RESET}
 
 ${C_BOLD}daily driving${C_RESET}
   devflow attach [NAME]   (a)   reattach from anywhere — tmux keeps it alive
-  devflow status [NAME]         poll detached task state (queued/running/completed/failed)
-  devflow peek [NAME] [-w W]    glance at the agent (or window W, e.g. script)
+  devflow status [NAME]         readable sandbox + task health; --raw for scripts
+  devflow peek [NAME] [-w W]    clean recent output; -n N lines, --raw transcript
   devflow team status TEAM      inspect a one- or multi-sandbox agent team
   devflow ls                    list sandboxes
   devflow stop [NAME|--all]     stop (disk kept) — attach restarts + resumes

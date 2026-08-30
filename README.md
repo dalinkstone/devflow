@@ -14,6 +14,7 @@ dv setup
 ```sh
 dv up org/repo
 dv up org/repo -m "fix it" --detach
+dv peek
 dv status
 ```
 

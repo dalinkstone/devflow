@@ -14,6 +14,81 @@ printf 'daytona %s\n' "$*" >> "$FAKE_LOG"
 
 sbx_file() { printf '%s/%s.json' "$FAKE_STATE_DIR" "$1"; }
 
+emit_fake_peek_pane() { # WINDOW
+  local window="$1" i
+  case "${FAKE_PEEK_VARIANT:-default}" in
+    long)
+      printf '\n\n'
+      i=1
+      while [ "$i" -le 12 ]; do
+        printf 'peek-line-%02d\n' "$i"
+        i=$((i + 1))
+      done
+      printf '\n\n\n'
+      ;;
+    dirty)
+      # Exercise more than SGR: real CLIs also emit hyperlinks, titles,
+      # cursor movement, carriage-return spinners, and backspaces.
+      printf '\n\033[31mred agent update\033[0m\n'
+      printf '\033]8;;https://incidental.example\007useful link label\033]8;;\007\n'
+      printf '\033]0;incidental terminal title\007'
+      printf 'spinner one\rspinner done\n'
+      printf 'typoX\b fixed\n'
+      printf '\033[2K\033[1Aclean result\n\n'
+      ;;
+    completed)
+      printf '\nraw pane transcript\ntokens used: 153371\n\n'
+      ;;
+    noise)
+      printf '\nuseful work\n'
+      printf '2026-08-30T10:00:00Z ERROR codex_core::session: failed to record rollout\n'
+      printf 'items: thread 019f9be8-0766-7990-b5d4-890aab32b4e5 not found\n'
+      printf 'tokens used\n153,371\nfinished result\n\n'
+      ;;
+    empty)
+      printf '\n\n\n'
+      ;;
+    windows)
+      printf '\n%s window output\n\n' "$window"
+      ;;
+    *)
+      printf '\n\n⏺ fake agent output line\n❯ waiting for input\n\n\n'
+      ;;
+  esac
+}
+
+emit_fake_peek_final() {
+  printf '\nImplemented the requested change.\nAll tests pass.\n\n'
+}
+
+emit_fake_peek_envelope() { # SCRIPT
+  local script="$1" window=agent state agent source=pane prefer_final=1 detected_window
+  state="${FAKE_AGENT_STATE:-running}"
+  agent="${FAKE_AGENT_NAME:-codex}"
+  detected_window="$(printf '%s' "$script" | sed -n 's/^.*window=\([a-zA-Z0-9_.-]*\);.*$/\1/p')"
+  [ -z "$detected_window" ] || window="$detected_window"
+  case "$script" in
+    *window=codex*|*dv:codex*)   window=codex ;;
+    *window=script*|*dv:script*) window=script ;;
+    *window=shell*|*dv:shell*)   window=shell ;;
+  esac
+  case "$script" in
+    *prefer_final=0*|*DEVFLOW_PEEK_PREFER_FINAL=0*) prefer_final=0 ;;
+  esac
+  if [ "$prefer_final" = 1 ] && [ "$state" = completed ] \
+     && [ "$agent" = codex ] && [ "$window" = agent ]; then
+    source=final
+  fi
+  [ "${FAKE_PEEK_VARIANT:-}" != missing ] || source=missing
+  printf '__DEVFLOW_PEEK_META__ state=%s agent=%s source=%s window=%s\n' \
+    "$state" "$agent" "$source" "$window"
+  printf '__DEVFLOW_PEEK_BEGIN__\n'
+  if [ "$source" = final ]; then emit_fake_peek_final
+  elif [ "$source" = missing ]; then printf 'window %s is not running\n' "$window"
+  else emit_fake_peek_pane "$window"; fi
+  printf '__DEVFLOW_PEEK_END__\n'
+}
+
 cmd="${1:-}"; shift || true
 
 case "$cmd" in
@@ -212,7 +287,10 @@ case "$cmd" in
         echo "exit_code="
         echo "prompt_sha256=FAKE"
         exit 0 ;;
-      *capture-pane*) echo "⏺ fake agent output line"; echo "❯ waiting for input"; exit 0 ;;
+      *'__DEVFLOW_PEEK_META__'*'__DEVFLOW_PEEK_BEGIN__'*'__DEVFLOW_PEEK_END__'*)
+        emit_fake_peek_envelope "$script"
+        exit 0 ;;
+      *capture-pane*) emit_fake_peek_pane agent; exit 0 ;;
       *dv-ensure*)    exit 0 ;;
       *dv-task-start*) echo "agent task started in tmux window dv:agent"; exit 0 ;;
       *provision.sh*) echo "[devflow] fake provision phase ran"; exit 0 ;;

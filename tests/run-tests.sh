@@ -75,6 +75,7 @@ run_devflow() { # args… (stdin=/dev/null, captures stdout+stderr, sets RC/OUT)
       FAKE_AWS_STATIC="${FAKE_AWS_STATIC:-0}" \
       FAKE_DAYTONA_VERSION="${FAKE_DAYTONA_VERSION:-0.200.1}" \
       FAKE_UNPROVISIONED="${FAKE_UNPROVISIONED:-0}" FAKE_AGENT_STATE="${FAKE_AGENT_STATE:-running}" FAKE_FAIL_TOOLS="${FAKE_FAIL_TOOLS:-0}" \
+      FAKE_AGENT_NAME="${FAKE_AGENT_NAME:-codex}" FAKE_PEEK_VARIANT="${FAKE_PEEK_VARIANT:-default}" \
       DAYTONA_API_KEY="${TEST_DAYTONA_API_KEY:-}" \
       CLOUDFLARE_API_TOKEN="${TEST_CLOUDFLARE_API_TOKEN:-}" \
       CODEX_HOME="$T_HOME/.codex" \
@@ -137,7 +138,7 @@ assert_rc "up exits 0" "$RC" 0
 assert_contains "up announces sandbox" "$OUT" "spinning up dv-alpha"
 assert_contains "up prints stable web terminal" "$OUT" "https://alpha.devflow.sh"
 assert_not_contains "up hides Daytona's temporary preview host" "$OUT" "daytonaproxy01.net"
-assert_contains "up ran provision phases" "$OUT" "fake provision phase ran"
+assert_not_contains "up hides successful provision chatter" "$OUT" "fake provision phase ran"
 assert_contains "up final hint" "$OUT" "devflow attach dv-alpha"
 assert_not_contains "up stays quiet without auto-handoff" "$OUT" "auto-handoff"
 
@@ -217,12 +218,123 @@ assert_contains "up on existing prints the attach hint" "$OUT" "attach anytime"
 run_devflow peek
 assert_rc "peek (auto-resolve) exits 0" "$RC" 0
 assert_contains "peek shows agent pane" "$OUT" "fake agent output line"
+assert_contains "peek preserves Unicode agent markers" "$OUT" "⏺"
+
+# Peek is deliberately one-shot and composable: the default adds one compact
+# human header, while --raw is content-only. The fake returns a marker envelope
+# like the remote collector so these exercise local parsing/cleanup end to end.
+PEEK_HEADER="$(printf '%s\n' "$OUT" | head -1)"
+assert_contains "peek header names the sandbox" "$PEEK_HEADER" "dv-alpha"
+assert_contains "peek header shows task state" "$PEEK_HEADER" "running"
+assert_not_contains "peek hides remote metadata" "$OUT" "__DEVFLOW_PEEK_"
+assert_eq "peek trims repeated tmux blank padding" \
+  "$(printf '%s\n' "$OUT" | tail -n +3 | awk 'previous == "" && $0 == "" { count++ } { previous=$0 } END { print count + 0 }')" "0"
+assert_file_contains "peek uses a framed remote payload" "$T_LOG" "__DEVFLOW_PEEK_META__"
+
+FAKE_PEEK_VARIANT=long
+run_devflow peek dv-alpha --lines 3
+assert_rc "peek --lines exits 0" "$RC" 0
+assert_eq "peek --lines is an exact content cap" \
+  "$(printf '%s\n' "$OUT" | grep -c '^peek-line-' | tr -d ' ')" "3"
+assert_not_contains "peek --lines drops older output" "$OUT" "peek-line-09"
+assert_contains "peek --lines keeps first capped line" "$OUT" "peek-line-10"
+assert_contains "peek --lines keeps latest output" "$OUT" "peek-line-12"
+
+run_devflow peek dv-alpha -n 2 --raw
+assert_rc "peek -n --raw exits 0" "$RC" 0
+assert_eq "peek --raw is trimmed content only" "$OUT" \
+  "$(printf 'peek-line-11\npeek-line-12')"
+assert_file_contains "raw peek disables final-response selection" "$T_LOG" "prefer_final=0"
+unset FAKE_PEEK_VARIANT
+
+FAKE_PEEK_VARIANT=noise
+run_devflow peek dv-alpha
+assert_contains "peek keeps useful output around Codex noise" "$OUT" "useful work"
+assert_contains "peek keeps the result after Codex noise" "$OUT" "finished result"
+assert_not_contains "peek hides Codex rollout bookkeeping errors" "$OUT" "codex_core::session"
+assert_not_contains "peek hides Codex token footer" "$OUT" "153,371"
+unset FAKE_PEEK_VARIANT
+
+FAKE_PEEK_VARIANT=dirty
+run_devflow peek dv-alpha
+assert_rc "peek cleans terminal control sequences" "$RC" 0
+assert_contains "peek keeps styled text" "$OUT" "red agent update"
+assert_contains "peek keeps hyperlink label" "$OUT" "useful link label"
+assert_contains "peek keeps latest spinner text" "$OUT" "spinner done"
+assert_contains "peek keeps text after cursor controls" "$OUT" "clean result"
+assert_not_contains "peek strips escape bytes" "$OUT" "$(printf '\033')"
+assert_not_contains "peek strips carriage returns" "$OUT" "$(printf '\r')"
+assert_not_contains "peek strips backspaces" "$OUT" "$(printf '\b')"
+assert_not_contains "peek strips bells" "$OUT" "$(printf '\007')"
+assert_not_contains "peek strips OSC hyperlink targets" "$OUT" "incidental.example"
+assert_not_contains "peek strips OSC terminal titles" "$OUT" "incidental terminal title"
+unset FAKE_PEEK_VARIANT
+
+FAKE_PEEK_VARIANT=missing
+run_devflow peek dv-alpha --window preview
+assert_rc "missing peek window exits cleanly" "$RC" 0
+assert_contains "missing peek window is explained" "$OUT" "window preview is not running"
+assert_not_contains "missing peek window hides raw tmux errors" "$OUT" "can't find window"
+unset FAKE_PEEK_VARIANT
+
+FAKE_PEEK_VARIANT=empty
+run_devflow peek dv-alpha --raw
+assert_rc "empty raw peek exits 0" "$RC" 0
+assert_eq "empty raw peek has no padding" "$OUT" ""
+unset FAKE_PEEK_VARIANT
+
+FAKE_PEEK_VARIANT=windows
+run_devflow peek dv-alpha --window codex --raw
+assert_eq "peek routes the codex window" "$OUT" "codex window output"
+run_devflow peek dv-alpha -w script --raw
+assert_eq "peek routes the script window" "$OUT" "script window output"
+unset FAKE_PEEK_VARIANT
+
+FAKE_AGENT_STATE=completed
+FAKE_AGENT_NAME=codex
+FAKE_PEEK_VARIANT=completed
+run_devflow peek dv-alpha
+assert_rc "completed Codex peek exits 0" "$RC" 0
+assert_contains "completed peek header shows state" "$(printf '%s\n' "$OUT" | head -1)" "completed"
+assert_contains "completed Codex peek selects final response" "$OUT" "Implemented the requested change."
+assert_contains "completed Codex final response remains multiline" "$OUT" "All tests pass."
+assert_not_contains "completed Codex peek hides pane transcript" "$OUT" "tokens used"
+run_devflow peek dv-alpha --raw
+assert_eq "completed --raw forces pane content" "$OUT" \
+  "$(printf 'raw pane transcript\ntokens used: 153371')"
+unset FAKE_AGENT_STATE FAKE_AGENT_NAME FAKE_PEEK_VARIANT
+
+run_devflow peek dv-alpha --lines 0
+assert_rc "peek rejects zero lines" "$RC" 1
+assert_contains "zero lines error names the flag" "$OUT" "--lines"
+run_devflow peek dv-alpha --lines -2
+assert_rc "peek rejects negative lines" "$RC" 1
+assert_contains "negative lines error names the flag" "$OUT" "--lines"
+run_devflow peek dv-alpha -n nope
+assert_rc "peek rejects non-numeric lines" "$RC" 1
+assert_contains "non-numeric lines error names the flag" "$OUT" "-n"
+run_devflow peek dv-alpha --lines 1001
+assert_rc "peek rejects excessive lines" "$RC" 1
+assert_contains "excessive lines error gives the limit" "$OUT" "1000"
+run_devflow peek dv-alpha --window 'agent;echo-nope'
+assert_rc "peek rejects unsafe window names" "$RC" 1
+assert_contains "unsafe window error is concise" "$OUT" "window"
+assert_not_contains "unsafe window never reaches Daytona" "$(cat "$T_LOG")" "echo-nope"
+run_devflow peek dv-alpha --bogus
+assert_rc "peek rejects unknown flags" "$RC" 1
+assert_contains "unknown peek flag is identified" "$OUT" "--bogus"
 
 run_devflow status dv-alpha
 assert_rc "status exits 0" "$RC" 0
-assert_contains "status reports sandbox state" "$OUT" "sandbox_state=started"
-assert_contains "status reports detached task state" "$OUT" "agent_state=running"
-assert_contains "status reports tmux" "$OUT" "tmux_session=running"
+assert_contains "status reports sandbox state" "$OUT" "sandbox"
+assert_contains "status reports detached task state" "$OUT" "running · codex"
+assert_contains "status reports tmux" "$OUT" "tmux running"
+
+run_devflow status dv-alpha --raw
+assert_rc "status --raw exits 0" "$RC" 0
+assert_contains "raw status keeps sandbox key" "$OUT" "sandbox_state=started"
+assert_contains "raw status keeps task key" "$OUT" "agent_state=running"
+assert_contains "raw status keeps tmux key" "$OUT" "tmux_session=running"
 
 run_devflow stop
 assert_rc "stop exits 0" "$RC" 0
@@ -392,7 +504,8 @@ assert_contains "--detach prints status polling hint" "$OUT" "devflow status dv-
 
 run_devflow up --blank --agent codex -m "run the second detached task" --detach
 assert_rc "task on existing sandbox exits 0" "$RC" 0
-assert_contains "existing sandbox task starts detached" "$OUT" "agent task started in tmux"
+assert_contains "existing sandbox task starts quietly" "$OUT" "starting detached agent task"
+assert_not_contains "existing task hides remote acknowledgement" "$OUT" "agent task started in tmux"
 assert_contains "existing sandbox task start is verified" "$OUT" "agent task state: running"
 assert_eq "existing task uploaded intact" "$(extract_pushed_file /tmp/.dv-task)" "run the second detached task"
 assert_file_contains "existing task honors explicit Codex agent" "$T_LOG" "dv-task-start\" /tmp/.dv-task codex"
@@ -424,8 +537,15 @@ fresh_env join
 run_devflow up tester/beta --no-attach
 assert_rc "join-style up exits 0" "$RC" 0
 assert_file_contains "join style cached" "$T_CONFIG/config" "DEVFLOW_EXEC_STYLE=join"
-assert_contains "join-style provision phases ran" "$OUT" "fake provision phase ran"
+assert_not_contains "join-style hides successful provision chatter" "$OUT" "fake provision phase ran"
 assert_file_contains "join-style self-quoted exec" "$T_LOG" "bash -lc "
+
+FAKE_PEEK_VARIANT=long
+run_devflow peek dv-beta -n 2 --raw
+assert_rc "join-style peek exits 0" "$RC" 0
+assert_eq "join-style peek parses marker envelope" "$OUT" \
+  "$(printf 'peek-line-11\npeek-line-12')"
+unset FAKE_PEEK_VARIANT
 
 # ===========================================================================
 echo "# 7..config + validation + env precedence"
@@ -575,7 +695,7 @@ assert_file_contains "daytona cli install targeted" "$T_LOG" "daytona-linux-amd6
 
 run_devflow peek dv-lambda -w script
 assert_rc "peek -w exits 0" "$RC" 0
-assert_file_contains "peek -w targets the requested window" "$T_LOG" "dv:script"
+assert_file_contains "peek -w targets the requested window" "$T_LOG" "window=script"
 
 # browser login (no api key, OAuth token only) → devflow mints + caches a key
 BROWSER_CFG='{"activeProfile":"initial","profiles":[{"id":"initial","name":"initial","api":{"url":"https://fake.daytona.local/api","key":null,"token":{"accessToken":"FAKE_OAUTH"}},"activeOrganizationId":"org-123"}]}'

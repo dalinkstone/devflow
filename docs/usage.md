@@ -45,8 +45,8 @@ devflow never sets it and sandboxes never receive it.
 devflow up [REPO] [flags]      # create, recover, or submit work to a session
 devflow attach [NAME]          # rejoin from anywhere; restarts stopped sandboxes
 devflow web [NAME] [--port P]  # terminal: NAME.devflow.sh; app: NAME--P.devflow.sh
-devflow status [NAME]          # poll queued/running/completed/failed task state
-devflow peek [NAME] [-w WIN]   # view the agent's screen (or window: script)
+devflow status [NAME]          # readable sandbox, task, process, and tmux state
+devflow peek [NAME] [-w WIN]   # clean recent output (or window: script)
 devflow ls                     # list devflow sandboxes
 devflow stop [NAME|--all]      # stop compute billing; disk preserved
 devflow rm [NAME|--all] [-f]   # delete (unpushed work is lost)
@@ -57,6 +57,11 @@ uses that repo's origin; outside one you get a picker of your GitHub repos
 (fzf if installed). On an existing sandbox, `up` resumes incomplete/outdated
 provisioning. A supplied `--task` starts in a fresh detached agent window when
 no task is already running. `--fresh` still deletes and recreates the sandbox.
+
+`peek` joins terminal-wrapped lines, removes blank padding, and limits output
+exactly with `-n N` or `--lines N`. Completed Codex tasks show only their final
+response. Use `--raw` for the pane transcript. `status --raw` keeps the original
+`key=value` form for scripts.
 
 Sizes are Daytona's fixed classes (the API rejects raw cpu/memory/disk when a
 snapshot is involved — and even the default image is a snapshot). The old
@@ -241,8 +246,8 @@ devflow attach NAME        # daytona ssh + tmux auto-attach (primary)
 devflow web NAME [--open]  # terminal: https://NAME.devflow.sh
 devflow web NAME --port 3000 [--open]  # app: https://NAME--3000.devflow.sh
 devflow ssh NAME           # same, explicit
-devflow status NAME        # detached task state without attaching
-devflow peek NAME          # recent agent output without attaching
+devflow status NAME        # detached task state without attaching; --raw for scripts
+devflow peek NAME          # clean recent output; -n N, -w WINDOW, or --raw
 devflow mobile NAME        # phone hand-off: QR + every reconnect path (see below)
 devflow ssh-command NAME [--expires MIN]
                            # prints `ssh <token>@ssh.app.daytona.io` for
