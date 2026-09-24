@@ -107,6 +107,28 @@ Workers get separate filesystems and prompts that require distinct
 The link supplies private bidirectional networking and DNS, not shared disk.
 Deleting the leader cascades to linked workers.
 
+Linked teams also install the embedded Python-stdlib `dv-bus` helper. The
+leader hosts an authenticated HTTP inbox on port 8787; each role gets its own
+random credential in `~/.devflow/cluster/config.json` (0600). The leader alone
+holds the credential roster. Messages are stored in SQLite (0600), read without
+destructive consumption, and acknowledged explicitly. All team members can
+read the recent event feed, but only the recipient can acknowledge its inbox.
+The leader reloads the roster on each request so `team connect` can add members
+without dropping history. Private link requests bypass inherited HTTP proxies.
+
+`team ui` composes existing commands through optional Charm Gum or plain menus.
+Its watch view polls bounded `peek` output. Task assignment uses the existing
+task launcher; messages remain data and require agent inbox checks. `team
+handoff` captures finished detached-task context (or an explicit local brief)
+and starts a destination task, without migrating native agent session state.
+
+`demo` bypasses the agent provisioner and custom snapshots. Two disposable
+`daytona-small` sandboxes demonstrate isolated files and a real Python worker
+using the same message service. It polls short remote requests for live output
+because Daytona CLI exec buffers long-running output. EXIT/INT/TERM cleanup
+targets only this run's generated names; `--keep` applies to success only.
+No model subscriptions or Daytona control credentials are forwarded.
+
 ### Sandbox state directory (`~/.devflow/`)
 
 `env`, `aws.env`, `forwarded.env` (0600 forwarded env files),

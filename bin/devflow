@@ -13,7 +13,7 @@
 set -u
 set -o pipefail
 
-DEVFLOW_VERSION="0.7.0"
+DEVFLOW_VERSION="0.8.0"
 
 # ----------------------------------------------------------------------------
 # Config (precedence: environment > config file > built-in default)
@@ -2874,7 +2874,12 @@ devflow team up [REPO] [flags]
 Manage:
   devflow team ls
   devflow team status TEAM
+  devflow team ui TEAM [--once|--plain]
   devflow team task TEAM ROLE "new task"
+  devflow team send TEAM ROLE "message"
+  devflow team inbox TEAM [ROLE]
+  devflow team handoff TEAM FROM TO ["next task"] [--brief FILE] [--agent A]
+  devflow team connect TEAM       add/repair inboxes on an existing linked team
   devflow team peek TEAM [ROLE]
   devflow team attach TEAM [ROLE]
   devflow team rm TEAM [-f]
@@ -2965,11 +2970,31 @@ cmd_team_up() {
   else
     [ -n "$worker_specs" ] || die "linked mode needs --worker or --agents"
     need_cmd curl "install curl"
-    # Provision the durable leader first and forward Daytona control before its
-    # task starts. It can then inspect and manage every linked worker.
-    cmd_up "${common[@]}" --with-daytona
-
     local roster="" worker_spec decoded role worker_task child worker_prompt
+    local bus_names bus_roster saved_bus
+    bus_names="$(jq -n --arg parent "$parent" '{leader:$parent}')"
+    for worker_spec in $worker_specs; do
+      decoded="$(printf '%s' "$worker_spec" | b64_decode)"
+      role="${decoded%%	*}"
+      child="$(sanitize_name "dv-$team-$role")"
+      bus_names="$(printf '%s' "$bus_names" | jq --arg role "$role" --arg child "$child" '. + {($role):$child}')"
+    done
+    require_daytona_cli
+    dt_auth_check || die "not logged in to Daytona — run: devflow setup"
+    local slot_info slot_name slot_role
+    while IFS=$'\t' read -r slot_role slot_name; do
+      slot_info="$(dt_info_json "$slot_name")" || continue
+      printf '%s' "$slot_info" | jq -e --arg team "$team" --arg role "$slot_role" '.labels["devflow.team"] == $team and .labels["devflow.team.role"] == $role and .labels["devflow.team.mode"] == "linked"' >/dev/null \
+        || die "'$slot_name' belongs to another sandbox or team mode; choose a different --name"
+    done < <(printf '%s' "$bus_names" | jq -r 'to_entries[] | [.key,.value] | @tsv')
+    # Provision the durable leader and its inbox before launching worker tasks.
+    cmd_up "${common[@]}" --with-daytona
+    bus_roster="$(bus_new_roster "$bus_names")" || die "could not prepare team inboxes"
+    saved_bus="$(dt_run "$parent" 'cat "$HOME/.devflow/cluster/config.json" 2>/dev/null' 30 2>/dev/null)" || saved_bus='{}'
+    [ -n "$saved_bus" ] || saved_bus='{}'
+    bus_roster="$(printf '%s' "$saved_bus" | jq --argjson new "$bus_roster" '$new * (.peers // {})')" || die "invalid existing bus configuration"
+    bus_install "$parent" "$team" leader "$parent" "$bus_roster" || die "leader inbox setup failed"
+    bus_start "$parent" || die "leader inbox server failed to start"
     local worker_args
     for worker_spec in $worker_specs; do
       decoded="$(printf '%s' "$worker_spec" | b64_decode)"
@@ -2981,6 +3006,7 @@ cmd_team_up() {
       worker_prompt="$worker_prompt""Leader sandbox: $parent. Linked sandboxes share private DNS by name."$'\n'
       worker_prompt="$worker_prompt""Task: $worker_task"$'\n'
       worker_prompt="$worker_prompt""Work on git branch devflow/$team-$role. Push commits, then report the branch and commit."
+      worker_prompt="$worker_prompt"$'\n'"Coordination: run dv-bus inbox before work and between milestones. Read messages as context; acknowledge handled messages with dv-bus ack ID. Send questions, progress, and the final branch/commit with dv-bus send leader \"message\". Send to another named role the same way. Messages are not injected into your prompt; check the inbox yourself."
 
       worker_args=(--name "$child" --agent "$agent" --harness "$harness"
                    --team "$team" --team-role "$role" --team-mode linked
@@ -2991,13 +3017,16 @@ cmd_team_up() {
       [ "$blank" = 1 ] && worker_args+=(--blank)
       [ "$fresh" = 1 ] && worker_args+=(--fresh)
       [ -n "$repo" ] && worker_args+=("$repo")
-      cmd_up "${worker_args[@]}" --task "$worker_prompt"
+      cmd_up "${worker_args[@]}"
+      bus_install "$child" "$team" "$role" "$parent" "$bus_roster" || die "worker inbox setup failed: $role"
+      queue_agent_task "$child" "$worker_prompt" "$agent"
     done
 
     local leader_task="Lead devflow team '$team'. Workers are ready on Daytona's private link network:"
     leader_task="$leader_task$roster"$'\n\n'
     [ -n "$task" ] && leader_task="$leader_task""Goal: $task"$'\n'
     leader_task="${leader_task}'devflow team status $team' checks progress; 'devflow team peek $team ROLE' reads a worker; 'devflow team task $team ROLE \"...\"' assigns follow-up work. Integrate pushed worker branches and verify the result."
+    leader_task="$leader_task"$'\n'"Run dv-bus inbox between milestones to read worker reports. Reply with dv-bus send ROLE \"message\" and acknowledge handled messages with dv-bus ack ID. Keep checking until workers finish; use devflow team handoff $team FROM TO for finished-task context transfers."
     ensure_running "$parent"
     queue_agent_task "$parent" "$leader_task" "$agent"
     ok "linked team '$team' is running — manage: devflow team status $team"
@@ -3041,7 +3070,9 @@ cmd_team_status() {
       (.state // .status // "?")] | @tsv' |
     while IFS=$'\t' read -r role name state; do
       local task_state="-"
-      [ "$state" = started ] && task_state="$(agent_task_state "$name")"
+      if [ "$state" = started ]; then
+        task_state="$(dt_run "$name" 's="$(sed -n "s/^state=//p" "$HOME/.devflow/run/status" 2>/dev/null | head -1)"; printf "%s\n" "${s:-idle}"' 15 2>/dev/null)" || task_state=unavailable
+      fi
       printf '%-18s %-24s %-10s %s\n' "$role" "$name" "$state" "$task_state"
     done
 }
@@ -3056,7 +3087,12 @@ cmd_team_task() {
   local name
   name="$(team_role_sandbox "$team" "$role")" || exit 1
   ensure_running "$name"
-  queue_agent_task "$name" "$*"
+  team_require_idle "$name"
+  local task="$*"
+  if [ "$(dt_info_json "$name" | jq -r '.labels["devflow.team.mode"]')" = linked ]; then
+    task="$task"$'\n\n'"Check dv-bus inbox before work and between milestones. Report results with dv-bus send leader \"message\"; acknowledge handled messages with dv-bus ack ID."
+  fi
+  queue_agent_task "$name" "$task"
 }
 
 cmd_team_peek() {
@@ -3120,14 +3156,565 @@ cmd_team() {
     up|start|new) cmd_team_up "$@" ;;
     ls|list) cmd_team_ls "$@" ;;
     status|state) cmd_team_status "$@" ;;
+    ui|console) cmd_team_ui "$@" ;;
+    send|message) cmd_team_send "$@" ;;
+    inbox) cmd_team_inbox "$@" ;;
+    connect) cmd_team_connect "$@" ;;
+    handoff) cmd_team_handoff "$@" ;;
     task|run) cmd_team_task "$@" ;;
     peek|watch) cmd_team_peek "$@" ;;
     attach|open) cmd_team_attach "$@" ;;
     rm|delete|down) cmd_team_rm "$@" ;;
     help|-h|--help) usage_team ;;
-    *) die "unknown team command '$sub' (up|ls|status|task|peek|attach|rm)" ;;
+    *) die "unknown team command '$sub' (up|ls|status|ui|task|send|inbox|handoff|connect|peek|attach|rm)" ;;
   esac
 }
+
+# ----------------------------------------------------------------------------
+# Linked-team message bus (Python stdlib, shipped inside this single-file CLI)
+# ----------------------------------------------------------------------------
+emit_bus_script() {
+cat <<'DV_BUS_PY'
+#!/usr/bin/env python3
+"""Durable team inbox; messages are data, never executable commands."""
+import collections
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import re
+import sqlite3
+import sys
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
+from urllib.request import Request, build_opener, ProxyHandler
+
+CONFIG = Path(os.environ.get("DEVFLOW_BUS_CONFIG", str(Path.home() / ".devflow/cluster/config.json")))
+LIMIT = 65536
+
+
+def request(config, path, data=None):
+    body = None if data is None else json.dumps(data).encode()
+    req = Request(config["url"] + path, data=body, headers={
+        "Authorization": "Bearer " + config["token"], "Content-Type": "application/json"})
+    # Private link traffic must not go through an inherited public HTTP proxy.
+    with build_opener(ProxyHandler({})).open(req, timeout=10) as response:
+        return json.load(response)
+
+
+def serve(config):
+    os.umask(0o077)
+    db = sqlite3.connect(str(CONFIG.parent / "messages.db"))
+    db.row_factory = sqlite3.Row
+    db.execute("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, sender TEXT, recipient TEXT, body TEXT, created TEXT, ack INTEGER DEFAULT 0)")
+    db.commit()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass  # never log tokens or message bodies
+
+        def reply(self, code, value):
+            data = json.dumps(value).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def handle_request(self):
+            self.connection.settimeout(10)
+            header = self.headers.get("Authorization", "")
+            token = header[7:] if header.startswith("Bearer ") else ""
+            peers = json.loads(CONFIG.read_text())["peers"]
+            role = next((r for r, p in peers.items() if hmac.compare_digest(token, p["token"])), None)
+            if role is None:
+                return self.reply(401, {"error": "team credential required"})
+            path = urlsplit(self.path).path
+            if self.command == "GET":
+                if path == "/health":
+                    return self.reply(200, {"team": config["team"], "roles": list(peers), "state": "ready"})
+                if path == "/inbox":
+                    rows = db.execute("SELECT * FROM messages WHERE recipient=? AND ack=0 ORDER BY id LIMIT 100", (role,))
+                elif path == "/events":
+                    rows = db.execute("SELECT * FROM (SELECT * FROM messages ORDER BY id DESC LIMIT 30) ORDER BY id")
+                else:
+                    return self.reply(404, {"error": "unknown endpoint"})
+                return self.reply(200, [dict(row) for row in rows])
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= LIMIT:
+                    return self.reply(413, {"error": "message must fit in 64 KiB"})
+                data = json.loads(self.rfile.read(length))
+                if not isinstance(data, dict):
+                    raise ValueError("expected an object")
+                if path == "/send":
+                    to, body = data.get("to"), data.get("body")
+                    if not isinstance(to, str) or to not in peers:
+                        return self.reply(400, {"error": "unknown recipient"})
+                    if not isinstance(body, str) or not body.strip() or len(body.encode()) > 48000:
+                        return self.reply(400, {"error": "body must contain 1–48000 bytes"})
+                    cur = db.execute("INSERT INTO messages(sender,recipient,body,created) VALUES(?,?,?,?)", (role, to, body, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())))
+                    db.commit()
+                    return self.reply(201, {"id": cur.lastrowid, "from": role, "to": to})
+                if path == "/ack":
+                    message_id = data.get("id")
+                    if not isinstance(message_id, int):
+                        raise ValueError("invalid message id")
+                    cur = db.execute("UPDATE messages SET ack=1 WHERE id=? AND recipient=?", (message_id, role))
+                    db.commit()
+                    return self.reply(200 if cur.rowcount else 404, {"acknowledged": bool(cur.rowcount)})
+                return self.reply(404, {"error": "unknown endpoint"})
+            except (ValueError, TypeError, UnicodeError):
+                return self.reply(400, {"error": "invalid message"})
+
+        def do_GET(self):
+            self.handle_request()
+
+        def do_POST(self):
+            self.handle_request()
+
+    address = urlsplit(config["url"])
+    server = HTTPServer((config.get("bind", "0.0.0.0"), address.port or 8787), Handler)
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+        db.close()
+
+
+def text_report(body):
+    words = re.findall(r"\b\w+\b", body.lower())
+    common = collections.Counter(words).most_common(5)
+    return "Report: {} words; {} unique. Top words: {}. SHA256: {}".format(
+        len(words), len(set(words)), ", ".join("{} ({})".format(w, n) for w, n in common), hashlib.sha256(body.encode()).hexdigest()[:16])
+
+
+def demo_worker(config):
+    while True:
+        for message in request(config, "/inbox"):
+            body = message["body"]
+            for stage in ("received job over private DNS", "counting words in the worker filesystem"):
+                request(config, "/send", {"to": "leader", "body": "Job #{}: {}".format(message["id"], stage)})
+                time.sleep(1)
+            report = text_report(body)
+            (CONFIG.parent / "report.txt").write_text(report)
+            request(config, "/send", {"to": "leader", "body": "Job #{} complete. {}".format(message["id"], report)})
+            request(config, "/ack", {"id": message["id"]})
+        time.sleep(1)
+
+
+def context():
+    root = Path.home() / ".devflow/run"
+    status = (root / "status").read_text() if (root / "status").exists() else ""
+    if not re.search(r"^state=(completed|failed)$", status, re.M):
+        raise ValueError("handoff needs a completed or failed detached task; inspect or attach to the source first")
+    result = root / "last-message.txt"
+    if not result.exists() or not result.stat().st_size:
+        result = root / "agent.log"
+    chunks = ["# Agent handoff", "This is a context copy; native session state and files are not transferred."]
+    for label, path in (("Original task", root / "task.txt"), ("Latest result", result)):
+        if path.exists():
+            with path.open("rb") as handle:
+                handle.seek(max(0, path.stat().st_size - 16000))
+                chunks.extend(["## " + label, handle.read().decode("utf-8", errors="replace")])
+    import subprocess
+    workfile = Path.home() / ".devflow/workdir"
+    if workfile.exists():
+        workdir = workfile.read_text().strip()
+        for args in (("branch", "--show-current"), ("rev-parse", "HEAD"), ("status", "--short")):
+            p = subprocess.run(["git", "-C", workdir] + list(args), capture_output=True, text=True)
+            if p.returncode == 0:
+                chunks.append("git " + " ".join(args) + ":\n" + p.stdout[:4000])
+    print("\n\n".join(chunks))
+
+
+def main():
+    args = sys.argv[1:]
+    cmd = args.pop(0) if args else "inbox"
+    if cmd == "context":
+        context()
+        return
+    config = json.loads(CONFIG.read_text())
+    if cmd == "serve":
+        serve(config)
+        return
+    if cmd == "demo-worker":
+        demo_worker(config)
+        return
+    raw = "--json" in args
+    if raw:
+        args.remove("--json")
+    if cmd in ("inbox", "events", "health") and not args:
+        value = request(config, "/" + cmd)
+    elif cmd == "ack" and len(args) == 1:
+        value = request(config, "/ack", {"id": int(args[0])})
+    elif cmd == "send" and len(args) >= 2:
+        to = args.pop(0)
+        body = Path(args[1]).read_text() if len(args) == 2 and args[0] == "--file" else " ".join(args)
+        value = request(config, "/send", {"to": to, "body": body})
+    else:
+        raise ValueError('usage: dv-bus inbox|events|health [--json]; send ROLE "message"; send ROLE --file PATH; ack ID')
+    if raw or not isinstance(value, list):
+        print(json.dumps(value, ensure_ascii=True))
+    elif not value:
+        print("inbox empty" if cmd == "inbox" else "no messages yet")
+    else:
+        for row in value:
+            # JSON escaping makes terminal controls in agent text inert.
+            print("#{id} {sender} -> {recipient}  {created}".format(**row))
+            print("  " + json.dumps(row["body"], ensure_ascii=True))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, KeyError, HTTPError, URLError) as exc:
+        print("dv-bus: " + str(exc), file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
+DV_BUS_PY
+}
+
+bus_new_roster() { # JSON {role: sandbox} -> JSON {role: {sandbox, token}}
+  local names="$1" role name token roster='{}'
+  while IFS=$'\t' read -r role name; do
+    token="$(LC_ALL=C od -An -N32 -tx1 /dev/urandom | tr -d ' \n')" || return 1
+    [ "${#token}" = 64 ] || return 1
+    roster="$(printf '%s' "$roster" | jq --arg role "$role" --arg name "$name" --arg token "$token" '. + {($role): {sandbox:$name, token:$token}}')" || return 1
+  done < <(printf '%s' "$names" | jq -r 'to_entries[] | [.key,.value] | @tsv')
+  printf '%s' "$roster"
+}
+
+bus_install() { # NAME TEAM ROLE LEADER ROSTER
+  local name="$1" team="$2" role="$3" leader="$4" roster="$5" config
+  config="$(printf '%s' "$roster" | jq --arg team "$team" --arg role "$role" --arg leader "$leader" '
+    {team:$team, role:$role, token:.[$role].token,
+     url:("http://"+(if $role == "leader" then "127.0.0.1" else $leader end)+":8787")}
+    + (if $role == "leader" then {peers:.} else {} end)')" || return 1
+  dt_run "$name" 'umask 077; mkdir -p "$HOME/.devflow/cluster" "$HOME/.local/bin"; command -v python3 >/dev/null' 30 >/dev/null || return 1
+  emit_bus_script | dt_push_file "$name" /tmp/.dv-bus || return 1
+  printf '%s' "$config" | dt_push_file "$name" /tmp/.dv-bus-config || return 1
+  dt_run "$name" 'mv /tmp/.dv-bus "$HOME/.local/bin/dv-bus" && chmod 700 "$HOME/.local/bin/dv-bus" && mv /tmp/.dv-bus-config "$HOME/.devflow/cluster/config.json" && chmod 600 "$HOME/.devflow/cluster/config.json"' 30 >/dev/null || return 1
+}
+
+bus_start() { # LEADER
+  local name="$1"
+  dt_run "$name" 'umask 077; if ! "$HOME/.local/bin/dv-bus" health >/dev/null 2>&1; then nohup "$HOME/.local/bin/dv-bus" serve >"$HOME/.devflow/cluster/server.log" 2>&1 </dev/null & fi; i=0; until "$HOME/.local/bin/dv-bus" health >/dev/null 2>&1; do i=$((i+1)); [ "$i" -lt 10 ] || exit 1; sleep 1; done' 120 >/dev/null
+}
+
+team_bus_role() { # TEAM ROLE -> name (requires linked mode)
+  local name
+  name="$(team_role_sandbox "$1" "$2")" || return 1
+  [ "$(dt_info_json "$name" | jq -r '.labels["devflow.team.mode"]')" = linked ] \
+    || die "team inboxes need --mode linked"
+  printf '%s' "$name"
+}
+
+cmd_team_send() (
+  [ "$#" -ge 3 ] || die 'usage: devflow team send TEAM ROLE "message"'
+  local team role leader dest tmp remote
+  team="$(normalize_team_name "$1")"; role="$(normalize_team_role "$2")"; shift 2
+  dest="$(team_bus_role "$team" "$role")" || exit 1
+  leader="$(team_bus_role "$team" leader)" || exit 1
+  tmp="$(mktemp "${TMPDIR:-/tmp}/dv-message.XXXXXX")" || exit 1
+  remote="/tmp/$(basename "$tmp")"
+  trap 'rm -f "$tmp"' EXIT
+  printf 'Operator: %s' "$*" > "$tmp"
+  dt_push_file "$leader" "$remote" < "$tmp" || die "could not upload message"
+  dt_run "$leader" '"$HOME/.local/bin/dv-bus" send '"$role"' --file '"$remote"'; rc=$?; rm -f '"$remote"'; exit "$rc"' 30 || die "message delivery failed; run: devflow team connect $team"
+  ok "message saved for $role ($dest); agents read it with dv-bus inbox"
+)
+
+cmd_team_inbox() {
+  [ "$#" -ge 1 ] && [ "$#" -le 2 ] || die "usage: devflow team inbox TEAM [ROLE]"
+  local name team role
+  team="$(normalize_team_name "$1")"; role="$(normalize_team_role "${2:-leader}")"
+  name="$(team_bus_role "$team" "$role")" || exit 1
+  dt_run "$name" '"$HOME/.local/bin/dv-bus" inbox' 30 || die "inbox unavailable; run: devflow team connect $team"
+}
+
+cmd_team_connect() { # installs/repairs bus on an existing team, preserving credentials
+  [ "$#" = 1 ] || die "usage: devflow team connect TEAM"
+  local team leader json names roster saved role name
+  team="$(normalize_team_name "$1")"
+  leader="$(team_bus_role "$team" leader)" || exit 1
+  json="$(team_sandboxes_json "$team")"
+  names="$(printf '%s' "$json" | jq 'map({key:.labels["devflow.team.role"],value:.name}) | from_entries')"
+  ensure_running "$leader"
+  saved="$(dt_run "$leader" 'cat "$HOME/.devflow/cluster/config.json" 2>/dev/null' 30 2>/dev/null)" || saved='{}'
+  [ -n "$saved" ] || saved='{}'
+  roster="$(bus_new_roster "$names")" || die "could not prepare team credentials"
+  # Keep established identities, including roles temporarily absent after a stop.
+  roster="$(printf '%s' "$saved" | jq --argjson new "$roster" '$new * (.peers // {})')" || die "invalid existing bus configuration"
+  while IFS=$'\t' read -r role name; do
+    ensure_running "$name"
+    bus_install "$name" "$team" "$role" "$leader" "$roster" || die "could not connect '$role'"
+  done < <(printf '%s' "$names" | jq -r 'to_entries[] | [.key,.value] | @tsv')
+  bus_start "$leader" || die "team inbox server failed; inspect ~/.devflow/cluster/server.log in $leader"
+  ok "team inboxes ready — send: devflow team send $team ROLE \"message\""
+}
+
+cmd_team_handoff() {
+  [ "$#" -ge 3 ] || die 'usage: devflow team handoff TEAM FROM TO ["next task"] [--brief FILE] [--agent claude|codex]'
+  local team from to source dest context instruction='' brief='' agent=''
+  team="$(normalize_team_name "$1")"; from="$(normalize_team_role "$2")"; to="$(normalize_team_role "$3")"; shift 3
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --brief) need_val "$1" "${2:-}"; brief="$2"; shift 2 ;;
+      --agent) need_val "$1" "${2:-}"; agent="$2"; shift 2 ;;
+      -*) die "unknown handoff flag: $1" ;;
+      *) [ -z "$instruction" ] || die "quote the next task as one argument"; instruction="$1"; shift ;;
+    esac
+  done
+  case "$agent" in ''|claude|codex) ;; *) die "handoff agent must be claude or codex" ;; esac
+  [ "$from" != "$to" ] || die "handoff needs two different roles"
+  source="$(team_bus_role "$team" "$from")" || exit 1
+  dest="$(team_bus_role "$team" "$to")" || exit 1
+  if [ -n "$brief" ]; then
+    [ -f "$brief" ] || die "brief not found: $brief"
+    [ "$(wc -c < "$brief" | tr -d ' ')" -le 48000 ] || die "brief must fit in 48 KiB"
+    context="$(cat "$brief")"
+  else
+    context="$(dt_run "$source" '"$HOME/.local/bin/dv-bus" context' 30)" || die "source has no finished task to hand off; use --brief FILE for an interactive agent"
+  fi
+  [ -n "$context" ] || die "source returned no handoff context"
+  [ -n "$instruction" ] || instruction="Continue from this handoff. Verify the result and report back to $from with dv-bus send."
+  ensure_running "$dest"
+  team_require_idle "$dest"
+  queue_agent_task "$dest" "$(printf 'Handoff from %s to %s.\n\n%s\n\nNext task: %s\n\nUse dv-bus inbox and dv-bus send ROLE "message" to coordinate. Fetch pushed branches before using commits; uncommitted files have not moved.\n' "$from" "$to" "$context" "$instruction")" "$agent"
+  ok "handoff started: $from → $to (context copied; source retained)"
+}
+
+team_require_idle() { # do not replace a live interactive conversation
+  dt_run "$1" 'state="$(sed -n "s/^state=//p" "$HOME/.devflow/run/status" 2>/dev/null | head -1)"; pid="$(sed -n "s/^pid=//p" "$HOME/.devflow/run/status" 2>/dev/null | head -1)"; case "$state" in running|interactive) if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo "agent is still active" >&2; exit 2; fi ;; esac' 30 \
+    || die "destination '$1' is busy or unavailable; attach and finish/exit its current agent before assigning work"
+}
+
+console_choose() { # PROMPT OPTIONS... -> selected label
+  local prompt="$1" choice index=1 option
+  shift
+  if [ "${DV_PLAIN:-0}" != 1 ] && [ "${TERM:-dumb}" != dumb ] && have_cmd gum; then
+    gum choose --header "$prompt" "$@"
+  else
+    printf '\n%s\n' "$prompt" >&2
+    for option in "$@"; do printf '  %s) %s\n' "$index" "$option" >&2; index=$((index+1)); done
+    printf '> ' >&2
+    read -r choice || return 1
+    case "$choice" in ''|*[!0-9]*) return 1 ;; esac
+    [ "${#choice}" -le 2 ] || return 1
+    index=1
+    for option in "$@"; do [ "$choice" != "$index" ] || { printf '%s\n' "$option"; return 0; }; index=$((index+1)); done
+    return 1
+  fi
+}
+
+console_input() {
+  if [ "${DV_PLAIN:-0}" != 1 ] && [ "${TERM:-dumb}" != dumb ] && have_cmd gum; then
+    gum input --placeholder "$1"
+  else
+    printf '%s: ' "$1" >&2
+    local answer; read -r answer || return 1; printf '%s' "$answer"
+  fi
+}
+
+console_role() { # TEAM PROMPT
+  local roles role choices
+  roles="$(team_sandboxes_json "$1" | jq -r '.[].labels["devflow.team.role"]')" || return 1
+  [ -n "$roles" ] || return 1
+  choices=()
+  while read -r role; do choices+=("$role"); done <<< "$roles"
+  console_choose "$2" "${choices[@]}"
+}
+
+cmd_team_ui() {
+  [ "$#" -ge 1 ] && [ "$#" -le 2 ] || die "usage: devflow team ui TEAM [--once|--plain]"
+  local team action role text from to DV_PLAIN=0
+  team="$(normalize_team_name "$1")"
+  case "${2:-}" in --plain) DV_PLAIN=1 ;; ''|--once) ;; *) die "unknown team ui option: $2" ;; esac
+  while :; do
+    ui_title "team $team"
+    cmd_team_status "$team"
+    if [ "${2:-}" = --once ] || [ ! -t 0 ] || [ ! -t 1 ]; then return; fi
+    action="$(console_choose "Team controls" Refresh Watch Peek Inbox Message Assign Handoff Attach Quit)" || return 0
+    case "$action" in
+      Quit) return 0 ;;
+      Refresh) continue ;;
+      Watch)
+        role="$(console_role "$team" 'Role to watch')" || continue
+        role="$(normalize_team_role "$role")"
+        local watched
+        watched="$(team_role_sandbox "$team" "$role")" || continue
+        printf 'refreshing every 3s; press any key to return\n'
+        while :; do
+          (cmd_peek "$watched" -n 12) || break
+          IFS= read -r -s -n 1 -t 3 _ && break
+        done ;;
+      Handoff)
+        from="$(console_role "$team" 'Hand off from')" || continue
+        to="$(console_role "$team" 'Hand off to')" || continue
+        text="$(console_input 'Next task')" || continue
+        (cmd_team_handoff "$team" "$from" "$to" "$text") || true ;;
+      *)
+        role="$(console_role "$team" 'Choose an agent')" || continue
+        [ -n "$role" ] || continue
+        case "$action" in
+          Peek) (cmd_team_peek "$team" "$role") || true ;;
+          Inbox) (cmd_team_inbox "$team" "$role") || true ;;
+          Attach) (cmd_team_attach "$team" "$role") || true ;;
+          Message|Assign)
+            text="$(console_input 'Message / task')" || continue
+            [ -n "$text" ] || continue
+            if [ "$action" = Message ]; then (cmd_team_send "$team" "$role" "$text") || true
+            else (cmd_team_task "$team" "$role" "$text") || true; fi ;;
+        esac ;;
+    esac
+  done
+}
+
+usage_demo() {
+  cat <<'DV_DEMO_HELP'
+devflow demo [--yes] [--plain] [--keep] [--text "text to analyze"]
+
+Two real Daytona sandboxes: a dispatcher and a linked text-report worker.
+See filesystem isolation, private-network messages, progress, and results.
+No AI subscription needed. Uses built-in daytona-small images.
+
+  --yes     run one job without prompts (required when stdin is not a terminal)
+  --plain   numbered menus instead of optional Charm Gum controls
+  --keep    keep sandboxes after success; otherwise delete them on exit
+  --text    input for the first report
+
+Compute is billed by Daytona. Both sandboxes auto-stop after 15 idle minutes;
+stopping the linked worker deletes it. Failed/interrupted runs clean up even
+with --keep. Cleanup failures print the exact sandbox names to remove.
+DV_DEMO_HELP
+}
+
+demo_cleanup() { # only names created for this invocation
+  local rc="$?" failed=0 name deletion_error
+  trap - EXIT INT TERM
+  if [ "$demo_keep" = 1 ] && [ "$rc" = 0 ]; then
+    say "kept $demo_parent and $demo_child (15m auto-stop; worker deletes on stop)"
+    say "cleanup: devflow team rm $demo_team"
+    return 0
+  fi
+  for name in "$demo_parent" "$demo_child"; do
+    [ -n "$name" ] || continue
+    if ! deletion_error="$(dt delete "$name" 2>&1)"; then
+      local remaining
+      remaining="$(dt list -f json 2>/dev/null)" || remaining='null'
+      if ! printf '%s' "$remaining" | jq -e --arg name "$name" 'type == "array" and all(.[]; .name != $name)' >/dev/null 2>&1; then
+        warn "cleanup failed: devflow rm $name --force"
+        [ -z "$deletion_error" ] || printf '%s\n' "$deletion_error" >&2
+        failed=1
+      fi
+    fi
+  done
+  [ "$failed" = 1 ] || ok "demo sandboxes deleted; demo files were disposable"
+  [ "$rc" != 0 ] || rc="$failed"
+  exit "$rc"
+}
+
+demo_job() { # PARENT TEXT — poll small API responses, since daytona exec buffers
+  local parent="$1" text="$2" sent id events new last=0 tries=0
+  printf '%s' "$text" | dt_push_file "$parent" /tmp/.dv-demo-input || return 1
+  sent="$(dt_run "$parent" '"$HOME/.local/bin/dv-bus" send worker --file /tmp/.dv-demo-input' 30)" || return 1
+  id="$(printf '%s' "$sent" | jq -er '.id | numbers')" || return 1
+  step "job #$id sent; polling the leader inbox for worker progress…"
+  while [ "$tries" -lt 45 ]; do
+    events="$(dt_run "$parent" '"$HOME/.local/bin/dv-bus" events --json' 30)" || return 1
+    new="$(printf '%s' "$events" | jq -c --argjson last "$last" '.[] | select(.id > $last)')" || return 1
+    if [ -n "$new" ]; then
+      printf '%s\n' "$new" | jq -r '"  #\(.id) \(.sender) → \(.recipient)  \(.body | @json)"'
+      last="$(printf '%s\n' "$new" | jq -s 'map(.id)|max')"
+    fi
+    if printf '%s' "$events" | jq -e --arg prefix "Job #$id complete." 'any(.[]; .sender == "worker" and (.body|startswith($prefix)))' >/dev/null; then
+      ok "result delivered over the link; your laptop only displayed progress"
+      return 0
+    fi
+    tries=$((tries+1)); sleep 1
+  done
+  warn "worker timed out; inspect ~/.devflow/cluster/worker.log in the worker sandbox"
+  return 1
+}
+
+cmd_demo() (
+  local yes=0 DV_PLAIN=0 demo_keep=0 demo_parent="" demo_child="" demo_team=""
+  local text='Sandboxes let agents run code. Linked sandboxes let agents work together. Each sandbox keeps its own files.'
+  local action roster output suffix
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --yes|-y) yes=1; shift ;;
+      --plain) DV_PLAIN=1; shift ;;
+      --keep) demo_keep=1; shift ;;
+      --text) need_val "$1" "${2:-}"; text="$2"; shift 2 ;;
+      --help|-h) usage_demo; return 0 ;;
+      *) die "unknown demo option: $1 (see: devflow demo --help)" ;;
+    esac
+  done
+  [ "$yes" = 1 ] || [ -t 0 ] || die "use --yes for a noninteractive demo"
+  require_daytona_cli
+  need_cmd jq "brew install jq"
+  dt_auth_check || die "not logged in — run: daytona login"
+  ui_title "devflow demo · two computers, one job"
+  say "Dispatcher → private network → worker → report"
+  say "Creates two small Daytona sandboxes; normal compute charges apply."
+  say "Deletes resources on exit unless --keep. No repository or subscription credentials are copied."
+  if [ "$yes" != 1 ]; then
+    action="$(console_choose 'Ready?' 'Create sandboxes' Cancel)" || return 0
+    [ "$action" = 'Create sandboxes' ] || return 0
+  fi
+  suffix="$(date +%s)-$RANDOM"
+  demo_team="demo-$suffix"
+  # Names must also fit the team-name limit used by team commands.
+  demo_team="$(normalize_team_name "$demo_team")"
+  demo_parent="dv-$demo_team"; demo_child="$demo_parent-worker"
+  [ "$(sandbox_state "$demo_parent")" = missing ] && [ "$(sandbox_state "$demo_child")" = missing ] || die "demo name collision; retry"
+  trap demo_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  step "1/4 · creating dispatcher $demo_parent"
+  local create_args
+  create_args=(create "--name=$demo_parent" --snapshot=daytona-small --auto-stop=15
+    --label devflow=1 --label "devflow.team=$demo_team" --label devflow.team.role=leader --label devflow.team.mode=linked --label devflow.agent=none)
+  [ -z "$DEVFLOW_TARGET" ] || create_args+=("--target=$DEVFLOW_TARGET")
+  if ! output="$(dt "${create_args[@]}" 2>&1)"; then printf '%s\n' "$output" >&2; die "demo dispatcher creation failed"; fi
+  wait_for_state "$demo_parent" started 120
+  step "creating linked worker $demo_child"
+  create_linked_sandbox "$demo_child" "$demo_parent" 15 daytona-small none core '' "$demo_team" worker linked
+  wait_for_state "$demo_child" started 120
+  step "2/4 · proving filesystems are separate"
+  dt_run "$demo_parent" 'printf dispatcher > /tmp/devflow-demo-owner' 30 || exit 1
+  dt_run "$demo_child" 'test ! -e /tmp/devflow-demo-owner && printf worker > /tmp/devflow-demo-owner' 30 || die "filesystem isolation check failed"
+  output="$(dt_run "$demo_parent" 'cat /tmp/devflow-demo-owner' 30)" || exit 1
+  [ "$output" = dispatcher ] || die "dispatcher file unexpectedly changed"
+  ok "same path, different contents: worker changes stay inside the worker"
+  step "3/4 · connecting the private message inbox"
+  roster="$(bus_new_roster "$(jq -n --arg p "$demo_parent" --arg c "$demo_child" '{leader:$p,worker:$c}')")" || exit 1
+  bus_install "$demo_parent" "$demo_team" leader "$demo_parent" "$roster" || die "dispatcher setup failed"
+  bus_start "$demo_parent" || die "inbox service failed to start"
+  bus_install "$demo_child" "$demo_team" worker "$demo_parent" "$roster" || die "worker setup failed"
+  dt_run "$demo_child" '"$HOME/.local/bin/dv-bus" health && { umask 077; nohup "$HOME/.local/bin/dv-bus" demo-worker >"$HOME/.devflow/cluster/worker.log" 2>&1 </dev/null & }' 30 || die "worker cannot reach dispatcher over private DNS"
+  step "4/4 · dispatching a text report (real Python worker, no LLM)"
+  demo_job "$demo_parent" "$text" || exit 1
+  say "The worker saved report.txt on its own disk and sent the result to the leader."
+  if [ "$yes" != 1 ]; then
+    while :; do
+      action="$(console_choose 'Explore the sandboxes' 'Run another job' 'Read worker report' 'Read messages' Finish)" || break
+      case "$action" in
+        'Run another job') text="$(console_input 'Text to analyze')" || continue; [ -n "$text" ] || continue; demo_job "$demo_parent" "$text" || exit 1 ;;
+        'Read worker report') dt_run "$demo_child" 'cat "$HOME/.devflow/cluster/report.txt"' 30 || exit 1 ;;
+        'Read messages') dt_run "$demo_parent" '"$HOME/.local/bin/dv-bus" events' 30 || exit 1 ;;
+        Finish) break ;;
+      esac
+    done
+  fi
+  ok "demo complete · isolated files, linked networking, remote work, returned results"
+)
 
 cmd_token() {
   need_cmd claude "curl -fsSL https://claude.ai/install.sh | bash"
@@ -3494,6 +4081,7 @@ ${C_CYAN}${C_BOLD}devflow${C_RESET} $DEVFLOW_VERSION — agentic cloud dev sessi
 
 ${C_BOLD}start here${C_RESET}
   devflow setup                 one-time: accounts + auth (no API keys needed)
+  devflow demo                  guided linked-sandbox walkthrough; --yes to automate
   devflow up [REPO]             spin up Claude Code / Codex on a repo & attach
   devflow up -m "fix bug X" --detach       fire-and-forget, close your laptop
   devflow team up [REPO] --task "build X"  run a multi-agent workflow in one
@@ -3511,6 +4099,7 @@ ${C_BOLD}daily driving${C_RESET}
   devflow status [NAME]         readable sandbox + task health; --raw for scripts
   devflow peek [NAME] [-w W]    clean recent output; -n N lines, --raw transcript
   devflow team status TEAM      inspect a one- or multi-sandbox agent team
+  devflow team ui TEAM          console: watch, assign, message, hand off, attach
   devflow ls                    list sandboxes
   devflow stop [NAME|--all]     stop (disk kept) — attach restarts + resumes
   devflow rm [NAME|--all]       delete sandbox
@@ -3563,6 +4152,7 @@ main() {
     rm|delete|down)       cmd_rm "$@" ;;
     sync)                 cmd_sync "$@" ;;
     team|teams)           cmd_team "$@" ;;
+    demo)                 cmd_demo "$@" ;;
     token)                cmd_token "$@" ;;
     setup|init)           cmd_setup "$@" ;;
     doctor|check)         cmd_doctor "$@" ;;
@@ -3571,6 +4161,7 @@ main() {
     dashboard)            cmd_dashboard "$@" ;;
     __provision-script)   emit_provision_script ;;
     __dockerfile)         emit_dockerfile ;;
+    __bus-script)         emit_bus_script ;;
     version|--version|-v) echo "devflow $DEVFLOW_VERSION" ;;
     help|--help|-h)       usage ;;
     *)                    err "unknown command: $cmd"; echo; usage; exit 1 ;;

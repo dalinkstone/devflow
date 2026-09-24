@@ -76,6 +76,8 @@ run_devflow() { # args… (stdin=/dev/null, captures stdout+stderr, sets RC/OUT)
       FAKE_DAYTONA_VERSION="${FAKE_DAYTONA_VERSION:-0.200.1}" \
       FAKE_UNPROVISIONED="${FAKE_UNPROVISIONED:-0}" FAKE_AGENT_STATE="${FAKE_AGENT_STATE:-running}" FAKE_FAIL_TOOLS="${FAKE_FAIL_TOOLS:-0}" \
       FAKE_AGENT_NAME="${FAKE_AGENT_NAME:-codex}" FAKE_PEEK_VARIANT="${FAKE_PEEK_VARIANT:-default}" \
+      FAKE_BUS_FAIL="${FAKE_BUS_FAIL:-0}" \
+      FAKE_DELETE_FAIL="${FAKE_DELETE_FAIL:-0}" FAKE_TASK_BUSY="${FAKE_TASK_BUSY:-0}" \
       DAYTONA_API_KEY="${TEST_DAYTONA_API_KEY:-}" \
       CLOUDFLARE_API_TOKEN="${TEST_CLOUDFLARE_API_TOKEN:-}" \
       CODEX_HOME="$T_HOME/.codex" \
@@ -734,6 +736,10 @@ run_devflow team task alpha leader "do a follow-up"
 assert_rc "team task exits 0" "$RC" 0
 assert_eq "team follow-up task uploaded intact" "$(extract_pushed_file /tmp/.dv-task)" "do a follow-up"
 
+run_devflow team up tester/teamrepo --name alpha --mode linked --agents 2 --task "another team"
+assert_rc "linked team cannot take over another team mode" "$RC" 1
+assert_eq "team collision leaves existing sandbox alone" "$(jq -r '.labels["devflow.team.mode"]' "$T_STATE/dv-alpha.json")" one
+
 run_devflow team rm alpha --force
 assert_rc "one-sandbox team rm exits 0" "$RC" 0
 assert_eq "one-sandbox team rm deletes sandbox" "$(find "$T_STATE" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')" "0"
@@ -758,9 +764,84 @@ run_devflow team peek swarm worker-1
 assert_rc "linked team peek exits 0" "$RC" 0
 assert_contains "linked team peek targets worker" "$OUT" "dv-swarm-worker-1"
 
+run_devflow team ui swarm --once
+assert_rc "team console once exits without input" "$RC" 0
+assert_contains "team console shows roster" "$OUT" "worker-2"
+
+run_devflow team send swarm worker-1 'Review "quotes" and $(not-a-command)'
+assert_rc "team message exits 0" "$RC" 0
+assert_contains "team message explains inbox semantics" "$OUT" "agents read it with dv-bus inbox"
+assert_not_contains "team messaging does not echo bus tokens" "$OUT" '"token"'
+
+run_devflow team inbox swarm worker-1
+assert_rc "worker inbox can be read from laptop" "$RC" 0
+run_devflow team send swarm missing "hello"
+assert_rc "messages reject unknown role" "$RC" 1
+
+run_devflow team handoff swarm worker-1 worker-2
+assert_rc "handoff refuses unfinished source" "$RC" 1
+FAKE_AGENT_STATE=completed
+FAKE_TASK_BUSY=1
+run_devflow team handoff swarm worker-1 worker-2
+assert_rc "handoff refuses a busy destination" "$RC" 1
+FAKE_TASK_BUSY=0
+run_devflow team handoff swarm worker-1 worker-2 "verify the result"
+assert_rc "finished task handoff starts destination" "$RC" 0
+assert_contains "handoff carries source context" "$(extract_pushed_file /tmp/.dv-task)" "Original task: build feature"
+assert_contains "handoff carries next instruction" "$(extract_pushed_file /tmp/.dv-task)" "verify the result"
+assert_contains "handoff explains files remain separate" "$(extract_pushed_file /tmp/.dv-task)" "uncommitted files have not moved"
+FAKE_AGENT_STATE=running
+printf 'Explicit interactive session summary\n' > "$T_CWD/brief.md"
+run_devflow team handoff swarm worker-1 worker-2 --brief brief.md --agent claude
+assert_rc "explicit brief supports interactive source and another agent" "$RC" 0
+assert_contains "explicit brief reaches destination" "$(extract_pushed_file /tmp/.dv-task)" "Explicit interactive session summary"
+
+run_devflow team connect swarm
+assert_rc "existing linked teams can get inboxes" "$RC" 0
+assert_file_contains "worker inbox helper installed" "$T_LOG" '.local/bin/dv-bus'
+
 run_devflow team rm swarm --force
 assert_rc "linked team rm exits 0" "$RC" 0
 assert_eq "linked parent deletion cascades workers" "$(find "$T_STATE" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')" "0"
+
+echo "# demo: disposable linked sandboxes"
+fresh_env argv
+run_devflow demo --help
+assert_rc "demo help needs no infrastructure" "$RC" 0
+run_devflow demo
+assert_rc "noninteractive demo requires explicit yes" "$RC" 1
+assert_eq "declined demo creates nothing" "$(find "$T_STATE" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')" "0"
+printf 'DEVFLOW_SNAPSHOT=missing-old-snapshot\n' > "$T_CONFIG/config"
+run_devflow demo --yes --plain
+assert_rc "demo finishes" "$RC" 0
+assert_contains "demo shows isolation proof" "$OUT" "same path, different contents"
+assert_contains "demo shows worker result" "$OUT" "Job #1 complete"
+assert_eq "demo cleans up both sandboxes" "$(find "$T_STATE" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')" "0"
+assert_file_contains "demo bypasses stale configured snapshots" "$T_LOG" '--snapshot=daytona-small'
+assert_not_contains "demo never provisions subscription auth" "$(cat "$T_LOG")" '.dv-secrets'
+assert_not_contains "demo never mints account keys" "$(cat "$T_LOG")" '/api-keys'
+FAKE_BUS_FAIL=1
+run_devflow demo --yes --keep
+assert_rc "failed job fails demo even with keep" "$RC" 1
+assert_eq "failed demo removes resources even with keep" "$(find "$T_STATE" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')" "0"
+FAKE_BUS_FAIL=0
+run_devflow demo --yes --keep
+assert_rc "successful demo can keep resources" "$RC" 0
+assert_eq "keep preserves both demo sandboxes" "$(find "$T_STATE" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')" "2"
+assert_contains "keep prints cleanup command" "$OUT" 'devflow team rm demo-'
+
+fresh_env argv
+FAKE_DELETE_FAIL=1
+run_devflow demo --yes
+assert_rc "cleanup failure makes demo fail" "$RC" 1
+assert_contains "cleanup failure prints recoverable targets" "$OUT" 'cleanup failed: devflow rm dv-demo-'
+assert_not_contains "cleanup failure never claims deletion" "$OUT" 'demo sandboxes deleted'
+FAKE_DELETE_FAIL=0
+
+fresh_env join
+run_devflow demo --yes
+assert_rc "demo works with join-style exec" "$RC" 0
+assert_eq "join demo cleans resources" "$(find "$T_STATE" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')" "0"
 
 # ===========================================================================
 echo "# 12..AWS + explicit secret forwarding"

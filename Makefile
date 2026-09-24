@@ -26,6 +26,8 @@ lint:
 
 test:
 	bash tests/run-tests.sh
+	python3 tests/test_bus.py
+	python3 tests/test_console.py
 
 test-docker:
 	bash tests/docker-provision-test.sh

@@ -31,6 +31,13 @@ make test-docker   # real provisioner end-to-end (~5-8 min, network + Docker);
 All green before every commit. CI runs the same three on push/PR
 (macos-latest runs the suite under bash 3.2 — that's deliberate).
 
+`make test` also runs `tests/test_bus.py` with Python 3: real loopback HTTP
+tests for the embedded team inbox, role authentication, persistence, handoff
+capture, and the demo worker. It needs permission to bind localhost, but no
+external services. `bin/devflow __bus-script` extracts the tested payload.
+`tests/test_console.py` drives the demo through a pseudo-terminal, including
+Ctrl-C cleanup and (when installed) the actual Gum menus.
+
 ## Hard invariants (violating these breaks users)
 
 1. **bash 3.2 compatibility** in `bin/devflow` and `tests/*`:

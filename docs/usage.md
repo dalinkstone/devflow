@@ -217,7 +217,8 @@ Linked mode creates one persistent leader plus one ephemeral Daytona sandbox
 per worker. Daytona gives the group a private bidirectional network and DNS by
 sandbox name. Filesystems stay separate, so workers use
 `devflow/<team>-<role>` branches and push commits for the leader to integrate.
-The leader receives Daytona/devflow control after all workers are ready.
+The leader receives Daytona/devflow control; each worker gets a message client
+before its assigned task starts.
 
 Linked workers are deleted when stopped and deleting the leader cascades to
 the workers. This follows Daytona's
@@ -238,6 +239,81 @@ devflow team rm release                  # whole team
 Useful creation flags: `--size`, `--snapshot`, `--branch`, `--auto-stop`,
 `--fresh`, and `--attach`. Each linked agent consumes its own Daytona compute
 and model subscription capacity.
+
+### Team console and messages
+
+```bash
+devflow team ui release             # controls + live output; optional: brew install gum
+devflow team ui release --plain     # numbered menus
+devflow team ui release --once      # one status view, suitable for scripts
+devflow team send release api "Please review the new tests"
+devflow team inbox release api
+devflow team connect release        # add/repair inboxes on an older linked team
+```
+
+New linked teams get a durable message service on the leader, port 8787.
+Each member receives a role credential and these commands inside its sandbox:
+
+```bash
+dv-bus inbox                       # unread messages; reading does not remove them
+dv-bus send leader "Tests passed; branch devflow/release-api, commit abc123"
+dv-bus send tests --file review.md  # pass a brief or result (up to 48 KiB)
+dv-bus ack 12                      # mark a handled message read
+dv-bus events                      # recent team activity
+```
+
+Messages use Daytona's private link and live in the leader's SQLite database.
+Agents are prompted to check their inbox between milestones; messages do not
+interrupt a running model or automatically launch a new turn. Use **Assign**
+(`team task`) for new work after a task ends, **Message** for coordination,
+and **Attach** to answer an interactive question. Exiting the console leaves
+the team running. Deleting the leader also deletes its message history.
+
+### Handoffs
+
+```bash
+devflow team handoff release api tests "Review and test the implementation"
+devflow team handoff release api tests --brief handoff.md --agent codex
+```
+
+A handoff starts a task on the destination using the source's finished task,
+latest response (or log tail), branch, commit, and working-tree status.
+Automatic capture currently supports completed/failed detached Codex tasks;
+use a local `--brief FILE` for Claude or another interactive session. The
+destination refuses a new task while its tracked agent process is still alive,
+including interactive conversations. Attach and finish/exit that agent first.
+Optional `--agent claude|codex` selects the destination agent.
+
+This is a context copy inspired by [catchup](https://github.com/wilbeibi/catchup),
+not a native session migration. Files and uncommitted changes stay on the source;
+push the branch before handing work over. No catchup installation is required.
+
+## Demo
+
+```bash
+devflow demo
+devflow demo --yes --plain          # one automatic walkthrough
+devflow demo --text "Your sample text"
+devflow demo --keep                 # retain the successful run for inspection
+```
+
+The demo creates two small sandboxes: a dispatcher and a linked Python worker.
+It writes the same path in each to prove filesystem isolation, sends a text
+analysis job over private DNS, displays worker progress, and returns a word
+report. Interactive controls let you submit another job, read the worker's
+file, and inspect messages. The job uses real Python execution, not an AI model.
+
+Only a Daytona login is needed (`daytona login`); no repository, agent auth, or
+Daytona account key is copied into the demo. It uses `daytona-small` even if
+your configured custom snapshot is missing. Charm's [Gum](https://github.com/charmbracelet/gum)
+adds keyboard menus when installed; plain numbered menus work without it.
+
+Both sandboxes incur normal Daytona compute charges. The demo deletes its
+resources on completion, failure, or Ctrl-C; `--keep` preserves only successful
+runs and prints a cleanup command. Both have a 15-minute idle auto-stop, which
+deletes the linked worker when triggered; a retained parent keeps its disk.
+An uncatchable kill or network failure may prevent cleanup: remove the printed
+names with `devflow rm NAME --force`, or `devflow team rm TEAM`.
 
 ## Access
 

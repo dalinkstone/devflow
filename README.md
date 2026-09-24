@@ -16,6 +16,7 @@ dv up org/repo
 dv up org/repo -m "fix it" --detach
 dv peek
 dv status
+dv demo                    # guided sandbox walkthrough
 ```
 
 ## Teams
@@ -25,7 +26,10 @@ dv team up org/repo -m "ship it"
 dv team up org/repo --mode linked --agents 3 -m "ship it"
 
 dv team status repo
+dv team ui repo            # watch, assign, message, hand off
 dv team task repo worker-1 "fix tests"
+dv team send repo worker-1 "check the edge cases"
+dv team handoff repo worker-1 worker-2 "review the result"
 dv team rm repo
 ```
 
