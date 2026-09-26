@@ -77,6 +77,7 @@ run_devflow() { # args… (stdin=/dev/null, captures stdout+stderr, sets RC/OUT)
       FAKE_UNPROVISIONED="${FAKE_UNPROVISIONED:-0}" FAKE_AGENT_STATE="${FAKE_AGENT_STATE:-running}" FAKE_FAIL_TOOLS="${FAKE_FAIL_TOOLS:-0}" \
       FAKE_AGENT_NAME="${FAKE_AGENT_NAME:-codex}" FAKE_PEEK_VARIANT="${FAKE_PEEK_VARIANT:-default}" \
       FAKE_BUS_FAIL="${FAKE_BUS_FAIL:-0}" \
+      FAKE_FIX_STATE="${FAKE_FIX_STATE:-completed}" FAKE_FIX_PASSED="${FAKE_FIX_PASSED:-5}" \
       FAKE_DELETE_FAIL="${FAKE_DELETE_FAIL:-0}" FAKE_TASK_BUSY="${FAKE_TASK_BUSY:-0}" \
       DAYTONA_API_KEY="${TEST_DAYTONA_API_KEY:-}" \
       CLOUDFLARE_API_TOKEN="${TEST_CLOUDFLARE_API_TOKEN:-}" \
@@ -748,6 +749,7 @@ fresh_env argv
 run_devflow team up tester/teamrepo --name swarm --mode linked --agent codex \
   --agents 3 --task "build and verify the feature"
 assert_rc "linked team exits 0" "$RC" 0
+assert_contains "worker bus uses leader ID DNS instead of name alias" "$(extract_pushed_file /tmp/.dv-bus-config)" 'http://id-dv-swarm:8787'
 assert_eq "linked team creates leader plus two workers" "$(find "$T_STATE" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')" "3"
 assert_eq "linked worker points at leader id" "$(jq -r '.linkedSandbox' "$T_STATE/dv-swarm-worker-1.json")" "id-dv-swarm"
 assert_eq "linked worker is delete-on-stop" "$(jq -r '.autoDeleteInterval' "$T_STATE/dv-swarm-worker-1.json")" "0"
@@ -808,6 +810,17 @@ echo "# demo: disposable linked sandboxes"
 fresh_env argv
 run_devflow demo --help
 assert_rc "demo help needs no infrastructure" "$RC" 0
+assert_contains "demo help advertises recording" "$OUT" "recording"
+assert_contains "demo help advertises Harbor" "$OUT" "Harbor"
+run_devflow demo windows --yes
+assert_rc "windows yes does not bypass tier acknowledgement" "$RC" 1
+assert_contains "windows warns before dependencies or create" "$OUT" "Tier 3 or higher"
+assert_contains "windows requires explicit acknowledgement" "$OUT" "--tier3"
+assert_eq "windows gate creates nothing" "$(find "$T_STATE" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')" "0"
+run_devflow demo rl --yes --keep
+assert_rc "RL rejects unsupported keep" "$RC" 1
+run_devflow demo desktop --yes --view invalid
+assert_rc "desktop validates viewer before creating" "$RC" 1
 run_devflow demo
 assert_rc "noninteractive demo requires explicit yes" "$RC" 1
 assert_eq "declined demo creates nothing" "$(find "$T_STATE" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')" "0"
@@ -817,6 +830,7 @@ assert_rc "demo finishes" "$RC" 0
 assert_contains "demo shows isolation proof" "$OUT" "same path, different contents"
 assert_contains "demo shows worker result" "$OUT" "Job #1 complete"
 assert_eq "demo cleans up both sandboxes" "$(find "$T_STATE" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')" "0"
+assert_contains "demo deletes worker before parent cascade" "$(awk '/^daytona delete / {print; exit}' "$T_LOG")" '-worker'
 assert_file_contains "demo bypasses stale configured snapshots" "$T_LOG" '--snapshot=daytona-small'
 assert_not_contains "demo never provisions subscription auth" "$(cat "$T_LOG")" '.dv-secrets'
 assert_not_contains "demo never mints account keys" "$(cat "$T_LOG")" '/api-keys'
@@ -844,6 +858,44 @@ assert_rc "demo works with join-style exec" "$RC" 0
 assert_eq "join demo cleans resources" "$(find "$T_STATE" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')" "0"
 
 # ===========================================================================
+echo "# bug-fixing demo"
+fresh_env argv
+run_devflow demo fix --agent both --yes
+assert_rc "fix rejects unsupported agent before create" "$RC" 1
+run_devflow demo fix --timeout 0 --yes
+assert_rc "fix rejects unbounded timeout" "$RC" 1
+run_devflow demo fix --yes --view none --output ./fix-results
+assert_rc "fix demo finishes" "$RC" 0
+assert_contains "fix shows independent result" "$OUT" '3 failing tests → 5 passing tests'
+assert_eq "fix cleans both sandboxes" "$(find "$T_STATE" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')" 0
+assert_not_contains "fix never logs signed preview token" "$OUT" FAKE_PREVIEW_SECRET
+FIX_SECRETS="$(extract_pushed_file /tmp/.dv-secrets.env)"
+assert_contains "fix forwards selected Codex auth" "$FIX_SECRETS" 'DV_CODEX_AUTH_B64=ey'
+assert_eq "fix strips GitHub auth" "$(printf '%s\n' "$FIX_SECRETS" | sed -n 's/^DV_GH_TOKEN=//p')" ''
+assert_not_contains "fix does not forward GitHub token" "$FIX_SECRETS" 'gho_'
+assert_contains "fix disables unrelated Claude auth" "$FIX_SECRETS" 'DV_CLAUDE_MODE=none'
+assert_eq "fix never provisions verifier with credentials" "$(awk '/^EXEC\[.*-verifier\].*provision.sh/ {n++} END {print n+0}' "$T_LOG")" 0
+assert_eq "fix exports patch" "$(find "$T_CWD/fix-results" -name fix.patch | wc -l | tr -d ' ')" 1
+FAKE_FIX_PASSED=2
+run_devflow demo fix --yes --view none --keep
+assert_rc "verifier failure fails demo" "$RC" 1
+assert_eq "failed verification cleans up despite keep" "$(find "$T_STATE" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')" 0
+FAKE_FIX_PASSED=5
+FAKE_FIX_STATE=failed
+run_devflow demo fix --yes --view none
+assert_rc "failed agent fails demo" "$RC" 1
+assert_eq "failed agent cleans resources" "$(find "$T_STATE" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')" 0
+assert_contains "failed agent retains diagnostics" "$OUT" 'Artifacts:'
+FAKE_FIX_STATE=completed
+run_devflow demo fix --agent claude --yes --view none --keep
+assert_rc "Claude fixer supported" "$RC" 0
+assert_eq "successful keep retains both sandboxes" "$(find "$T_STATE" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')" 2
+assert_contains "Claude run strips Codex auth" "$(extract_pushed_file /tmp/.dv-secrets.env)" 'DV_CODEX_AUTH_B64='
+assert_not_contains "Claude run does not send Codex auth" "$(extract_pushed_file /tmp/.dv-secrets.env)" 'DV_CODEX_AUTH_B64=ey'
+fresh_env join
+run_devflow demo fix --yes --view none
+assert_rc "fix supports join-style remote exec" "$RC" 0
+
 echo "# 12..AWS + explicit secret forwarding"
 # ===========================================================================
 fresh_env argv

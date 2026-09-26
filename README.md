@@ -16,8 +16,14 @@ dv up org/repo
 dv up org/repo -m "fix it" --detach
 dv peek
 dv status
-dv demo                    # guided sandbox walkthrough
+dv demo                    # choose a sandbox demo
+dv demo desktop            # recorded LibreOffice computer use
+dv demo rl                 # Harbor reward evaluation
+dv demo fix                # agent fixes an app; linked verifier checks it
+dv demo windows            # Windows GUI + screenshot (Tier 3+)
 ```
+
+Demo previews use your Daytona account; no Cloudflare setup needed.
 
 ## Teams
 

@@ -28,6 +28,8 @@ test:
 	bash tests/run-tests.sh
 	python3 tests/test_bus.py
 	python3 tests/test_console.py
+	python3 tests/test_demo.py
+	python3 tests/test_bugfix.py
 
 test-docker:
 	bash tests/docker-provision-test.sh

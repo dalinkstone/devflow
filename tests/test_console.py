@@ -35,7 +35,9 @@ class DemoConsoleTests(unittest.TestCase):
                    DAYTONA_API_KEY="dtn_FAKE", FAKE_EXEC_STYLE="argv", TERM="xterm", NO_COLOR="1")
         env.pop("DEVFLOW_SNAPSHOT", None)
         env.pop("DEVFLOW_TARGET", None)
-        args = [str(ROOT / "bin/devflow"), "demo"]
+        args = [str(ROOT / "bin/devflow"), "demo", "linked"]
+        if self._testMethodName == "test_demo_chooser_exit":
+            args.pop()
         if self._testMethodName != "test_gum_walkthrough":
             args.append("--plain")
         self.process = subprocess.Popen(args,
@@ -111,6 +113,16 @@ class DemoConsoleTests(unittest.TestCase):
     def test_cancel_before_creation(self):
         self.until("2) Cancel")
         os.write(self.master, b"2\n")
+        self.assertEqual(self.finish(), 0)
+        self.assertEqual(list(self.state.glob("*.json")), [])
+
+    def test_demo_chooser_exit(self):
+        output = self.until("6) Exit")
+        self.assertIn("LibreOffice", output)
+        self.assertIn("Harbor", output)
+        self.assertIn("Tier 3+", output)
+        self.assertIn("Fix a broken app", output)
+        os.write(self.master, b"6\n")
         self.assertEqual(self.finish(), 0)
         self.assertEqual(list(self.state.glob("*.json")), [])
 

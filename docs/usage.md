@@ -214,8 +214,9 @@ devflow team up owner/repo --mode linked -n release -m "ship v2" \
 ```
 
 Linked mode creates one persistent leader plus one ephemeral Daytona sandbox
-per worker. Daytona gives the group a private bidirectional network and DNS by
-sandbox name. Filesystems stay separate, so workers use
+per worker. Daytona gives the group a private bidirectional network. Devflow
+uses sandbox-ID DNS for the leader (name aliases are not always available).
+Filesystems stay separate, so workers use
 `devflow/<team>-<role>` branches and push commits for the leader to integrate.
 The leader receives Daytona/devflow control; each worker gets a message client
 before its assigned task starts.
@@ -291,13 +292,17 @@ push the branch before handing work over. No catchup installation is required.
 ## Demo
 
 ```bash
-devflow demo
-devflow demo --yes --plain          # one automatic walkthrough
-devflow demo --text "Your sample text"
-devflow demo --keep                 # retain the successful run for inspection
+dv demo                            # choose with Gum or numbered menus
+dv demo linked --text "Your sample text"
+dv demo desktop                    # Calc, spreadsheet, MP4 recording
+dv demo desktop --view terminal     # sampled desktop frames (chafa)
+dv demo rl                         # two Harbor trials: reward 0 vs 1
+dv demo windows                    # explicit Tier 3+ confirmation
+dv demo windows --yes --tier3       # noninteractive acknowledgement
+dv demo desktop --yes --view none --output ./demo-results
 ```
 
-The demo creates two small sandboxes: a dispatcher and a linked Python worker.
+The linked demo creates two small sandboxes: a dispatcher and a linked Python worker.
 It writes the same path in each to prove filesystem isolation, sends a text
 analysis job over private DNS, displays worker progress, and returns a word
 report. Interactive controls let you submit another job, read the worker's
@@ -314,6 +319,99 @@ runs and prints a cleanup command. Both have a 15-minute idle auto-stop, which
 deletes the linked worker when triggered; a retained parent keeps its disk.
 An uncatchable kill or network failure may prevent cleanup: remove the printed
 names with `devflow rm NAME --force`, or `devflow team rm TEAM`.
+
+### Desktop
+
+Install `uv` (`brew install uv`). Desktop demos cache Daytona's pinned Python
+SDK locally; they create a normal Linux sandbox from `daytona-medium`, install
+LibreOffice Calc, and start recording before the first GUI action. A scripted
+computer-use agent opens Calc, types a table and formulas using the keyboard,
+saves an ODS file, and checks that its grand total is 86. It is a reproducible
+GUI automation demo, not an autonomous LLM agent; no model credentials are used.
+
+Progress appears in the terminal. The default browser view uses your own
+Daytona account's signed preview link (15-minute expiry, saved privately in
+`preview-url.txt`). No Cloudflare login is needed. To use your own proxy,
+pass `--proxy-domain devflow.sh` (Cloudflare Access still applies). The Daytona
+dashboard's VNC action is the fallback. `--view terminal` renders sampled screenshots with
+`chafa` (`brew install chafa`), not an interactive VNC stream. Afterward, choose
+terminal replay with `mpv --vo=tct` (`brew install mpv`) or open the MP4 normally.
+Use `--view none` to avoid opening a viewer.
+
+Each run gets a private folder under `./devflow-demos` (or `--output DIR`) with
+`recording.mp4`, `desktop.png`, `steps.json`, and, for Calc, `spreadsheet.ods`.
+Downloads happen before sandbox deletion. Failed GUI runs try to save a partial
+recording; if recovery fails, the sandbox is kept and its exact cleanup command
+is printed so the video is not silently destroyed. `--keep` otherwise applies
+only after success. Sandboxes have 15-minute idle auto-stop; kept disks can incur
+storage charges. SIGKILL, a host crash, or an API outage can prevent cleanup.
+
+### Harbor
+
+`dv demo rl` uses pinned `harbor[daytona]` through `uv`, runs one no-op and one
+oracle trial in fresh Ubuntu sandboxes, and reads Harbor's verifier
+results. The task is to write the sum of three numbers to a file; the verifier
+awards 0 or 1. This shows the rollout → verification → reward part of RL, not
+training or policy optimization. No model API keys or repository credentials
+are required. The generated task, logs, trial results, and `rewards.json` stay
+locally so you can change the task and inspect the scoring.
+
+Harbor manages execution and deletion of its own environments; `--keep` is not
+supported. On interruption it gets time to clean up; inspect Daytona for leftover
+trials after a hard kill. Trials have a 15-minute idle auto-stop and ephemeral
+deletion on stop. Daytona builds a small Ubuntu image from the generated
+Dockerfile; first-run image preparation can take a few minutes. It runs as root
+inside the isolated eval sandbox because Harbor needs writable `/logs` paths.
+
+### Fix a broken app
+
+```sh
+dv demo fix                            # Codex fixer + independent verifier
+dv demo fix --agent claude             # use Claude Code instead
+dv demo fix --yes --view none          # unattended; delete when finished
+dv demo fix --keep                     # keep the app open after the walkthrough
+```
+
+Inspired by Daytona's [bug-fixing guide](https://www.daytona.io/docs/en/guides/ag2/ag2-bug-fixer-agent/),
+adapted to devflow subscriptions rather than AG2/API keys. A real coding agent
+repairs a tiny checkout app. Your terminal coordinates; a separate linked
+sandbox receives the patch through the private message bus and runs five fixed
+tests. The verifier is a deterministic test runner, not another LLM. The demo
+first proves three tests fail, then requires all five to pass independently.
+
+Only the selected agent's existing sign-in is copied to the fixer. No GitHub,
+Daytona, AWS, or model credentials are copied to the verifier; no user repo is
+cloned or edited. Normal Daytona compute and subscription usage apply. This is
+a collaboration example, not a hostile-agent security benchmark: the linked
+network and the agent's sandbox access are deliberately trusted for this demo.
+
+Progress and recent agent output appear live. One repair attempt is allowed;
+`--timeout 300` bounds agent execution (30–900 seconds, excluding provisioning).
+Failures and Ctrl-C trigger cleanup even with `--keep`. Logs, before/after test
+results, the patch, and a fetched HTML preview stay in a private run directory
+under `./devflow-demos` (`--output DIR` overrides it).
+
+The repaired app runs on port 3000 in the verifier. A native Daytona signed URL
+expires after 15 minutes and is saved privately to `preview-url.txt`; anyone
+holding it can access the demo. Browser mode opens it automatically; `--view
+none` skips opening. No Cloudflare configuration is needed. Interactive runs
+wait for Finish before cleanup; unattended runs delete immediately unless
+`--keep`. Kept sandboxes auto-stop after 15 minutes idle; the verifier deletes
+on stop. Use the printed team cleanup command to remove both.
+
+### Windows
+
+Windows warns **before creation** that you need **Daytona Tier 3 or higher** and
+Windows quota in the selected region. `--yes` does not bypass this gate: use
+`--tier3` to acknowledge it in scripts. The gate is an acknowledgement, not an
+account-tier check. The walkthrough uses `windows-small`, opens Notepad through
+computer use, types a note, and saves a screenshot. Windows native recording
+currently fails to produce a file in live testing; use `dv demo desktop` for MP4
+recording. It never tries to run Linux provisioning or Bash in Windows.
+
+References: [Computer Use](https://www.daytona.io/docs/en/computer-use/),
+[VM sandboxes](https://www.daytona.io/docs/en/sandboxes/#vm-sandboxes),
+[Harbor environments](https://docs.harborframework.com/core-concepts/sandboxes/pre-integrated-sandboxes).
 
 ## Access
 

@@ -37,6 +37,20 @@ capture, and the demo worker. It needs permission to bind localhost, but no
 external services. `bin/devflow __bus-script` extracts the tested payload.
 `tests/test_console.py` drives the demo through a pseudo-terminal, including
 Ctrl-C cleanup and (when installed) the actual Gum menus.
+`tests/test_demo.py` tests the embedded desktop controller, real ODS validation,
+partial recording recovery, resource cleanup, and Harbor result parsing without
+cloud calls. Live checks: `bin/devflow demo desktop --yes --view none` and
+`bin/devflow demo rl --yes` create billed disposable sandboxes. Windows tests
+require an explicitly acknowledged Tier 3+ account and regional Windows quota.
+Live-test regressions cover leader-ID DNS (parent-name aliases can fail),
+child-first linked cleanup, sync SDKs without `close()`, Windows single-key
+input, and waiting for the Windows shell before opening Run. Windows exports
+screenshots only: the tested native recorder returned an ID but no video file.
+`tests/test_bugfix.py` executes the embedded repair fixture locally with known
+test patches (no agent/model calls), checking real Git patch validation, test
+outcomes, bus handoff, and agent timeout handling. Shell fakes exercise lifecycle
+and auth filtering. Live check: `bin/devflow demo fix --yes --view none` copies
+the selected subscription sign-in into the disposable fixer and bills compute.
 
 ## Hard invariants (violating these breaks users)
 

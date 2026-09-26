@@ -129,7 +129,35 @@ because Daytona CLI exec buffers long-running output. EXIT/INT/TERM cleanup
 targets only this run's generated names; `--keep` applies to success only.
 No model subscriptions or Daytona control credentials are forwarded.
 
+The demo chooser also dispatches `desktop`, `windows`, and `rl` to an embedded
+local Python controller (`__demo-driver`). `uv --no-project` caches pinned SDK /
+Harbor dependencies without changing the caller's project. Desktop lifecycle
+uses the Daytona CLI; GUI actions, recording, screenshots, and downloads use
+the SDK. Linux shell operations call back through `__demo-exec` → `dt_run`.
+Windows uses only GUI actions and screenshots, never the Linux provisioner or
+the currently unreliable Windows native recorder. Credentials remain
+in the controller environment; previews default to private, expiring native
+Daytona links, with the Access-protected proxy explicitly opt-in. Recordings
+are downloaded before deleting the run's random name;
+failed downloads preserve the sandbox for recovery. Local artifacts are private.
+
+The RL demo delegates execution/lifecycle to Harbor's Daytona provider. It uses
+an Ubuntu Dockerfile (root for Harbor's log setup), sequential nop/oracle trials, explicit
+timeouts, no retries, ephemeral environments, and real verifier reward files.
+This is a reward evaluation, not model training. Harbor gets SIGINT and a bounded
+cleanup grace period on cancellation; interrupted runs retain local diagnostics.
+
 ### Sandbox state directory (`~/.devflow/`)
+
+`demo fix` creates a medium fixer parent and a small linked verifier. It reuses
+only tools/auth provisioning for the fixer, filtering the bundle to the chosen
+subscription. Its separate embedded `__bugfix-demo` helper seeds an identical
+Git fixture, launches a bounded headless agent, packages only an ordinary
+app.py text diff, sends it through dv-bus, and applies/tests it independently.
+The verifier receives no provisioner or subscription auth. Only sandbox-side
+Python executes candidate code; remote commands still use dt_run. The terminal
+polls status/logs and preserves artifacts before child-first cleanup. Native
+signed app previews are private local artifacts, never printed in the log.
 
 `env`, `aws.env`, `forwarded.env` (0600 forwarded env files),
 `aws-expiration`, `aws-source-profile`, `forwarded-env-names` (0600 metadata),

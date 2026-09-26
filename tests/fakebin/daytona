@@ -200,6 +200,11 @@ case "$cmd" in
     exit 0
     ;;
 
+  preview-url)
+    echo 'https://preview.example.invalid/?token=FAKE_PREVIEW_SECRET'
+    exit 0
+    ;;
+
   exec)
     name="${1:-}"; shift || true
     # swallow --timeout N / --cwd X
@@ -271,6 +276,12 @@ case "$cmd" in
     fi
 
     case "$script" in
+      *'bugfix/status.json'*) echo '{"state":"'"${FAKE_FIX_STATE:-completed}"'"}'; exit 0 ;;
+      *'/tmp/.dv-bugfix.py'*evaluate*) echo '{"passed":2,"total":5,"tests":[{"test":"basket","passed":false,"expected":8600,"actual":20}]}'; exit 0 ;;
+      *'/tmp/.dv-bugfix.py'*verify*) echo '{"passed":'"${FAKE_FIX_PASSED:-5}"',"total":5,"tests":[{"test":"basket","passed":true,"expected":8600,"actual":8600}]}'; exit 0 ;;
+      *'/tmp/.dv-bugfix.py'*package*) echo '{"message_id":1,"bytes":100}'; exit 0 ;;
+      *'bugfix/fix.patch'*) printf 'diff --git a/app.py b/app.py\n'; exit 0 ;;
+      *'bugfix/agent.log'*) echo 'agent repaired the total'; exit 0 ;;
       *'agent is still active'*) [ "${FAKE_TASK_BUSY:-0}" != 1 ]; exit $? ;;
       *'"${s:-idle}"'*) echo "${FAKE_AGENT_STATE:-running}"; exit 0 ;;
       *cat*/tmp/devflow-demo-owner*) echo dispatcher; exit 0 ;;

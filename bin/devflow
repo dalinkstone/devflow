@@ -13,7 +13,7 @@
 set -u
 set -o pipefail
 
-DEVFLOW_VERSION="0.8.0"
+DEVFLOW_VERSION="0.9.0"
 
 # ----------------------------------------------------------------------------
 # Config (precedence: environment > config file > built-in default)
@@ -3390,8 +3390,9 @@ bus_new_roster() { # JSON {role: sandbox} -> JSON {role: {sandbox, token}}
 }
 
 bus_install() { # NAME TEAM ROLE LEADER ROSTER
-  local name="$1" team="$2" role="$3" leader="$4" roster="$5" config
-  config="$(printf '%s' "$roster" | jq --arg team "$team" --arg role "$role" --arg leader "$leader" '
+  local name="$1" team="$2" role="$3" leader="$4" roster="$5" config leader_host
+  leader_host="$(dt_info_json "$leader" | jq -er '.id // .sandboxId // empty')" || return 1
+  config="$(printf '%s' "$roster" | jq --arg team "$team" --arg role "$role" --arg leader "$leader_host" '
     {team:$team, role:$role, token:.[$role].token,
      url:("http://"+(if $role == "leader" then "127.0.0.1" else $leader end)+":8787")}
     + (if $role == "leader" then {peers:.} else {} end)')" || return 1
@@ -3577,20 +3578,36 @@ cmd_team_ui() {
 
 usage_demo() {
   cat <<'DV_DEMO_HELP'
-devflow demo [--yes] [--plain] [--keep] [--text "text to analyze"]
+devflow demo [linked|fix|desktop|rl|windows] [options]
 
-Two real Daytona sandboxes: a dispatcher and a linked text-report worker.
-See filesystem isolation, private-network messages, progress, and results.
-No AI subscription needed. Uses built-in daytona-small images.
+  linked    two isolated workers exchanging messages (original demo)
+  fix       real coding agent fixes an app; linked sandbox verifies the patch
+  desktop   LibreOffice Calc via computer use; save spreadsheet + recording
+  rl        Harbor on Daytona: compare no-op (0) and oracle (1) rewards
+  windows   Windows/Notepad + screenshot (Tier 3+ and regional quota)
 
-  --yes     run one job without prompts (required when stdin is not a terminal)
-  --plain   numbered menus instead of optional Charm Gum controls
-  --keep    keep sandboxes after success; otherwise delete them on exit
-  --text    input for the first report
+No mode: choose interactively; --yes alone still runs linked.
+Desktop is a scripted computer-use agent, not an LLM. RL is an evaluation,
+not model training. Only fix copies the selected agent's subscription sign-in.
 
-Compute is billed by Daytona. Both sandboxes auto-stop after 15 idle minutes;
-stopping the linked worker deletes it. Failed/interrupted runs clean up even
-with --keep. Cleanup failures print the exact sandbox names to remove.
+  --yes       skip ordinary confirmations
+  --plain     numbered menus instead of optional Charm Gum controls
+  --keep      keep linked/fix/desktop/Windows sandboxes after success
+  --text TEXT linked worker input
+  --view MODE desktop/Windows: browser (default), terminal, or none
+  --proxy-domain HOST desktop/Windows: opt into your own preview proxy
+  --output DIR local artifacts parent (default: ./devflow-demos)
+  --tier3     explicitly acknowledge Windows Tier 3+ requirement
+  --agent NAME fix only: codex (default) or claude
+  --timeout N fix only: agent time limit in seconds (30–900; default 300)
+
+Desktop/Windows/RL need uv (brew install uv); pinned Python packages are cached
+on first run. Terminal frames need chafa; terminal video replay needs mpv.
+Terminal frames are sampled screenshots, not an interactive VNC client.
+
+Normal Daytona compute charges apply. Sandboxes are deleted on exit unless
+--keep; artifacts stay locally. Failed/interrupted desktop runs try to save
+partial recordings before cleanup. All demos have a 15m idle auto-stop.
 DV_DEMO_HELP
 }
 
@@ -3602,12 +3619,15 @@ demo_cleanup() { # only names created for this invocation
     say "cleanup: devflow team rm $demo_team"
     return 0
   fi
-  for name in "$demo_parent" "$demo_child"; do
+  # Delete dependents first: parent deletion cascades asynchronously to children.
+  for name in "$demo_child" "$demo_parent"; do
     [ -n "$name" ] || continue
     if ! deletion_error="$(dt delete "$name" 2>&1)"; then
       local remaining
       remaining="$(dt list -f json 2>/dev/null)" || remaining='null'
-      if ! printf '%s' "$remaining" | jq -e --arg name "$name" 'type == "array" and all(.[]; .name != $name)' >/dev/null 2>&1; then
+      if ! printf '%s' "$remaining" | jq -e --arg name "$name" '
+        (if type == "object" and (.nextCursor // "") == "" then .items else . end)
+        | type == "array" and all(.[]; .name != $name)' >/dev/null 2>&1; then
         warn "cleanup failed: devflow rm $name --force"
         [ -z "$deletion_error" ] || printf '%s\n' "$deletion_error" >&2
         failed=1
@@ -3643,6 +3663,794 @@ demo_job() { # PARENT TEXT — poll small API responses, since daytona exec buff
 }
 
 cmd_demo() (
+  local mode="" arg DV_PLAIN=0 yes=0 tier3=0 keep=0 view=browser output=./devflow-demos proxy_domain=""
+  local args=("$@") runner action
+  for arg in "$@"; do
+    case "$arg" in --help|-h) usage_demo; return 0 ;; --plain) DV_PLAIN=1 ;; --yes|-y) yes=1 ;; esac
+  done
+  case "${1:-}" in linked|fix|desktop|rl|windows) mode="$1"; shift ;; esac
+  if [ -z "$mode" ]; then
+    if [ "$yes" = 1 ]; then mode=linked
+    else
+      [ -t 0 ] || die "choose a demo and use --yes when stdin is not a terminal"
+      action="$(console_choose 'Choose a sandbox demo' 'Linked workers' 'Computer use · LibreOffice' 'RL eval · Harbor' 'Windows · Tier 3+' 'Fix a broken app' Exit)" || return 0
+      case "$action" in
+        'Linked workers') mode=linked ;;
+        'Computer use · LibreOffice') mode=desktop ;;
+        'RL eval · Harbor') mode=rl ;;
+        'Windows · Tier 3+') mode=windows ;;
+        'Fix a broken app') mode=fix ;;
+        *) return 0 ;;
+      esac
+    fi
+  else
+    args=("$@")
+  fi
+  if [ "$mode" = fix ]; then
+    if [ "${#args[@]}" -gt 0 ]; then cmd_demo_fix "${args[@]}"; else cmd_demo_fix; fi
+    return
+  fi
+  if [ "$mode" = linked ]; then
+    if [ "${#args[@]}" -gt 0 ]; then cmd_demo_linked "${args[@]}"; else cmd_demo_linked; fi
+    return
+  fi
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --yes|-y) yes=1; shift ;;
+      --plain) DV_PLAIN=1; shift ;;
+      --keep) keep=1; shift ;;
+      --tier3) tier3=1; shift ;;
+      --view) need_val "$1" "${2:-}"; view="$2"; shift 2 ;;
+      --output) need_val "$1" "${2:-}"; output="$2"; shift 2 ;;
+      --proxy-domain) need_val "$1" "${2:-}"; proxy_domain="$2"; shift 2 ;;
+      *) die "unknown $mode demo option: $1" ;;
+    esac
+  done
+  case "$view" in browser|terminal|none) ;; *) die "--view must be browser, terminal, or none" ;; esac
+  [ "$mode" != rl ] || [ "$keep" = 0 ] || die "RL demos always clean up; --keep is not supported"
+  if [ "$mode" = windows ]; then
+    warn "Windows requires Daytona Tier 3 or higher AND Windows quota in your region. Lower tiers will not work."
+    say "Check https://app.daytona.io/dashboard/limits before creating a billed Windows VM."
+    if [ "$tier3" != 1 ]; then
+      [ "$yes" != 1 ] && [ -t 0 ] || die "acknowledge the Windows requirement with --tier3 (not implied by --yes)"
+      confirm "I have Tier 3+ and Windows quota; continue?" || return 0
+    fi
+  fi
+  [ "$yes" = 1 ] || [ -t 0 ] || die "use --yes for a noninteractive demo"
+  need_cmd uv "brew install uv"
+  need_cmd jq "brew install jq"
+  require_daytona_cli
+  dt_auth_check || die "not logged in — run: daytona login"
+  resolve_daytona_api || die "no Daytona credentials — run: daytona login"
+  if [ "$DT_API_KEY" = "$DT_OAUTH_TOKEN" ] && [ -n "$DT_ORG_ID" ]; then
+    export DAYTONA_JWT_TOKEN="$DT_API_KEY" DAYTONA_ORGANIZATION_ID="$DT_ORG_ID"
+    unset DAYTONA_API_KEY
+  else
+    export DAYTONA_API_KEY="$DT_API_KEY"
+    unset DAYTONA_JWT_TOKEN DAYTONA_ORGANIZATION_ID
+  fi
+  export DAYTONA_API_URL="$DT_API_URL"
+  [ -z "$DEVFLOW_TARGET" ] || export DAYTONA_TARGET="$DEVFLOW_TARGET"
+  say "$mode demo · billed Daytona compute; pinned dependencies download on first run."
+  say "Recordings/results stay under $output. No model credentials are forwarded."
+  [ "$yes" = 1 ] || { confirm "start the demo?" || return 0; }
+  umask 077
+  runner="$(mktemp "${TMPDIR:-/tmp}/devflow-demo.XXXXXX")"
+  trap 'rm -f "$runner"' EXIT
+  emit_demo_driver > "$runner"
+  local package=daytona==0.217.0
+  [ "$mode" != rl ] || package='harbor[daytona]==0.23.0'
+  # Isolated from cwd pyproject/.env; dependencies do not alter the user's project.
+  uv run --no-project --with "$package" python "$runner" "$mode" \
+    --cli "$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" --output "$output" \
+    --view "$view" --keep "$keep" --yes "$yes" --domain "$proxy_domain"
+)
+
+emit_bugfix_demo() {
+cat <<'DV_BUGFIX_PY'
+"""Runs INSIDE disposable sandboxes; never executes agent code on the laptop."""
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+
+ROOT = Path.home() / 'devflow-bugfix'
+STATE = Path.home() / '.devflow/bugfix'
+APP = '''import json
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+ITEMS = [{"qty": 4, "price_cents": 1200}, {"qty": 10, "price_cents": 200}, {"qty": 6, "price_cents": 300}]
+
+def total_cents(items):
+    return sum(item["qty"] for item in items)
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        total = total_cents(ITEMS)
+        body = ("<!doctype html><title>devflow checkout</title><h1>Checkout</h1>"
+                "<p>4 notebooks, 10 pens, 6 folders</p><h2>Total: $%.2f</h2>" % (total / 100)).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--total":
+        print(json.dumps(total_cents(json.loads(sys.argv[2]))))
+    else:
+        HTTPServer(("0.0.0.0", 3000), Handler).serve_forever()
+'''
+CASES = [
+    ('basket', [{'qty': 4, 'price_cents': 1200}, {'qty': 10, 'price_cents': 200}, {'qty': 6, 'price_cents': 300}], 8600),
+    ('empty', [], 0),
+    ('single', [{'qty': 1, 'price_cents': 259}], 259),
+    ('zero quantity', [{'qty': 0, 'price_cents': 999}], 0),
+    ('mixed', [{'qty': 3, 'price_cents': 101}, {'qty': 2, 'price_cents': 75}], 453),
+]
+
+
+def git(*args):
+    return subprocess.check_output(['git', '-C', str(ROOT), *args], text=True, stderr=subprocess.PIPE)
+
+
+def seed():
+    ROOT.mkdir(parents=True, exist_ok=False)
+    STATE.mkdir(parents=True, exist_ok=True)
+    (ROOT / 'app.py').write_text(APP)
+    (ROOT / 'README.md').write_text('Fix the checkout total. Prices are integer cents; multiply quantity by price per line and sum. Preserve the HTTP server and --total JSON CLI. Change only app.py. No packages or external services are needed.\n')
+    git('init', '-q')
+    git('add', 'app.py', 'README.md')
+    git('-c', 'user.name=devflow demo', '-c', 'user.email=demo@example.invalid', 'commit', '-qm', 'Broken checkout fixture')
+    (STATE / 'base').write_text(git('rev-parse', 'HEAD').strip())
+
+
+def evaluate():
+    results = []
+    for name, items, expected in CASES:
+        actual = None
+        try:
+            run = subprocess.run([sys.executable, '-I', str(ROOT / 'app.py'), '--total', json.dumps(items)],
+                                 capture_output=True, text=True, timeout=10)
+            actual = json.loads(run.stdout) if run.returncode == 0 else None
+        except (subprocess.TimeoutExpired, ValueError):
+            pass
+        results.append({'test': name, 'passed': type(actual) is int and actual == expected,
+                        'expected': expected, 'actual': actual})
+    return {'passed': sum(r['passed'] for r in results), 'total': len(results), 'tests': results}
+
+
+def bus():
+    path = str(Path.home() / '.local/bin/dv-bus')
+    loader = importlib.machinery.SourceFileLoader('bugfix_bus', path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module, json.loads(module.CONFIG.read_text())
+
+
+def package():
+    patch = git('diff', '--binary', (STATE / 'base').read_text(), '--', 'app.py')
+    validate_patch(patch)
+    (STATE / 'fix.patch').write_text(patch)
+    module, config = bus()
+    message = module.request(config, '/send', {'to': 'verifier', 'body': patch})
+    print(json.dumps({'message_id': message['id'], 'bytes': len(patch.encode())}))
+
+
+def validate_patch(patch):
+    if not patch.strip() or len(patch.encode()) > 32000:
+        raise ValueError('expected a nonempty patch of at most 32 KB')
+    # Only ordinary app.py text changes are allowed, not symlinks, renames, or tests.
+    if not patch.startswith('diff --git a/app.py b/app.py\n') or patch.count('diff --git ') != 1:
+        raise ValueError('patch must change only app.py')
+    if '\n--- a/app.py\n+++ b/app.py\n' not in patch or any(x in patch for x in ('mode ', 'GIT binary patch', 'rename from')):
+        raise ValueError('only regular-file text edits are accepted')
+
+
+def verify():
+    module, config = bus()
+    messages = module.request(config, '/inbox')
+    patches = [m for m in messages if m['sender'] == 'leader']
+    if len(patches) != 1:
+        raise ValueError('expected exactly one fixer patch in verifier inbox')
+    message = patches[0]
+    validate_patch(message['body'])
+    patch = STATE / 'fix.patch'
+    patch.write_text(message['body'])
+    git('apply', '--check', str(patch))
+    git('apply', str(patch))
+    result = evaluate()
+    (STATE / 'result.json').write_text(json.dumps(result, indent=2))
+    module.request(config, '/send', {'to': 'leader', 'body': json.dumps(result)})
+    module.request(config, '/ack', {'id': message['id']})
+    print(json.dumps(result))
+
+
+def agent(name, timeout):
+    prompt = ('Fix the broken checkout in app.py. Read README.md, reproduce the wrong total, and fix it. '
+              'Only edit app.py. Preserve the HTTP server and --total JSON CLI; run representative checks. '
+              'Do not commit, push, install packages, delegate, or ask questions. Stop when done. '
+              'This disposable demo has no GitHub credentials. An independent verifier will check your patch.')
+    args = (['codex', 'exec', '--dangerously-bypass-approvals-and-sandbox', '--color', 'never', prompt]
+            if name == 'codex' else ['claude', '-p', '--dangerously-skip-permissions', prompt])
+    status = STATE / 'status.json'
+    def write(state, code=None):
+        tmp = status.with_suffix('.tmp')
+        tmp.write_text(json.dumps({'state': state, 'exit_code': code}))
+        tmp.replace(status)
+    write('running')
+    try:
+        with (STATE / 'agent.log').open('w') as log:
+            child = subprocess.Popen(args, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            try:
+                code = child.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                os.killpg(child.pid, signal.SIGKILL)
+                child.wait()
+                write('timeout', 124)
+                return
+        write('completed' if code == 0 else 'failed', code)
+    except Exception:
+        write('failed', 1)
+        raise
+
+
+if __name__ == '__main__':
+    os.umask(0o077)
+    command = sys.argv[1]
+    if command == 'seed': seed()
+    elif command == 'evaluate': print(json.dumps(evaluate()))
+    elif command == 'package': package()
+    elif command == 'verify': verify()
+    elif command == 'agent': agent(sys.argv[2], int(sys.argv[3]))
+    else: raise ValueError('unknown demo action')
+DV_BUGFIX_PY
+}
+
+demo_fix_cleanup() {
+  local rc="$?"
+  trap '' INT TERM
+  if [ -n "$demo_parent" ]; then
+    dt_run "$demo_parent" 'cat "$HOME/.devflow/bugfix/agent.log" 2>/dev/null || true' 30 > "$folder/agent.log" 2>/dev/null || true
+    dt_run "$demo_parent" 'cat "$HOME/.devflow/bugfix/status.json" 2>/dev/null || true' 30 > "$folder/status.json" 2>/dev/null || true
+  fi
+  say "Artifacts: $folder"
+  (exit "$rc")
+  demo_cleanup
+}
+
+cmd_demo_fix() (
+  local yes=0 DV_PLAIN=0 demo_keep=0 demo_parent="" demo_child="" demo_team=""
+  local agent=codex timeout=300 output=./devflow-demos view=browser folder name roster result state last="" log="" deadline
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --yes|-y) yes=1; shift ;;
+      --plain) DV_PLAIN=1; shift ;;
+      --keep) demo_keep=1; shift ;;
+      --agent) need_val "$1" "${2:-}"; agent="$2"; shift 2 ;;
+      --timeout) need_val "$1" "${2:-}"; timeout="$2"; shift 2 ;;
+      --output) need_val "$1" "${2:-}"; output="$2"; shift 2 ;;
+      --view) need_val "$1" "${2:-}"; view="$2"; shift 2 ;;
+      *) die "unknown fix demo option: $1" ;;
+    esac
+  done
+  case "$agent" in codex|claude) ;; *) die "fix --agent must be codex or claude" ;; esac
+  case "$timeout" in ''|*[!0-9]*|0*) die "--timeout must be 30–900 seconds" ;; esac
+  [ "${#timeout}" -le 3 ] && [ "$timeout" -ge 30 ] && [ "$timeout" -le 900 ] || die "--timeout must be 30–900 seconds"
+  case "$view" in browser|none) ;; *) die "fix --view must be browser or none" ;; esac
+  [ "$yes" = 1 ] || [ -t 0 ] || die "use --yes for a noninteractive demo"
+  require_daytona_cli
+  need_cmd jq "brew install jq"
+  dt_auth_check || die "not logged in — run: daytona login"
+  # Only the selected model subscription crosses into the fixer, never cloud/GitHub credentials.
+  set_forwarding_options '' '' 0 ''
+  harvest_all
+  GH_TOKEN_VAL=""; GIT_NAME="devflow demo"; GIT_EMAIL="demo@example.invalid"
+  if [ "$agent" = codex ]; then
+    [ -n "$CODEX_AUTH_B64" ] || die "sign into Codex locally first"
+    CLAUDE_MODE=none; CLAUDE_TOKEN=""; CLAUDE_CREDS_B64=""
+  else
+    [ "$CLAUDE_MODE" != none ] || die "sign into Claude Code locally first (or run: dv token)"
+    CODEX_AUTH_B64=""
+  fi
+  ui_title "devflow demo · fix a broken app"
+  say "Coordinator (this terminal) → fixer ($agent) → independent verifier"
+  say "Creates two billed linked sandboxes. Copies only $agent sign-in to the fixer; uses your subscription."
+  say "One repair attempt, ${timeout}s agent limit. Patch and test results are saved locally; no repository is touched."
+  [ "$yes" = 1 ] || { confirm "start the demo?" || return 0; }
+  umask 077
+  mkdir -p "$output" || exit 1
+  folder="$(mktemp -d "$output/fix.XXXXXX")" || exit 1
+  folder="$(cd "$folder" && pwd)"
+  # Keep repeated CLI upgrade notices out of the live agent feed; retain full diagnostics.
+  dt() {
+    local diagnostics rc=0
+    diagnostics="$(mktemp "$folder/daytona.XXXXXX")" || return 1
+    command daytona "$@" 2>"$diagnostics" || rc=$?
+    cat "$diagnostics" >> "$folder/daytona.log"
+    if grep -q 'Daytona CLI .* is outdated' "$diagnostics" && [ ! -f "$folder/.update-notice" ]; then
+      warn "Daytona CLI update available; full diagnostics: $folder/daytona.log"
+      : > "$folder/.update-notice"
+    fi
+    sed '/^time=.*level=warning msg="Daytona CLI .* is outdated/d' "$diagnostics" >&2
+    rm -f "$diagnostics"
+    return "$rc"
+  }
+  demo_team="fix-$(date +%s)-$RANDOM"
+  demo_parent="dv-$demo_team"; demo_child="$demo_parent-verifier"
+  [ "$(sandbox_state "$demo_parent")" = missing ] && [ "$(sandbox_state "$demo_child")" = missing ] || die "demo name collision; retry"
+  printf '%s\n%s\n' "$demo_parent" "$demo_child" > "$folder/sandboxes.txt"
+  trap demo_fix_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  step "1/5 · coordinator: creating isolated fixer and verifier"
+  local create_args=(create "--name=$demo_parent" --snapshot=daytona-medium --auto-stop=15 --label=devflow=1 "--label=devflow.team=$demo_team" --label=devflow.team.role=leader --label=devflow.team.mode=linked)
+  [ -z "$DEVFLOW_TARGET" ] || create_args+=("--target=$DEVFLOW_TARGET")
+  dt_quiet "${create_args[@]}" || die "fixer creation failed"
+  wait_for_state "$demo_parent" started 180
+  create_linked_sandbox "$demo_child" "$demo_parent" 15 daytona-small none core '' "$demo_team" verifier linked
+  wait_for_state "$demo_child" started 180
+  for name in "$demo_parent" "$demo_child"; do
+    emit_bugfix_demo | dt_push_file "$name" /tmp/.dv-bugfix.py || exit 1
+    dt_run "$name" 'python3 /tmp/.dv-bugfix.py seed' 30 || exit 1
+  done
+  roster="$(bus_new_roster "$(jq -n --arg p "$demo_parent" --arg c "$demo_child" '{leader:$p,verifier:$c}')")" || exit 1
+  bus_install "$demo_parent" "$demo_team" leader "$demo_parent" "$roster" || exit 1
+  bus_start "$demo_parent" || exit 1
+  bus_install "$demo_child" "$demo_team" verifier "$demo_parent" "$roster" || exit 1
+  dt_run "$demo_child" '"$HOME/.local/bin/dv-bus" health' 30 >/dev/null || die "private link unavailable"
+  step "2/5 · verifier: reproducing the broken checkout before any agent edits"
+  result="$(dt_run "$demo_child" 'python3 /tmp/.dv-bugfix.py evaluate' 90)" || exit 1
+  printf '%s\n' "$result" > "$folder/before.json"
+  printf '%s' "$result" | jq -e '.passed == 2 and .total == 5' >/dev/null || die "fixture did not produce its expected 3 failures"
+  printf '%s' "$result" | jq -r '.tests[] | "  \(if .passed then "PASS" else "FAIL" end) \(.test): expected \(.expected), got \(.actual)"'
+  step "3/5 · fixer: installing tools and applying selected subscription auth"
+  upload_provisioner "$demo_parent" 1 || exit 1
+  run_phase_clean "$demo_parent" tools "$agent" '' '' '' core || die "fixer tools failed"
+  run_phase_clean "$demo_parent" auth "$agent" '' '' '' core || die "fixer auth failed"
+  dt_run "$demo_parent" 'umask 077; export PATH="$HOME/.local/bin:$PATH"; [ ! -f "$HOME/.devflow/env" ] || . "$HOME/.devflow/env"; nohup python3 /tmp/.dv-bugfix.py agent '"$agent $timeout"' >"$HOME/.devflow/bugfix/runner.log" 2>&1 </dev/null &' 30 || exit 1
+  deadline=$(( $(date +%s) + timeout + 60 ))
+  while :; do
+    result="$(dt_run "$demo_parent" 'cat "$HOME/.devflow/bugfix/status.json" 2>/dev/null || printf "{}"' 30)" || die "could not read fixer status"
+    state="$(printf '%s' "$result" | jq -r '.state // "starting"')" || exit 1
+    log="$(dt_run "$demo_parent" 'tail -n 8 "$HOME/.devflow/bugfix/agent.log" 2>/dev/null || true' 30)" || exit 1
+    if [ "$log" != "$last" ]; then printf '%s\n' "$log" | clean_peek_output; last="$log"; fi
+    case "$state" in completed) break ;; failed|timeout) die "fixer $state; inspect artifacts in $folder" ;; esac
+    [ "$(date +%s)" -lt "$deadline" ] || die "fixer did not finish within the time limit"
+    sleep 2
+  done
+  step "4/5 · handoff: patch travels over private DNS to the verifier"
+  dt_run "$demo_parent" 'python3 /tmp/.dv-bugfix.py package' 30 > "$folder/handoff.json" || die "agent did not produce an acceptable patch"
+  dt_run "$demo_parent" 'cat "$HOME/.devflow/bugfix/fix.patch"' 30 > "$folder/fix.patch" || exit 1
+  dt_run "$demo_parent" 'cat "$HOME/.devflow/bugfix/agent.log"' 30 > "$folder/agent.log" || exit 1
+  result="$(dt_run "$demo_child" 'python3 /tmp/.dv-bugfix.py verify' 90)" || die "patch verification failed"
+  printf '%s\n' "$result" > "$folder/after.json"
+  printf '%s' "$result" | jq -r '.tests[] | "  \(if .passed then "PASS" else "FAIL" end) \(.test): expected \(.expected), got \(.actual)"'
+  printf '%s' "$result" | jq -e '.passed == .total and .total == 5' >/dev/null || die "independent tests rejected the patch (see after.json)"
+  dt_run "$demo_parent" '"$HOME/.local/bin/dv-bus" events --json' 30 > "$folder/messages.json" || exit 1
+  step "5/5 · verifier: all 5 tests passed; starting the repaired app on port 3000"
+  dt_run "$demo_child" 'nohup python3 "$HOME/devflow-bugfix/app.py" >"$HOME/.devflow/bugfix/server.log" 2>&1 </dev/null & ' 30 || exit 1
+  dt_run "$demo_child" 'i=0; until curl -fsS http://127.0.0.1:3000/; do i=$((i+1)); [ "$i" -lt 10 ] || exit 1; sleep 1; done' 30 > "$folder/preview.html" || die "repaired app did not start"
+  local url="" preview
+  preview="$(dt preview-url "$demo_child" --port=3000 --expires=900 2>/dev/null)" || preview=""
+  url="$(printf '%s\n' "$preview" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^https:\/\//) {print $i; exit}}')"
+  if [ -n "$url" ]; then
+    printf '%s\n' "$url" > "$folder/preview-url.txt"
+    say "Private 15m preview link saved in $folder/preview-url.txt (anyone with that link can access this demo)."
+    [ "$view" != browser ] || open_file "$url" || warn "could not open preview; use the saved link"
+  else
+    warn "could not create preview link; Daytona dashboard → $demo_child → preview port 3000"
+  fi
+  ok "3 failing tests → 5 passing tests. Artifacts: $folder"
+  if [ "$yes" != 1 ]; then
+    console_choose 'Inspect the app, then finish' Finish >/dev/null || true
+  fi
+)
+
+emit_demo_driver() {
+cat <<'DV_DEMO_PY'
+"""Local demo controller. Embedded so curl and Homebrew remain single-file installs."""
+import argparse
+import base64
+import json
+import os
+from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+import webbrowser
+import xml.etree.ElementTree as ET
+import zipfile
+
+
+def note(text):
+    print(f"  ▸ {text}", flush=True)
+
+
+def private_write(path, content):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+    path.chmod(0o600)
+
+
+def command(args, **kwargs):
+    return subprocess.run(args, check=True, text=True, **kwargs)
+
+
+def remote(cli, name, script, timeout=60):
+    # Keep every devflow-managed remote shell operation behind the exec-style probe.
+    return command([cli, '__demo-exec', name, script, str(timeout)],
+                   capture_output=True, timeout=timeout + 30).stdout
+
+
+def verify_sheet(path):
+    ns = {'t': 'urn:oasis:names:tc:opendocument:xmlns:table:1.0',
+          'o': 'urn:oasis:names:tc:opendocument:xmlns:office:1.0'}
+    with zipfile.ZipFile(path) as archive:
+        root = ET.fromstring(archive.read('content.xml'))
+    cells = root.findall('.//t:table-cell', ns)
+    text = [''.join(c.itertext()) for c in cells]
+    for value in ('Item', 'Units', 'Price', 'Total', 'Notebooks', 'Pens', 'Folders', 'Grand total'):
+        if value not in text:
+            raise RuntimeError(f'Spreadsheet verification failed: missing {value}')
+    formulas = [c for c in cells if c.get('{%s}formula' % ns['t'])]
+    if len(formulas) < 4 or not any(c.get('{%s}value' % ns['o']) == '86' for c in formulas):
+        raise RuntimeError('Spreadsheet formulas did not calculate the expected total (86)')
+
+
+class Desktop:
+    def __init__(self, args, client, folder):
+        self.args, self.client, self.folder = args, client, folder
+        self.name = 'dv-demo-' + args.mode + '-' + uuid.uuid4().hex[:10]
+        self.sandbox = None
+        self.recording = None
+        self.created = False
+        self.allocated = False
+        self.run_id = uuid.uuid4().hex
+        self.finished = False
+        self.steps = []
+
+    def frame(self, label):
+        self.steps.append({'step': label, 'time': time.time()})
+        private_write(self.folder / 'steps.json', json.dumps(self.steps, indent=2))
+        shot = self.sandbox.computer_use.screenshot.take_full_screen(request_timeout=30)
+        path = self.folder / 'desktop.png'
+        path.write_bytes(base64.b64decode(shot.screenshot))
+        path.chmod(0o600)
+        if self.args.view == 'terminal' and sys.stdout.isatty() and shutil.which('chafa'):
+            command(['chafa', '--format=symbols', '--size=80x24', str(path)], timeout=15)
+        note(label)
+
+    def key(self, key):
+        keyboard = self.sandbox.computer_use.keyboard
+        if '+' in key:
+            keyboard.hotkey(key, request_timeout=30)
+        else:
+            keyboard.press({'Return': 'enter', 'Escape': 'esc'}.get(key, key.lower()), request_timeout=30)
+        time.sleep(0.3)
+
+    def type(self, text):
+        self.sandbox.computer_use.keyboard.type(text, request_timeout=30)
+
+    def wait_window(self, title, attempts=30):
+        for _ in range(attempts):
+            windows = self.sandbox.computer_use.display.get_windows(request_timeout=30)
+            if title.lower() in str(windows).lower():
+                return
+            time.sleep(1)
+        self.frame(f'Window timeout · {title}')
+        raise RuntimeError(f'{title} window did not appear; see desktop.png')
+
+    def preview_url(self):
+        if self.args.domain:
+            domain = self.args.domain.removeprefix('https://').removeprefix('http://').rstrip('/')
+            url = f'https://{self.name.removeprefix("dv-")}--6080.{domain}/vnc.html?autoconnect=true&resize=scale'
+            note('Live VNC (your custom preview proxy): ' + url)
+            return url
+        try:
+            signed = self.sandbox.create_signed_preview_url(6080, expires_in_seconds=900, request_timeout=30).url
+            parts = urlsplit(signed)
+            query = parse_qsl(parts.query) + [('autoconnect', 'true'), ('resize', 'scale')]
+            url = urlunsplit(parts._replace(path=parts.path.rstrip('/') + '/vnc.html', query=urlencode(query)))
+            private_write(self.folder / 'preview-url.txt', url + '\n')
+            note('Native Daytona VNC link saved in preview-url.txt (15m bearer link; keep private).')
+            return url
+        except Exception as exc:
+            note(f'Native preview unavailable ({type(exc).__name__}); use Daytona dashboard VNC.')
+            return None
+
+    def run(self):
+        windows = self.args.mode == 'windows'
+        snapshot = 'windows-small' if windows else 'daytona-medium'
+        # Names are random and never reused. Retain the name before create, including API timeouts.
+        private_write(self.folder / 'sandbox.txt', self.name + '\n')
+        create = ['daytona', 'create', '--name=' + self.name, '--snapshot=' + snapshot,
+                  '--auto-stop=15', '--label=devflow=1', '--label=devflow.demo=' + self.args.mode,
+                  '--label=devflow.demo.run=' + self.run_id]
+        if os.environ.get('DAYTONA_TARGET'):
+            create.append('--target=' + os.environ['DAYTONA_TARGET'])
+        note(f'Creating {snapshot}: {self.name}')
+        self.created = True
+        result = subprocess.run(create, capture_output=True, text=True, timeout=300)
+        private_write(self.folder / 'create.log', result.stdout + result.stderr)
+        if result.returncode:
+            raise RuntimeError('Sandbox create failed; see create.log (check tier, regional quota, and snapshot availability)')
+        self.allocated = True
+        self.sandbox = self.client.get(self.name)
+        if not windows:
+            note('Installing LibreOffice Calc (first boot can take a few minutes)')
+            remote(self.args.cli, self.name,
+                   'command -v libreoffice >/dev/null || { sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libreoffice-calc; }', 600)
+        note('Starting desktop' if windows else 'Starting desktop and recording before any GUI actions')
+        self.sandbox.computer_use.start(request_timeout=120)
+        if windows:
+            note('Windows saves screenshots, not video: native recording is not reliable on this platform. Use the Linux desktop demo for MP4 recording.')
+            note('Waiting for the Windows shell to finish signing in')
+            self.wait_window('Program Manager', attempts=120)
+        else:
+            self.recording = self.sandbox.computer_use.recording.start('devflow-' + self.args.mode, request_timeout=60)
+        url = self.preview_url()
+        note('Fallback: Daytona dashboard → ' + self.name + ' → VNC')
+        if self.args.view == 'browser' and url:
+            webbrowser.open(url)
+        elif self.args.view == 'terminal' and not shutil.which('chafa'):
+            note('chafa not installed; showing progress only. Install: brew install chafa')
+        self.frame('Windows · desktop ready' if windows else 'Recording · desktop ready')
+        if windows:
+            self.key('win+r'); self.wait_window('Run')
+            self.type('notepad'); self.key('Return')
+            self.wait_window('Notepad')
+            self.type('Hello from devflow!\n\nThis is a real Windows VM in Daytona.\nComputer-use keyboard actions created this note.\nA screenshot of this desktop will be saved locally.')
+            self.frame('Windows · typed into Notepad through the computer-use API')
+        else:
+            self.key('alt+F2')
+            self.type('libreoffice --calc --norestore --nofirststartwizard')
+            self.key('Return'); self.wait_window('LibreOffice Calc')
+            time.sleep(2)
+            self.key('Escape'); self.key('ctrl+Home')
+            rows = [('Item', 'Units', 'Price', 'Total'),
+                    ('Notebooks', '4', '12', '=B2*C2'),
+                    ('Pens', '10', '2', '=B3*C3'),
+                    ('Folders', '6', '3', '=B4*C4'),
+                    ('Grand total', '', '', '=SUM(D2:D4)')]
+            for n, row in enumerate(rows):
+                self.key('ctrl+Home')
+                for _ in range(n): self.key('Down')
+                for column, value in enumerate(row):
+                    if value: self.type(value)
+                    self.key('Tab' if column < 3 else 'Return')
+                self.frame(f'Calc · row {n + 1}/{len(rows)} entered with keyboard actions')
+            self.key('ctrl+Home'); self.key('shift+space'); self.key('ctrl+b'); self.key('ctrl+Home')
+            self.key('ctrl+shift+s'); time.sleep(2)
+            self.key('ctrl+a'); self.type('/tmp/devflow-demo.ods'); self.key('Return')
+            time.sleep(3)
+            self.frame('Calc · saving spreadsheet and checking calculated reward data')
+            # Download bytes, then verify the actual saved GUI document, never synthesize it.
+            remote(self.args.cli, self.name, 'test -s /tmp/devflow-demo.ods', 30)
+            path = self.folder / 'spreadsheet.ods'
+            self.sandbox.fs.download_file('/tmp/devflow-demo.ods', str(path))
+            verify_sheet(path)
+            note('Verified spreadsheet: 3 line items, formulas, grand total 86')
+        time.sleep(2)
+        self.finished = True
+
+    def finalize(self):
+        # Best-effort artifact recovery must happen before deleting the desktop.
+        saved = self.recording is None
+        if self.recording:
+            try:
+                note('Stopping recording and downloading recording.mp4')
+                self.sandbox.computer_use.recording.stop(self.recording.id, request_timeout=120)
+                self.sandbox.computer_use.recording.download(self.recording.id, str(self.folder / 'recording.mp4'))
+                saved = True
+            except Exception as exc:
+                note(f'Recording recovery failed ({type(exc).__name__}). Keeping sandbox to avoid losing video.')
+        keep = (self.args.keep == '1' and self.finished) or not saved
+        if self.created and not keep:
+            if not self.allocated:
+                # A timed-out create might have allocated remotely; a duplicate
+                # name error must never result in deleting someone else's box.
+                info = subprocess.run(['daytona', 'info', self.name, '-f', 'json'],
+                                      capture_output=True, text=True, timeout=30)
+                if info.returncode == 0:
+                    data = json.loads(info.stdout)
+                    if data.get('labels', {}).get('devflow.demo.run') != self.run_id:
+                        raise RuntimeError(f'Refusing cleanup of unowned sandbox {self.name}')
+                else:
+                    note('Create outcome unconfirmed; inspect Daytona for ' + self.name)
+                    return
+            result = subprocess.run(['daytona', 'delete', self.name], capture_output=True, text=True, timeout=120)
+            if result.returncode:
+                # Creation may have failed before allocation; only confirm absence from a successful list.
+                listing = subprocess.run(['daytona', 'list', '-f', 'json'], capture_output=True, text=True, timeout=30)
+                try:
+                    items = json.loads(listing.stdout)
+                    complete = isinstance(items, list) or not items.get('nextCursor')
+                    if isinstance(items, dict): items = items['items']
+                    absent = listing.returncode == 0 and complete and all(s.get('name') != self.name for s in items)
+                except (ValueError, TypeError, AttributeError):
+                    absent = False
+                if not absent:
+                    raise RuntimeError(f'Cleanup failed. Run: devflow rm {self.name} --force')
+            note('Demo sandbox deleted; local artifacts preserved')
+        elif self.created:
+            note(f'Kept {self.name} (15m idle auto-stop; storage may still be billed). Cleanup: dv rm {self.name} --force')
+        if not saved:
+            raise RuntimeError('Recording was not downloaded; recover it via Daytona Screen Recordings')
+
+
+def make_eval_task(folder):
+    task = folder / 'task'
+    files = {
+        'task.toml': '''schema_version = "1.4"
+[task]
+name = "devflow/sum-sales"
+version = "1.0.0"
+[verifier]
+timeout_sec = 60
+[agent]
+timeout_sec = 60
+[environment]
+build_timeout_sec = 180
+cpus = 1
+memory_mb = 1024
+storage_mb = 3072
+''',
+        'instruction.md': 'Write the sum of 48, 20, and 18 as a decimal integer to /tmp/answer.txt.\n',
+        # Harbor uses su root for its log directories. The regular Daytona image
+        # defaults to a non-root desktop user, so use a tiny root-owned eval image.
+        'environment/Dockerfile': 'FROM ubuntu:24.04\nUSER root\nWORKDIR /app\n',
+        'solution/solve.sh': '#!/bin/bash\nset -eu\nprintf "86\\n" > /tmp/answer.txt\n',
+        'tests/test.sh': '''#!/bin/bash
+set -eu
+mkdir -p /logs/verifier
+if [ "$(cat /tmp/answer.txt 2>/dev/null || true)" = 86 ]; then
+  printf '1\\n' > /logs/verifier/reward.txt
+else
+  printf '0\\n' > /logs/verifier/reward.txt
+fi
+''',
+    }
+    for name, content in files.items():
+        private_write(task / name, content)
+    return task
+
+
+def eval_rewards(folder):
+    rewards = []
+    for path in folder.rglob('result.json'):
+        data = json.loads(path.read_text())
+        if 'verifier_result' not in data:
+            continue
+        if data.get('exception_info'):
+            raise RuntimeError(f'Harbor trial failed: see {path}')
+        value = (data.get('verifier_result') or {}).get('rewards', {}).get('reward')
+        if value is None:
+            raise RuntimeError(f'Harbor trial did not produce a reward: {path}')
+        rewards.append(float(value))
+    if len(rewards) != 1:
+        raise RuntimeError(f'Expected one scored trial, found {len(rewards)} in {folder}')
+    return rewards[0]
+
+
+def run_eval(folder):
+    task = make_eval_task(folder)
+    note('RL evaluation: task → isolated rollout → verifier → reward. No model training or LLM calls.')
+    scores = {}
+    for agent, expected in [('nop', 0), ('oracle', 1)]:
+        note(f'{agent}: building a small root-owned eval environment; expected reward {expected}')
+        args = ['harbor', 'run', '--path', str(task), '--agent', agent, '--env', 'daytona',
+                '--n-concurrent', '1', '--n-attempts', '1', '--max-retries', '0', '--delete',
+                '--jobs-dir', str(folder / agent), '--job-name', 'eval',
+                '--ek', 'auto_stop_interval_mins=15', '--ek', 'auto_delete_interval_mins=0']
+        # Harbor owns its environment lifecycle, including deletion after each trial.
+        child_env = dict(os.environ, HARBOR_TELEMETRY='0')
+        # Keep Harbor's progress/table live, but retain dependency tracebacks in
+        # the run folder instead of filling the console with shutdown chatter.
+        error_log = (folder / (agent + '-stderr.log')).open('w')
+        child = subprocess.Popen(args, start_new_session=True, env=child_env, stderr=error_log)
+        try:
+            rc = child.wait(timeout=900)
+        except (KeyboardInterrupt, subprocess.TimeoutExpired):
+            os.killpg(child.pid, signal.SIGINT)
+            try:
+                child.wait(timeout=45)
+            except subprocess.TimeoutExpired:
+                os.killpg(child.pid, signal.SIGKILL)
+                child.wait()
+            note('Interrupted Harbor; inspect Daytona for remaining trials. They auto-stop at 15m idle and delete on stop.')
+            raise
+        finally:
+            error_log.close()
+        if rc:
+            raise RuntimeError(f'Harbor {agent} failed (exit {rc}); inspect {folder / agent}')
+        scores[agent] = eval_rewards(folder / agent)
+        note(f'{agent} reward: {scores[agent]:g}')
+        if scores[agent] != expected:
+            raise RuntimeError(f'Unexpected {agent} reward; inspect the verifier artifacts')
+    private_write(folder / 'rewards.json', json.dumps(scores, indent=2))
+    note('Reward comparison: no-op 0 → oracle 1. A training loop could consume this signal; this demo only evaluates.')
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('mode', choices=['desktop', 'windows', 'rl'])
+    parser.add_argument('--cli', required=True)
+    parser.add_argument('--output', required=True)
+    parser.add_argument('--view', default='browser')
+    parser.add_argument('--keep', default='0')
+    parser.add_argument('--yes', default='0')
+    parser.add_argument('--domain', default='')
+    args = parser.parse_args()
+    os.umask(0o077)
+    parent = Path(args.output).expanduser().resolve()
+    parent.mkdir(parents=True, exist_ok=True)
+    folder = Path(tempfile.mkdtemp(prefix=args.mode + '-', dir=parent))
+    note('Artifacts: ' + str(folder))
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+    controller = None
+    try:
+        if args.mode == 'rl':
+            run_eval(folder)
+        else:
+            from daytona import Daytona, DaytonaConfig
+            client = Daytona(DaytonaConfig(api_key=os.environ.get('DAYTONA_API_KEY'),
+                             jwt_token=os.environ.get('DAYTONA_JWT_TOKEN'),
+                             organization_id=os.environ.get('DAYTONA_ORGANIZATION_ID'),
+                             api_url=os.environ.get('DAYTONA_API_URL')))
+            controller = Desktop(args, client, folder)
+            try:
+                controller.run()
+            finally:
+                old_int = signal.getsignal(signal.SIGINT)
+                old_term = signal.getsignal(signal.SIGTERM)
+                signal.signal(signal.SIGINT, signal.SIG_IGN)
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                try:
+                    controller.finalize()
+                finally:
+                    signal.signal(signal.SIGINT, old_int)
+                    signal.signal(signal.SIGTERM, old_term)
+                    # The pinned sync SDK has no close(); AsyncDaytona does.
+                    close = getattr(client, 'close', None)
+                    if close is not None:
+                        close()
+        note('Demo complete · ' + str(folder))
+    except (Exception, KeyboardInterrupt) as exc:
+        # SDK exceptions can include request details: never dump credentials or bearer URLs.
+        detail = str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__
+        print('Demo failed: ' + detail + '. Artifacts: ' + str(folder), file=sys.stderr)
+        return 130 if isinstance(exc, KeyboardInterrupt) else 1
+    video = folder / 'recording.mp4'
+    if video.exists() and args.yes != '1' and sys.stdin.isatty():
+        choice = input('Replay: [t] terminal (mpv), [o] open video, [Enter] finish: ').strip().lower()
+        if choice == 't':
+            if shutil.which('mpv'):
+                command(['mpv', '--no-config', '--vo=tct', '--really-quiet', str(video)])
+            else:
+                note('Install terminal replay: brew install mpv')
+        elif choice == 'o':
+            command(['open' if sys.platform == 'darwin' else 'xdg-open', str(video)])
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
+DV_DEMO_PY
+}
+
+cmd_demo_linked() (
   local yes=0 DV_PLAIN=0 demo_keep=0 demo_parent="" demo_child="" demo_team=""
   local text='Sandboxes let agents run code. Linked sandboxes let agents work together. Each sandbox keeps its own files.'
   local action roster output suffix
@@ -4081,7 +4889,7 @@ ${C_CYAN}${C_BOLD}devflow${C_RESET} $DEVFLOW_VERSION — agentic cloud dev sessi
 
 ${C_BOLD}start here${C_RESET}
   devflow setup                 one-time: accounts + auth (no API keys needed)
-  devflow demo                  guided linked-sandbox walkthrough; --yes to automate
+  devflow demo                  linked workers, desktop recording, Harbor eval, Windows
   devflow up [REPO]             spin up Claude Code / Codex on a repo & attach
   devflow up -m "fix bug X" --detach       fire-and-forget, close your laptop
   devflow team up [REPO] --task "build X"  run a multi-agent workflow in one
@@ -4153,6 +4961,9 @@ main() {
     sync)                 cmd_sync "$@" ;;
     team|teams)           cmd_team "$@" ;;
     demo)                 cmd_demo "$@" ;;
+    __demo-driver)        emit_demo_driver ;;
+    __bugfix-demo)        emit_bugfix_demo ;;
+    __demo-exec)          dt_run "$@" ;;
     token)                cmd_token "$@" ;;
     setup|init)           cmd_setup "$@" ;;
     doctor|check)         cmd_doctor "$@" ;;
