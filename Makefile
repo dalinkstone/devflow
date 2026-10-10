@@ -30,6 +30,7 @@ test:
 	python3 tests/test_console.py
 	python3 tests/test_demo.py
 	python3 tests/test_bugfix.py
+	python3 tests/test_agents.py
 
 test-docker:
 	bash tests/docker-provision-test.sh

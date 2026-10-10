@@ -1,7 +1,7 @@
 # devflow — agent notes
 
-Single-file bash CLI (`bin/devflow`) that runs Claude Code / Codex sessions in
-Daytona cloud sandboxes using the user's subscriptions (never API keys).
+Single-file bash CLI (`bin/devflow`) that runs coding agents in Daytona:
+Claude Code / Codex use subscriptions; OpenCode / Pi use opt-in provider API keys.
 Full docs: [docs/README.md](docs/README.md) — read the page matching your
 task: [usage](docs/usage.md) · [architecture](docs/architecture.md) ·
 [development](docs/development.md) · [releasing](docs/releasing.md).

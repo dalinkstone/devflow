@@ -84,6 +84,8 @@ the selected subscription sign-in into the disposable fixer and bills compute.
 
 | Trap | Rule |
 |---|---|
+| browser terminals may use zsh without `SSH_CONNECTION` | hook `.zshrc` too; auto-attach interactive TTYs outside tmux, not just SSH |
+| snapshot-global OpenCode packages can be root-owned even with a writable npm prefix | install pinned API agents under `~/.devflow/agents/AGENT` with explicit `npm --prefix`, then link into `~/.local/bin`; never mutate the snapshot package |
 | nvm-installed node/npm/omc/omx invisible to non-interactive login shells (ubuntu .bashrc early-returns) | after npm installs, `link_global_bin <name>` into `~/.local/bin` |
 | `omc setup` syncs `~/.claude/agents/` and **deletes unknown files** | install dv-* subagents **after** omc setup (see `phase_harness` ordering) |
 | `omx setup` writes `.omx` state into **cwd** | provisioner does `cd "$HOME"` at start — keep it |

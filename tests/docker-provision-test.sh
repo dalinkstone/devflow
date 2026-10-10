@@ -145,6 +145,7 @@ check "workdir recorded"          "grep -q Hello-World $H/.devflow/workdir"
 check "tmux.conf written"         "test -f $H/.tmux.conf"
 check "bashrc hook"               "grep -q devflow/shellrc $H/.bashrc"
 check "profile hook"              "grep -q devflow/shellrc $H/.profile"
+check "browser zsh hook"          "grep -q devflow/shellrc $H/.zshrc"
 check "dv-agent executable"       "test -x $H/.devflow/bin/dv-agent"
 check "dv-task-start executable"  "test -x $H/.devflow/bin/dv-task-start"
 check "dv-ensure executable"      "test -x $H/.devflow/bin/dv-ensure"
@@ -153,7 +154,7 @@ check "dv-agent parses"           "bash -n $H/.devflow/bin/dv-agent"
 check "dv-task-start parses"      "bash -n $H/.devflow/bin/dv-task-start"
 check "dv-ensure parses"          "bash -n $H/.devflow/bin/dv-ensure"
 check "shellrc parses"            "bash -n $H/.devflow/shellrc"
-check "provisioned marker v5"     "grep -qx 5 $H/.devflow/provisioned"
+check "provisioned marker v6"     "grep -qx 6 $H/.devflow/provisioned"
 
 check "detached tmux survived the provisioning caller" 'tmux has-session -t dv'
 check "tmux window agent"         'tmux list-windows -t dv | grep -q agent'
@@ -179,6 +180,16 @@ esac
 
 echo "=== re-run idempotency ==="
 if run_phase workspace >/dev/null 2>&1; then ok "workspace re-run idempotent"; else bad "workspace re-run"; fi
+
+echo "=== API agent installations (no model calls) ==="
+for agent in opencode pi; do
+  if sudo -u daytona -H env DV_PHASE=tools DV_AGENT="$agent" bash "$H/.devflow/stage/provision.sh"; then
+    ok "$agent provisioned"
+  else bad "$agent provisioning"; fi
+  check "$agent version" "\$HOME/.local/bin/$agent --version"
+  check "$agent uses private install" "readlink \$HOME/.local/bin/$agent | grep -q /.devflow/agents/$agent/"
+  check "$agent continue flag" "\$HOME/.local/bin/$agent --help 2>&1 | grep -q -- --continue"
+done
 
 echo
 echo "RESULTS: $PASS passed, $FAIL failed"

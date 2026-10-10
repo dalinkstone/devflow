@@ -14,9 +14,9 @@ before touching anything.
 ## The one-paragraph mental model
 
 devflow is a **single-file bash CLI** (`bin/devflow`) that orchestrates the
-official `daytona` CLI to run Claude Code / Codex sessions inside Daytona
-cloud sandboxes, authenticated with the user's **subscriptions** (Claude
-Pro/Max, ChatGPT Plus/Pro) — never API keys. It harvests auth locally, pushes
+official `daytona` CLI to run coding sessions inside Daytona sandboxes:
+Claude Code / Codex use subscriptions, OpenCode / Pi use opt-in provider
+API keys. It harvests auth locally, pushes
 an embedded provisioning script into the sandbox (4 idempotent phases:
 tools → auth → workspace → harness), and leaves a tmux session (`dv`)
 running the agent so the user can detach, close the laptop, and

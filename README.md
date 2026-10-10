@@ -1,6 +1,6 @@
 # devflow
 
-Cloud Claude/Codex sessions on Daytona.
+Cloud Claude, Codex, OpenCode, and Pi sessions on Daytona.
 
 ## Install
 
@@ -9,14 +9,18 @@ curl -fsSL https://devflow.sh/install | sh
 dv setup
 ```
 
+Use `dv setup opencode` or `dv setup pi` for API keys; `dv setup github` for repo access.
+
 ## Run
 
 ```sh
 dv up org/repo
+dv up org/repo --agent pi
 dv up org/repo -m "fix it" --detach
 dv peek
 dv status
 dv demo                    # choose a sandbox demo
+dv demo startup            # time sandbox creation + first command
 dv demo desktop            # recorded LibreOffice computer use
 dv demo rl                 # Harbor reward evaluation
 dv demo fix                # agent fixes an app; linked verifier checks it
@@ -46,6 +50,7 @@ Add `--aws-profile NAME`, `--secret-env VAR`, or `--env NAME=VALUE`.
 ## Access
 
 Run `dv web NAME`, or add `--port 3000` for an app. Use `dv mobile` or `dv attach` for SSH.
+Phone browser: `dv mobile NAME --browser` — private 15-minute QR, same live session.
 
 ## Cost
 

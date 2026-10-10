@@ -36,6 +36,10 @@ class DemoConsoleTests(unittest.TestCase):
         env.pop("DEVFLOW_SNAPSHOT", None)
         env.pop("DEVFLOW_TARGET", None)
         args = [str(ROOT / "bin/devflow"), "demo", "linked"]
+        if self._testMethodName == "test_startup_interrupt_cleanup":
+            args[-1] = "startup"
+            args.append("--yes")
+            env["FAKE_STARTUP_MODE"] = "interrupt"
         if self._testMethodName == "test_demo_chooser_exit":
             args.pop()
         if self._testMethodName != "test_gum_walkthrough":
@@ -116,13 +120,28 @@ class DemoConsoleTests(unittest.TestCase):
         self.assertEqual(self.finish(), 0)
         self.assertEqual(list(self.state.glob("*.json")), [])
 
+    def test_startup_interrupt_cleanup(self):
+        unrelated = self.state / "unrelated.json"
+        unrelated.write_text('{"id":"id-unrelated","name":"unrelated","state":"started","labels":{}}')
+        self.until("sandbox started; running first command")
+        # Wait for the fake remote command, not the banner printed before exec.
+        deadline = time.monotonic() + 5
+        while "STARTUP_BLOCKED" not in (self.root / "log").read_text():
+            self.assertLess(time.monotonic(), deadline, "startup command never ran")
+            time.sleep(0.05)
+        time.sleep(0.1)
+        os.killpg(self.process.pid, signal.SIGINT)
+        self.assertEqual(self.finish(), 130)
+        self.assertEqual(sorted(p.name for p in self.state.glob("*.json")), ["unrelated.json"])
+
     def test_demo_chooser_exit(self):
-        output = self.until("6) Exit")
+        output = self.until("7) Exit")
         self.assertIn("LibreOffice", output)
         self.assertIn("Harbor", output)
         self.assertIn("Tier 3+", output)
         self.assertIn("Fix a broken app", output)
-        os.write(self.master, b"6\n")
+        self.assertIn("Startup speed", output)
+        os.write(self.master, b"7\n")
         self.assertEqual(self.finish(), 0)
         self.assertEqual(list(self.state.glob("*.json")), [])
 

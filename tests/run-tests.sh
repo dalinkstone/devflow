@@ -77,10 +77,13 @@ run_devflow() { # args… (stdin=/dev/null, captures stdout+stderr, sets RC/OUT)
       FAKE_UNPROVISIONED="${FAKE_UNPROVISIONED:-0}" FAKE_AGENT_STATE="${FAKE_AGENT_STATE:-running}" FAKE_FAIL_TOOLS="${FAKE_FAIL_TOOLS:-0}" \
       FAKE_AGENT_NAME="${FAKE_AGENT_NAME:-codex}" FAKE_PEEK_VARIANT="${FAKE_PEEK_VARIANT:-default}" \
       FAKE_BUS_FAIL="${FAKE_BUS_FAIL:-0}" \
+      FAKE_STARTUP_MODE="${FAKE_STARTUP_MODE:-}" \
       FAKE_FIX_STATE="${FAKE_FIX_STATE:-completed}" FAKE_FIX_PASSED="${FAKE_FIX_PASSED:-5}" \
       FAKE_DELETE_FAIL="${FAKE_DELETE_FAIL:-0}" FAKE_TASK_BUSY="${FAKE_TASK_BUSY:-0}" \
       DAYTONA_API_KEY="${TEST_DAYTONA_API_KEY:-}" \
       CLOUDFLARE_API_TOKEN="${TEST_CLOUDFLARE_API_TOKEN:-}" \
+      DEVFLOW_OPENCODE_API_KEY="${TEST_OPENCODE_KEY:-}" DEVFLOW_PI_API_KEY="${TEST_PI_KEY:-}" \
+      GH_TOKEN="${TEST_GH_TOKEN:-}" \
       CODEX_HOME="$T_HOME/.codex" \
       "$DEVFLOW" "$@" </dev/null 2>&1)"
   RC=$?
@@ -858,6 +861,99 @@ assert_rc "demo works with join-style exec" "$RC" 0
 assert_eq "join demo cleans resources" "$(find "$T_STATE" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')" "0"
 
 # ===========================================================================
+echo "# startup speed demo"
+fresh_env argv
+run_devflow up --blank --agent opencode --detach
+assert_rc "API agent requires credentials before create" "$RC" 1
+assert_not_contains "missing API key creates nothing" "$(cat "$T_LOG")" 'daytona create'
+for API_AGENT in opencode pi; do
+  fresh_env argv
+  TEST_OPENCODE_KEY=FAKE_OPENCODE_SECRET
+  TEST_PI_KEY=FAKE_PI_SECRET
+  TEST_GH_TOKEN=FAKE_GITHUB_SECRET
+  printf 'DEVFLOW_OPENCODE_PROVIDER=openrouter\nDEVFLOW_OPENCODE_MODEL=vendor/model\nDEVFLOW_PI_PROVIDER=anthropic\nDEVFLOW_PI_MODEL=test-model\n' > "$T_CONFIG/config"
+  run_devflow up tester/api --agent "$API_AGENT" --detach -m 'ask me a question'
+  assert_rc "$API_AGENT up succeeds" "$RC" 0
+  assert_contains "$API_AGENT uses core harness" "$OUT" "harness=core"
+  assert_not_contains "$API_AGENT hides API key" "$OUT" SECRET
+  API_BUNDLE="$(extract_pushed_file /tmp/.dv-secrets.env)"
+  assert_not_contains "$API_AGENT excludes Claude subscription" "$API_BUNDLE" sk-ant-oat01
+  assert_not_contains "$API_AGENT excludes Codex subscription" "$API_BUNDLE" 'DV_CODEX_AUTH_B64=ey'
+  assert_contains "$API_AGENT forwards explicit GH token" "$API_BUNDLE" 'DV_GH_TOKEN=FAKE_GITHUB_SECRET'
+  API_PAYLOAD="$(printf '%s\n' "$API_BUNDLE" | sed -n 's/^DV_PROVIDER_ENV_B64=//p' | base64 --decode)"
+  if [ "$API_AGENT" = opencode ]; then
+    assert_contains "OpenCode uses selected provider" "$API_PAYLOAD" 'OPENROUTER_API_KEY=FAKE_OPENCODE_SECRET'
+    assert_contains "OpenCode preserves nested model ID" "$API_PAYLOAD" 'DEVFLOW_SESSION_MODEL=openrouter/vendor/model'
+    assert_not_contains "OpenCode excludes Pi key" "$API_PAYLOAD" FAKE_PI_SECRET
+  else
+    assert_contains "Pi uses selected provider" "$API_PAYLOAD" 'ANTHROPIC_API_KEY=FAKE_PI_SECRET'
+    assert_not_contains "Pi excludes OpenCode key" "$API_PAYLOAD" FAKE_OPENCODE_SECRET
+  fi
+  run_devflow sync dv-api
+  assert_rc "$API_AGENT sync reads sandbox agent rather than local default" "$RC" 0
+  run_devflow mobile dv-api --browser --no-qr --no-copy
+  assert_rc "$API_AGENT has phone browser access" "$RC" 0
+  assert_contains "browser mobile shows private native URL" "$OUT" 'preview.example.invalid'
+  assert_contains "browser mobile warns about terminal control" "$OUT" 'anyone with it can control'
+  assert_not_contains "browser mobile does not use personal proxy" "$OUT" 'devflow.sh'
+  assert_file_contains "browser mobile defaults to 15m" "$T_LOG" '--port=22222 --expires=900'
+  run_devflow web dv-api --native --port 3000 --expires 10
+  assert_rc "native app preview succeeds" "$RC" 0
+  assert_file_contains "native app preview honors expiry and port" "$T_LOG" '--port=3000 --expires=600'
+  run_devflow mobile dv-api --browser --expires 0
+  assert_rc "browser rejects invalid expiry" "$RC" 1
+  run_devflow mobile dv-api --browser --send
+  assert_rc "browser rejects unsupported send mode" "$RC" 1
+  run_devflow config get DEVFLOW_OPENCODE_API_KEY
+  assert_rc "config never prints API keys" "$RC" 1
+done
+unset TEST_OPENCODE_KEY TEST_PI_KEY TEST_GH_TOKEN
+
+fresh_env argv
+run_devflow demo startup --help
+assert_rc "startup help exits 0" "$RC" 0
+assert_contains "startup help explains timing" "$OUT" 'first command'
+run_devflow demo startup
+assert_rc "startup requires confirmation or yes" "$RC" 1
+run_devflow demo startup --keep --yes
+assert_rc "startup rejects keep" "$RC" 1
+assert_not_contains "invalid startup calls create nothing" "$(cat "$T_LOG")" 'daytona create'
+printf 'DEVFLOW_SNAPSHOT=missing-old-snapshot\nDEVFLOW_TARGET=us\n' > "$T_CONFIG/config"
+run_devflow demo startup --yes --plain
+assert_rc "startup demo succeeds" "$RC" 0
+assert_contains "startup shows real command output" "$OUT" 'hello from a fresh sandbox'
+assert_contains "startup reports creation time" "$OUT" 'Sandbox creation'
+assert_contains "startup reports command time" "$OUT" 'First command'
+assert_contains "startup reports total time" "$OUT" 'Total to output'
+assert_eq "startup timings are nonnegative seconds" "$(printf '%s\n' "$OUT" | grep -Ec '^  (Sandbox creation|First command|Total to output) +[0-9]+\.[0-9]{2} s$')" 3
+assert_contains "startup explains measurement overhead" "$OUT" 'CLI/network overhead'
+assert_eq "startup creates exactly one sandbox" "$(grep -c '^daytona create ' "$T_LOG")" 1
+assert_file_contains "startup bypasses custom snapshot" "$T_LOG" '--snapshot=daytona-small'
+assert_file_contains "startup honors target" "$T_LOG" '--target=us'
+assert_file_contains "startup has safety auto-stop" "$T_LOG" '--auto-stop=15'
+assert_not_contains "startup hides preview chatter" "$OUT" 'daytonaproxy01.net'
+assert_not_contains "startup hides routine successful exec warnings" "$OUT" 'routine Daytona version warning'
+assert_not_contains "startup never copies credentials" "$(cat "$T_LOG")" '.dv-secrets'
+assert_not_contains "startup never provisions tools" "$(cat "$T_LOG")" 'provision.sh'
+assert_eq "startup deletes its sandbox" "$(find "$T_STATE" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')" 0
+for FAKE_STARTUP_MODE in create-fail exec-fail wrong-output; do
+  run_devflow demo startup --yes
+  assert_rc "startup fails on $FAKE_STARTUP_MODE" "$RC" 1
+  assert_not_contains "failed startup shows no success timings ($FAKE_STARTUP_MODE)" "$OUT" 'Total to output'
+  assert_eq "failed startup cleans up ($FAKE_STARTUP_MODE)" "$(find "$T_STATE" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')" 0
+done
+unset FAKE_STARTUP_MODE
+FAKE_DELETE_FAIL=1
+run_devflow demo startup --yes
+assert_rc "startup fails if cleanup fails" "$RC" 1
+assert_contains "startup cleanup failure is actionable" "$OUT" 'cleanup failed: devflow rm dv-startup-'
+assert_not_contains "startup cleanup failure never claims deletion" "$OUT" 'demo sandboxes deleted'
+FAKE_DELETE_FAIL=0
+fresh_env join
+run_devflow demo startup --yes
+assert_rc "startup supports join exec style" "$RC" 0
+assert_eq "join startup cleans up" "$(find "$T_STATE" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')" 0
+
 echo "# bug-fixing demo"
 fresh_env argv
 run_devflow demo fix --agent both --yes
@@ -871,7 +967,7 @@ assert_eq "fix cleans both sandboxes" "$(find "$T_STATE" -maxdepth 1 -name '*.js
 assert_not_contains "fix never logs signed preview token" "$OUT" FAKE_PREVIEW_SECRET
 FIX_SECRETS="$(extract_pushed_file /tmp/.dv-secrets.env)"
 assert_contains "fix forwards selected Codex auth" "$FIX_SECRETS" 'DV_CODEX_AUTH_B64=ey'
-assert_eq "fix strips GitHub auth" "$(printf '%s\n' "$FIX_SECRETS" | sed -n 's/^DV_GH_TOKEN=//p')" ''
+assert_eq "fix strips GitHub auth" "$(printf '%s\n' "$FIX_SECRETS" | sed -n 's/^DV_GH_TOKEN=//p')" "''"
 assert_not_contains "fix does not forward GitHub token" "$FIX_SECRETS" 'gho_'
 assert_contains "fix disables unrelated Claude auth" "$FIX_SECRETS" 'DV_CLAUDE_MODE=none'
 assert_eq "fix never provisions verifier with credentials" "$(awk '/^EXEC\[.*-verifier\].*provision.sh/ {n++} END {print n+0}' "$T_LOG")" 0

@@ -2,8 +2,8 @@
 # ============================================================================
 #  devflow — your agentic cloud dev environment
 #
-#  Spin up Claude Code or Codex in a Daytona sandbox using your existing
-#  subscriptions (Claude Max / ChatGPT Pro) — no agent API keys. Optional
+#  Spin up Claude Code/Codex with subscriptions or OpenCode/Pi with API keys.
+#  Optional
 #  deployment credentials are forwarded only through explicit flags. Sessions
 #  live in tmux inside the sandbox, so you can close your laptop and reattach from
 #  anywhere with `devflow attach`.
@@ -13,7 +13,7 @@
 set -u
 set -o pipefail
 
-DEVFLOW_VERSION="0.9.0"
+DEVFLOW_VERSION="0.10.0"
 
 # ----------------------------------------------------------------------------
 # Config (precedence: environment > config file > built-in default)
@@ -26,14 +26,15 @@ GH_PIN_VERSION="2.96.0"          # fallback for in-sandbox gh install
 CODEX_PIN_TAG="rust-v0.142.5"    # fallback for in-sandbox codex install
 DT_MIN_VERSION="0.200.0"         # older clients spam API mismatch warnings
 DT_PIN_VERSION="0.200.1"         # fallback for in-sandbox daytona install (--with-daytona)
-DV_EXPECTED_PROVISION_VERSION=5
+DV_EXPECTED_PROVISION_VERSION=6
 
 _CONFIG_KEYS="DEVFLOW_AGENT DEVFLOW_SIZE DEVFLOW_CPU DEVFLOW_MEMORY DEVFLOW_DISK DEVFLOW_AUTO_STOP DEVFLOW_TARGET DEVFLOW_SNAPSHOT DEVFLOW_CLAUDE_AUTH DEVFLOW_EXEC_STYLE DEVFLOW_WORKROOT DEVFLOW_HARNESS DEVFLOW_NTFY_URL DEVFLOW_NTFY_TOPIC DEVFLOW_AUTO_HANDOFF DEVFLOW_DOMAIN"
+_CONFIG_KEYS="$_CONFIG_KEYS DEVFLOW_OPENCODE_PROVIDER DEVFLOW_OPENCODE_MODEL DEVFLOW_PI_PROVIDER DEVFLOW_PI_MODEL"
 
 load_config() {
   # 1) preserve values that came from the caller's environment
   local k v _envsaved=""
-  for k in $_CONFIG_KEYS DEVFLOW_CLAUDE_TOKEN DEVFLOW_DAYTONA_SANDBOX_KEY; do
+  for k in $_CONFIG_KEYS DEVFLOW_CLAUDE_TOKEN DEVFLOW_DAYTONA_SANDBOX_KEY DEVFLOW_OPENCODE_API_KEY DEVFLOW_PI_API_KEY; do
     eval "v=\${$k-__devflow_unset__}"
     if [ "$v" != "__devflow_unset__" ]; then
       _envsaved="$_envsaved $k=$(printf '%q' "$v")"
@@ -47,7 +48,9 @@ load_config() {
   # 3) environment wins
   [ -n "$_envsaved" ] && eval "$_envsaved"
   # 4) defaults fill the gaps
-  : "${DEVFLOW_AGENT:=claude}"          # claude | codex | both | none
+  : "${DEVFLOW_AGENT:=claude}"          # claude | codex | opencode | pi | both | none
+  : "${DEVFLOW_OPENCODE_PROVIDER:=anthropic}" "${DEVFLOW_OPENCODE_MODEL:=}" "${DEVFLOW_OPENCODE_API_KEY:=}"
+  : "${DEVFLOW_PI_PROVIDER:=anthropic}" "${DEVFLOW_PI_MODEL:=}" "${DEVFLOW_PI_API_KEY:=}"
   : "${DEVFLOW_SIZE:=}"                 # small | medium | large; "" = medium
   : "${DEVFLOW_CPU:=}"                  # legacy; maps to the smallest size that fits
   : "${DEVFLOW_MEMORY:=}"               # legacy (MB); ditto
@@ -81,6 +84,22 @@ resolve_harness() { # AGENT REQUESTED -> effective harness
     none) printf 'core' ;;
     *)    printf '%s' "$req" ;;
   esac
+}
+
+api_agent_settings() { # AGENT -> API_PROVIDER / API_MODEL / API_KEY / API_ENV_NAME
+  case "$1" in
+    opencode) API_PROVIDER="$DEVFLOW_OPENCODE_PROVIDER"; API_MODEL="$DEVFLOW_OPENCODE_MODEL"; API_KEY="$DEVFLOW_OPENCODE_API_KEY" ;;
+    pi) API_PROVIDER="$DEVFLOW_PI_PROVIDER"; API_MODEL="$DEVFLOW_PI_MODEL"; API_KEY="$DEVFLOW_PI_API_KEY" ;;
+    *) return 1 ;;
+  esac
+  case "$API_PROVIDER" in
+    anthropic) API_ENV_NAME=ANTHROPIC_API_KEY ;;
+    openai) API_ENV_NAME=OPENAI_API_KEY ;;
+    openrouter) API_ENV_NAME=OPENROUTER_API_KEY ;;
+    *) die "unsupported $1 provider '$API_PROVIDER' — run: devflow setup $1" ;;
+  esac
+  [ -n "$API_KEY" ] && [ -n "$API_MODEL" ] || die "$1 needs a provider API key and model — run: devflow setup $1"
+  case "$API_MODEL" in -*|*[!a-zA-Z0-9_./:@+-]*) die "invalid $1 model ID — run: devflow setup $1" ;; esac
 }
 
 # Daytona sizes sandboxes via its fixed-size default snapshots — the API
@@ -460,8 +479,8 @@ harvest_all() {
   local cf="${CODEX_HOME:-$HOME/.codex}/auth.json"
   [ -f "$cf" ] && CODEX_AUTH_B64="$(b64_encode <"$cf")"
   # --- github ---
-  GH_TOKEN_VAL=""
-  have_cmd gh && GH_TOKEN_VAL="$(gh auth token 2>/dev/null || true)"
+  GH_TOKEN_VAL="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+  if [ -z "$GH_TOKEN_VAL" ] && have_cmd gh; then GH_TOKEN_VAL="$(gh auth token --hostname github.com 2>/dev/null || true)"; fi
   # --- git identity ---
   GIT_NAME="$(git config --global user.name 2>/dev/null || git config user.name 2>/dev/null || true)"
   GIT_EMAIL="$(git config --global user.email 2>/dev/null || git config user.email 2>/dev/null || true)"
@@ -532,13 +551,21 @@ output = json"
   return 0
 }
 
-build_secrets_bundle() { # stdout: env file consumed by the sandbox provisioner
+build_secrets_bundle() { # [AGENT] stdout: env file consumed by the sandbox provisioner
   harvest_all
+  local selected="${1:-$DEVFLOW_AGENT}" provider_env=""
+  local CLAUDE_MODE="$CLAUDE_MODE" CLAUDE_TOKEN="$CLAUDE_TOKEN" CLAUDE_CREDS_B64="$CLAUDE_CREDS_B64" CODEX_AUTH_B64="$CODEX_AUTH_B64"
+  case "$selected" in opencode|pi)
+    api_agent_settings "$selected" || return 1
+    provider_env="$(printf 'export %s=%q\nexport DEVFLOW_SESSION_MODEL=%q\n' "$API_ENV_NAME" "$API_KEY" "$API_PROVIDER/$API_MODEL")"
+    CLAUDE_MODE=none; CLAUDE_TOKEN=""; CLAUDE_CREDS_B64=""; CODEX_AUTH_B64=""
+    ;; esac
+  printf 'DV_PROVIDER_ENV_B64=%s\n' "$(printf '%s' "$provider_env" | b64_encode)"
   printf 'DV_CLAUDE_MODE=%s\n' "$CLAUDE_MODE"
   printf 'DV_CLAUDE_TOKEN=%s\n' "$CLAUDE_TOKEN"
   printf 'DV_CLAUDE_CREDS_B64=%s\n' "$CLAUDE_CREDS_B64"
   printf 'DV_CODEX_AUTH_B64=%s\n' "$CODEX_AUTH_B64"
-  printf 'DV_GH_TOKEN=%s\n' "$GH_TOKEN_VAL"
+  printf 'DV_GH_TOKEN=%q\n' "$GH_TOKEN_VAL"
   printf 'DV_GIT_NAME=%q\n' "${GIT_NAME:-}"
   printf 'DV_GIT_EMAIL=%q\n' "${GIT_EMAIL:-}"
   printf 'DV_GH_PIN=%s\n' "$GH_PIN_VERSION"
@@ -555,6 +582,12 @@ build_secrets_bundle() { # stdout: env file consumed by the sandbox provisioner
 auth_summary() { # print what will be synced (no secret values)
   harvest_all
   local ready=""
+  case "${1:-$DEVFLOW_AGENT}" in
+    opencode|pi)
+      api_agent_settings "${1:-$DEVFLOW_AGENT}" || return 1
+      ready="${1:-$DEVFLOW_AGENT} ($API_PROVIDER API key; usage billed by provider)"
+      ;;
+    *)
   case "$CLAUDE_MODE" in
     token) ready="claude" ;;
     creds) ready="claude" ;;
@@ -562,6 +595,8 @@ auth_summary() { # print what will be synced (no secret values)
   esac
   if [ -n "$CODEX_AUTH_B64" ]; then ready="${ready}${ready:+ · }codex"
   else warn "Codex: no ~/.codex/auth.json — run 'codex' locally and sign in with ChatGPT first"; fi
+    ;;
+  esac
   if [ -n "$GH_TOKEN_VAL" ]; then ready="${ready}${ready:+ · }github"
   else warn "GitHub: gh not authenticated — private clones/pushes won't work (gh auth login)"; fi
   [ -z "$ready" ] || ok "auth ready: $ready"
@@ -616,7 +651,7 @@ set -o pipefail
 DV_DIR="$HOME/.devflow"
 DV_BIN="$DV_DIR/bin"
 DV_STAGE="$DV_DIR/stage"
-DV_PROVISION_VERSION=5
+DV_PROVISION_VERSION=6
 export PATH="$HOME/.local/bin:$DV_BIN:$PATH"
 
 : "${DV_PHASE:=all}"
@@ -695,6 +730,7 @@ load_secrets() {
   DV_GH_TOKEN="" DV_GIT_NAME="" DV_GIT_EMAIL="" DV_GH_PIN="2.96.0" DV_CODEX_PIN="rust-v0.142.5"
   DV_AWS_ENABLED=0 DV_AWS_CREDS_B64="" DV_AWS_CONFIG_B64="" DV_AWS_EXPIRATION="" DV_AWS_SOURCE_PROFILE=""
   DV_SECRET_ENV_B64="" DV_SECRET_ENV_NAMES=""
+  DV_PROVIDER_ENV_B64=""
   if [ -f "$DV_STAGE/secrets.env" ]; then
     # shellcheck disable=SC1090
     . "$DV_STAGE/secrets.env"
@@ -875,6 +911,37 @@ phase_tools() {
   [ -n "$tag" ] || tag="$DV_CODEX_PIN"
   codex_want="${tag#rust-v}"
   codex_have="$(codex --version 2>/dev/null | awk '{print $NF}' | sed 's/^v//' || true)"
+
+  case "$DV_AGENT" in
+    opencode|pi)
+      ensure_npm || fail "npm is required for $DV_AGENT"
+      if [ "$DV_AGENT" = pi ] && version_lt "$(node --version | sed 's/^v//')" 22.19.0; then
+        export NVM_DIR="$HOME/.nvm"
+        if [ ! -s "$NVM_DIR/nvm.sh" ]; then
+          curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash > "$DV_DIR/nvm-install.log" 2>&1 || fail "node setup failed"
+        fi
+        # shellcheck disable=SC1091
+        . "$NVM_DIR/nvm.sh"
+        nvm install 22 >> "$DV_DIR/nvm-install.log" 2>&1 || fail "Pi needs Node 22.19+"
+        link_global_bin node; link_global_bin npm; link_global_bin npx
+      fi
+      local package version install_dir
+      if [ "$DV_AGENT" = opencode ]; then package=opencode-ai; version=1.18.35
+      else package=@earendil-works/pi-coding-agent; version=1.1.0; fi
+      if [ "$("$DV_AGENT" --version 2>/dev/null)" != "$version" ]; then
+        # Snapshot-global packages can be root-owned even when npm's prefix is writable.
+        install_dir="$DV_DIR/agents/$DV_AGENT"
+        mkdir -p "$install_dir"
+        if [ "$DV_AGENT" = pi ]; then
+          npm install --prefix "$install_dir" --ignore-scripts --no-audit --no-fund "$package@$version" > "$DV_DIR/$DV_AGENT-install.log" 2>&1 || fail "$DV_AGENT install failed (see ~/.devflow/$DV_AGENT-install.log)"
+        else
+          npm install --prefix "$install_dir" --no-audit --no-fund "$package@$version" > "$DV_DIR/$DV_AGENT-install.log" 2>&1 || fail "$DV_AGENT install failed (see ~/.devflow/$DV_AGENT-install.log)"
+        fi
+        ln -sf "$install_dir/node_modules/.bin/$DV_AGENT" "$HOME/.local/bin/$DV_AGENT"
+      fi
+      "$DV_AGENT" --version >/dev/null 2>&1 || fail "$DV_AGENT is not runnable"
+      ;;
+  esac
   install_codex=0
   if [ -z "$codex_have" ] || version_lt "$codex_have" "$codex_want"; then
     install_codex=1
@@ -928,7 +995,7 @@ phase_tools() {
 
 # ============================ phase: auth ====================================
 phase_auth() {
-  log "phase 2/4 auth: applying subscription credentials…"
+  log "phase 2/4 auth: applying credentials…"
   load_secrets
   umask 077
   mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.aws"
@@ -936,6 +1003,9 @@ phase_auth() {
 
   : > "$DV_DIR/env"
   chmod 600 "$DV_DIR/env"
+  printf '%s' "$DV_PROVIDER_ENV_B64" | base64 -d > "$DV_DIR/provider.env"
+  chmod 600 "$DV_DIR/provider.env"
+  printf '%s\n' '[ -f "$HOME/.devflow/provider.env" ] && . "$HOME/.devflow/provider.env"' >> "$DV_DIR/env"
   case "$DV_CLAUDE_MODE" in
     token)
       printf 'export CLAUDE_CODE_OAUTH_TOKEN=%q\n' "$DV_CLAUDE_TOKEN" >> "$DV_DIR/env"
@@ -1172,7 +1242,7 @@ DV_TMUXCONF
 
   # ---- shell integration ----
   cat > "$DV_DIR/shellrc" <<'DV_SHELLRC'
-# devflow shell integration (sourced from ~/.bashrc and ~/.profile)
+# devflow shell integration (bash, zsh, and login shells)
 [ -n "${DEVFLOW_SHELLRC_RAN:-}" ] && return 0
 DEVFLOW_SHELLRC_RAN=1; export DEVFLOW_SHELLRC_RAN
 
@@ -1185,9 +1255,9 @@ export DEVFLOW_NAME
 alias dv-work='cd "$(cat "$HOME/.devflow/workdir" 2>/dev/null || echo "$HOME")"'
 alias yolo='claude --dangerously-skip-permissions'
 
-# Auto-attach the devflow tmux session on interactive SSH logins, so
-# `devflow attach` / `daytona ssh` drop straight into the agent.
-if [ -n "${SSH_CONNECTION:-}" ] && [ -z "${TMUX:-}" ] && [ -t 0 ] \
+# Auto-attach SSH and browser terminals. Daytona's web terminal may launch zsh
+# without SSH_CONNECTION; the tmux guard prevents recursive attachment.
+if [ -z "${TMUX:-}" ] && [ -t 0 ] \
    && [ -f "$HOME/.devflow/autotmux" ] && command -v tmux >/dev/null 2>&1; then
   case "$-" in
     *i*)
@@ -1200,7 +1270,7 @@ fi
 DV_SHELLRC
 
   local rcfile
-  for rcfile in "$HOME/.bashrc" "$HOME/.profile"; do
+  for rcfile in "$HOME/.bashrc" "$HOME/.profile" "$HOME/.zshrc"; do
     if ! grep -q 'devflow/shellrc' "$rcfile" 2>/dev/null; then
       {
         printf '\n# --- devflow ---\n'
@@ -1212,7 +1282,7 @@ DV_SHELLRC
   # ---- in-sandbox helper scripts ----
   cat > "$DV_BIN/dv-agent" <<'DV_DVAGENT'
 #!/usr/bin/env bash
-# dv-agent [claude|codex] — launch the coding agent in the work directory,
+# dv-agent [claude|codex|opencode|pi] — launch the coding agent in the work directory,
 # resuming the previous conversation when one exists.
 set -u
 set -o pipefail
@@ -1272,6 +1342,20 @@ has_claude_history() {
 }
 
 case "$AGENT" in
+  opencode|pi)
+    args=("$AGENT" --continue)
+    [ -z "${DEVFLOW_SESSION_MODEL:-}" ] || args+=(--model "$DEVFLOW_SESSION_MODEL")
+    if [ -n "$TASK" ]; then
+      if [ "$AGENT" = opencode ]; then args+=(--prompt "$(cat "$TASK_FILE")")
+      else args+=(-- "$(cat "$TASK_FILE")"); fi
+    fi
+    status_write interactive
+    "${args[@]}"
+    rc=$?
+    COMPLETED_AT="$(date -u +%FT%TZ)"
+    if [ "$rc" -eq 0 ]; then status_write completed "$rc"; else status_write failed "$rc"; fi
+    exit "$rc"
+    ;;
   codex)
     if [ -n "$TASK" ]; then
       : > "$RUN_DIR/agent.log"
@@ -1326,12 +1410,17 @@ command -v tmux >/dev/null 2>&1 || { echo "tmux is not installed" >&2; exit 1; }
 
 state="$(sed -n 's/^state=//p' "$RUN_DIR/status" 2>/dev/null | head -1)"
 pid="$(sed -n 's/^pid=//p' "$RUN_DIR/status" 2>/dev/null | head -1)"
-if [ "$state" = "running" ] && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+if { [ "$state" = "running" ] || [ "$state" = "interactive" ]; } && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
   echo "an agent task is already running (pid $pid)" >&2
   exit 2
 fi
 if [ -n "$AGENT_OVERRIDE" ]; then
-  case "$AGENT_OVERRIDE" in claude|codex|both) AGENT="$AGENT_OVERRIDE" ;; *) echo "invalid agent override" >&2; exit 1 ;; esac
+  case "$AGENT:$AGENT_OVERRIDE" in
+    opencode:*|pi:*|*:opencode|*:pi)
+      [ "$AGENT" = "$AGENT_OVERRIDE" ] || { echo "changing API agents needs a new sandbox (--name or --fresh), with its own tools and credentials" >&2; exit 1; }
+      ;;
+  esac
+  case "$AGENT_OVERRIDE" in claude|codex|opencode|pi|both) AGENT="$AGENT_OVERRIDE" ;; *) echo "invalid agent override" >&2; exit 1 ;; esac
   printf '%s' "$AGENT" > "$DV_DIR/agent"
 fi
 [ "$AGENT" != "none" ] || { echo "sandbox agent is set to none" >&2; exit 1; }
@@ -1585,11 +1674,11 @@ DVPROV_EOF
 # ----------------------------------------------------------------------------
 # Provision + sync orchestration (local side)
 # ----------------------------------------------------------------------------
-upload_provisioner() { # NAME [WITH_SECRETS]
-  local name="$1" with_secrets="${2:-1}"
+upload_provisioner() { # NAME [WITH_SECRETS] [AGENT]
+  local name="$1" with_secrets="${2:-1}" selected="${3:-$DEVFLOW_AGENT}"
   emit_provision_script | dt_push_file "$name" "/tmp/.dv-provision.sh"
   if [ "$with_secrets" = 1 ]; then
-    build_secrets_bundle | dt_push_file "$name" "/tmp/.dv-secrets.env"
+    build_secrets_bundle "$selected" | dt_push_file "$name" "/tmp/.dv-secrets.env" || return 1
   fi
   dt_run "$name" 'mkdir -p "$HOME/.devflow/stage" && chmod 700 "$HOME/.devflow" "$HOME/.devflow/stage" && mv -f /tmp/.dv-provision.sh "$HOME/.devflow/stage/provision.sh" && { [ ! -f /tmp/.dv-secrets.env ] || mv -f /tmp/.dv-secrets.env "$HOME/.devflow/stage/secrets.env"; }' 120 >/dev/null
 }
@@ -1620,10 +1709,10 @@ provision_sandbox() { # NAME AGENT REPO BRANCH TASK HARNESS
   local name="$1" agent="$2" repo="$3" branch="$4" task="$5" harness="$6" task_b64=""
   [ -n "$task" ] && task_b64="$(printf '%s' "$task" | b64_encode)"
 
-  step "uploading provisioner + syncing subscription auth…"
-  upload_provisioner "$name" 1
+  step "uploading provisioner + syncing auth…"
+  upload_provisioner "$name" 1 "$agent" || die "could not upload provisioner/auth"
 
-  step "installing tools (tmux, gh, claude, codex)…"
+  step "installing tools (tmux, gh, $agent)…"
   run_phase_clean "$name" tools "$agent" "$repo" "$branch" "$task_b64" "$harness" \
     || die "sandbox tools phase failed; task was not queued"
 
@@ -1647,14 +1736,14 @@ sandbox_is_provisioned() { # NAME
 }
 
 agent_task_state() { # NAME
-  dt_run "$1" 'i=0; state=""; while [ "$i" -lt 30 ]; do state="$(sed -n "s/^state=//p" "$HOME/.devflow/run/status" 2>/dev/null | head -1)"; case "$state" in running|completed|failed) break ;; esac; i=$((i + 1)); sleep 1; done; printf "%s\n" "${state:-not-started}"' 60 2>/dev/null | tail -1
+  dt_run "$1" 'i=0; state=""; while [ "$i" -lt 30 ]; do state="$(sed -n "s/^state=//p" "$HOME/.devflow/run/status" 2>/dev/null | head -1)"; case "$state" in running|interactive|completed|failed) break ;; esac; i=$((i + 1)); sleep 1; done; printf "%s\n" "${state:-not-started}"' 60 2>/dev/null | tail -1
 }
 
 verify_agent_task_started() { # NAME
   local state
   state="$(agent_task_state "$1")"
   case "$state" in
-    running|completed) ok "agent task state: $state" ;;
+    running|interactive|completed) ok "agent task state: $state" ;;
     failed) die "agent task exited immediately (inspect: devflow peek $1; devflow status $1)" ;;
     *) die "agent task did not start (state: ${state:-unknown}; inspect: devflow status $1)" ;;
   esac
@@ -1851,10 +1940,12 @@ set_forwarding_options() { # AWS_PROFILE SECRET_ENV_NAMES ALLOW_STATIC ENV_ITEMS
 }
 
 refresh_forwarded_auth() { # NAME [RUN_TOOLS]
-  local name="$1" run_tools="${2:-0}"
+  local name="$1" run_tools="${2:-0}" selected
   ensure_running "$name"
+  selected="$(dt_run "$name" 'cat "$HOME/.devflow/agent"' 30)" || die "could not read sandbox agent"
+  case "$selected" in claude|codex|opencode|pi|both|none) ;; *) die "sandbox agent is unknown; run devflow up first" ;; esac
   step "re-syncing auth and explicitly forwarded credentials into '$name'…"
-  upload_provisioner "$name" 1
+  upload_provisioner "$name" 1 "$selected" || die "could not upload credentials"
   if [ "$run_tools" = 1 ]; then
     run_phase "$name" tools "" "" "" "" "core" \
       || die "sandbox tools phase failed; auth was not refreshed"
@@ -1952,7 +2043,8 @@ cmd_up() {
   # Resolve and validate credentials before creating anything billable.
   if [ -n "$aws_profile$secret_env_names$env_items" ]; then harvest_all; fi
 
-  case "$agent" in claude|codex|both|none) ;; *) die "invalid --agent '$agent' (claude|codex|both|none)" ;; esac
+  case "$agent" in claude|codex|opencode|pi|both|none) ;; *) die "invalid --agent '$agent' (claude|codex|opencode|pi|both|none)" ;; esac
+  case "$agent" in opencode|pi) api_agent_settings "$agent" || return 1 ;; esac
   case "$harness" in auto|omc|omx|both|core|none) ;; *) die "invalid --harness '$harness' (auto|omc|omx|both|core|none)" ;; esac
   harness="$(resolve_harness "$agent" "$harness")"
 
@@ -2014,6 +2106,15 @@ cmd_up() {
       step "recreating '$name' (--fresh)…"
       dt delete "$name" >/dev/null 2>&1 || true
     else
+      if [ "$agent_explicit" = 1 ]; then
+        local current_agent
+        current_agent="$(dt_info_json "$name" | jq -r '.labels["devflow.agent"] // "none"')"
+        case "$current_agent:$agent" in
+          opencode:*|pi:*|*:opencode|*:pi)
+            [ "$current_agent" = "$agent" ] || die "changing API agents needs a new sandbox (--name or --fresh), with its own tools and credentials"
+            ;;
+        esac
+      fi
       say "sandbox '$name' already exists ($st). (--fresh recreates, -n NAME makes another)"
       local needs_remote=0 reprovisioned=0
       if [ "$with_daytona" = 1 ] || [ -n "$script$task$aws_profile$secret_env_names$env_items" ]; then
@@ -2059,7 +2160,7 @@ cmd_up() {
   size_note="size=$size ($(size_desc "$size"))"
   [ -n "$snapshot" ] && size_note="snapshot=$snapshot"
   say "spinning up ${C_BOLD}$name${C_RESET}  ${C_DIM}agent=$agent harness=$harness repo=${repo:-none} $size_note auto-stop=${auto_stop}m${C_RESET}"
-  auth_summary
+  auth_summary "$agent"
 
   # --- create (never pass raw resources: the API rejects them with snapshots,
   # and even the default image is a snapshot — sizes live in the snapshot) ---
@@ -2154,14 +2255,27 @@ sandbox_web_url() { # NAME [PORT] -> stable browser URL
   printf 'https://%s.%s\n' "$slug" "$domain"
 }
 
+native_preview_url() { # NAME PORT MINUTES -> bearer URL, never a public sandbox
+  local result url minutes="$3"
+  case "$minutes" in ''|*[!0-9]*) die "--expires must be minutes (1–1440)" ;; esac
+  [ "${#minutes}" -le 4 ] && [ "$minutes" -ge 1 ] && [ "$minutes" -le 1440 ] || die "--expires must be minutes (1–1440)"
+  minutes="$(expr "$minutes" + 0)"
+  result="$(dt preview-url "$1" "--port=$2" "--expires=$((minutes * 60))" 2>/dev/null)" || die "could not create a signed preview link; update Daytona or check access"
+  url="$(printf '%s\n' "$result" | grep -Eo 'https://[^[:space:]]+' | head -1)"
+  [ -n "$url" ] || die "Daytona returned no preview URL"
+  printf '%s\n' "$url"
+}
+
 cmd_web() {
-  local name="" port=22222 want_open=0
+  local name="" port=22222 want_open=0 native=0 expires=15
   while [ $# -gt 0 ]; do
     case "$1" in
       --open) want_open=1; shift ;;
+      --native) native=1; shift ;;
+      --expires) need_val "$1" "${2:-}"; expires="$2"; shift 2 ;;
       --port) need_val "$1" "${2:-}"; port="$2"; shift 2 ;;
       --port=*) port="${1#--port=}"; shift ;;
-      -h|--help) printf 'devflow web [NAME] [--port PORT] [--open] — print a stable terminal or app URL\n'; return 0 ;;
+      -h|--help) printf 'devflow web [NAME] [--port PORT] [--native [--expires MIN]] [--open] — proxy URL or private Daytona link\n'; return 0 ;;
       -*) die "unknown web flag: $1" ;;
       *)  [ -z "$name" ] || die "unexpected web argument: $1"
           name="$1"; shift ;;
@@ -2169,7 +2283,15 @@ cmd_web() {
   done
   name="$(resolve_name "$name")" || exit 1
   local url
-  url="$(sandbox_web_url "$name" "$port")"
+  if [ "$native" = 1 ]; then
+    case "$port" in ''|*[!0-9]*) die "invalid port" ;; esac
+    [ "${#port}" -le 5 ] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "invalid port"
+    ensure_running "$name"
+    url="$(native_preview_url "$name" "$port" "$expires")" || return 1
+    warn "private bearer link: anyone with it can access this port until it expires ($expires minutes)"
+  else
+    url="$(sandbox_web_url "$name" "$port")"
+  fi
   printf '%s\n' "$url"
   if [ "$want_open" = 1 ]; then
     open_file "$url" || warn "couldn't open a browser; use: $url"
@@ -2518,9 +2640,11 @@ auto_handoff() { # NAME
 
 cmd_mobile() { # hand the session to your phone: camera-scannable QR + ssh line + fallbacks
   local name="" expires=1440 want_qr=1 want_copy=1 want_open=0 outfile="" send_target=""
+  local browser=0 expires_set=0
   while [ $# -gt 0 ]; do
     case "$1" in
-      --expires)   need_val "$1" "${2:-}"; expires="$2"; shift 2 ;;
+      --expires)   need_val "$1" "${2:-}"; expires="$2"; expires_set=1; shift 2 ;;
+      --browser)   browser=1; shift ;;
       --out)       need_val "$1" "${2:-}"; outfile="$2"; shift 2 ;;
       --open)      want_open=1; shift ;;
       --send)      send_target=auto
@@ -2529,13 +2653,35 @@ cmd_mobile() { # hand the session to your phone: camera-scannable QR + ssh line 
       --setup-push) setup_push_channel; return $? ;;
       --no-qr)     want_qr=0; shift ;;
       --no-copy)   want_copy=0; shift ;;
-      -h|--help)   printf 'devflow mobile [NAME] [--expires MIN] [--send [push|op|bw|note]] [--setup-push] [--out FILE [--open]] [--no-qr] [--no-copy] — hand the session to your phone\n'; return 0 ;;
+      -h|--help)   printf 'devflow mobile [NAME] [--browser [--open]] [--expires MIN] [--send [push|op|bw|note]] [--setup-push] [--out FILE [--open]] [--no-qr] [--no-copy] — live session by SSH or private browser QR\n'; return 0 ;;
+      -*)          die "unknown mobile option: $1" ;;
       *)           name="$1"; shift ;;
     esac
   done
-  [ "$want_open" = 1 ] && [ -z "$outfile" ] && die "--open requires --out FILE"
+  if [ "$browser" = 1 ]; then
+    [ -z "$outfile$send_target" ] || die "--browser does not support --out/--send; use its QR or copied URL"
+    [ "$expires_set" = 1 ] || expires=15
+  else
+    [ "$want_open" = 1 ] && [ -z "$outfile" ] && die "--open requires --out FILE"
+  fi
   name="$(resolve_name "$name")" || exit 1
   ensure_running "$name"
+  if [ "$browser" = 1 ]; then
+    local browser_url qr=""
+    dt_run "$name" 'test -x "$HOME/.devflow/bin/dv-ensure" && "$HOME/.devflow/bin/dv-ensure"' 30 >/dev/null || die "sandbox needs devflow provisioning first: devflow up"
+    browser_url="$(native_preview_url "$name" 22222 "$expires")" || return 1
+    warn "private terminal link: anyone with it can control your sandbox for $expires minutes; do not share it"
+    if [ "$want_qr" = 1 ]; then
+      qr="$(emit_qr "$browser_url")" || true
+      [ -z "$qr" ] || printf '\n%s\n' "$qr"
+    fi
+    printf '\n%s\n' "$browser_url"
+    say 'Scan with your phone camera. The terminal joins the same live tmux session.'
+    say 'If a shell appears, run: tmux attach -t dv (detach: Ctrl-b d).'
+    [ "$want_copy" != 1 ] || copy_to_clipboard "$browser_url" || true
+    [ "$want_open" != 1 ] || open_file "$browser_url" || warn "could not open browser"
+    return 0
+  fi
   local sshcmd
   sshcmd="$(mint_ssh_command "$name" "$expires")" || exit 1
 
@@ -2861,7 +3007,7 @@ devflow team up [REPO] [flags]
   -w, --worker ROLE=TASK  named worker and task (repeatable)
       --agents N          total agents; creates worker-1..N-1 from the team goal
   -n, --name NAME         team name (default: repo name)
-  -a, --agent A           claude | codex | both
+  -a, --agent A           claude | codex | opencode | pi | both
   -H, --harness H         auto | omc | omx | both | core
   -s, --size S            small | medium | large
   -b, --branch B          base branch
@@ -2914,7 +3060,8 @@ cmd_team_up() {
   done
 
   case "$mode" in one|linked) ;; *) die "invalid team mode '$mode' (one|linked)" ;; esac
-  case "$agent" in claude|codex|both) ;; *) die "invalid --agent '$agent' (claude|codex|both)" ;; esac
+  case "$agent" in claude|codex|opencode|pi|both) ;; *) die "invalid --agent '$agent' (claude|codex|opencode|pi|both)" ;; esac
+  case "$agent" in opencode|pi) api_agent_settings "$agent" || return 1 ;; esac
   if [ -n "$agents" ]; then
     case "$agents" in
       ''|*[!0-9]*) die "--agents must be an integer from 2 to 9" ;;
@@ -3471,7 +3618,7 @@ cmd_team_handoff() {
       *) [ -z "$instruction" ] || die "quote the next task as one argument"; instruction="$1"; shift ;;
     esac
   done
-  case "$agent" in ''|claude|codex) ;; *) die "handoff agent must be claude or codex" ;; esac
+  case "$agent" in ''|claude|codex|opencode|pi) ;; *) die "handoff agent must be claude, codex, opencode, or pi" ;; esac
   [ "$from" != "$to" ] || die "handoff needs two different roles"
   source="$(team_bus_role "$team" "$from")" || exit 1
   dest="$(team_bus_role "$team" "$to")" || exit 1
@@ -3578,8 +3725,9 @@ cmd_team_ui() {
 
 usage_demo() {
   cat <<'DV_DEMO_HELP'
-devflow demo [linked|fix|desktop|rl|windows] [options]
+devflow demo [startup|linked|fix|desktop|rl|windows] [options]
 
+  startup   time a fresh sandbox and its first command; terminal output only
   linked    two isolated workers exchanging messages (original demo)
   fix       real coding agent fixes an app; linked sandbox verifies the patch
   desktop   LibreOffice Calc via computer use; save spreadsheet + recording
@@ -3608,8 +3756,57 @@ Terminal frames are sampled screenshots, not an interactive VNC client.
 Normal Daytona compute charges apply. Sandboxes are deleted on exit unless
 --keep; artifacts stay locally. Failed/interrupted desktop runs try to save
 partial recordings before cleanup. All demos have a 15m idle auto-stop.
+Startup needs python3 for timing; always deletes its sandbox (no --keep).
 DV_DEMO_HELP
 }
+
+cmd_demo_startup() (
+  local yes=0 demo_keep=0 demo_parent="" demo_child="" demo_team=""
+  local started created finished output
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --yes|-y) yes=1; shift ;;
+      --plain) shift ;; # Always plain terminal output.
+      *) die "unknown startup demo option: $1 (use --yes to skip confirmation)" ;;
+    esac
+  done
+  [ "$yes" = 1 ] || [ -t 0 ] || die "use --yes for a noninteractive demo"
+  require_daytona_cli
+  _DT_VERSION_CHECKED=1
+  need_cmd jq "brew install jq"
+  need_cmd python3 "install Python 3 for startup timing"
+  dt_auth_check || die "not logged in — run: daytona login"
+  say "Startup · one small sandbox, one command, automatic cleanup."
+  say "Normal Daytona compute charges apply. No agent, installs, or credentials copied."
+  [ "$yes" = 1 ] || { confirm "start the demo?" || return 0; }
+  demo_parent="dv-startup-$(date +%s)-$RANDOM"
+  [ "$(sandbox_state "$demo_parent")" = missing ] || die "demo name collision; retry"
+  local create_args=(create "--name=$demo_parent" --snapshot=daytona-small --auto-stop=15
+    --label=devflow=1 --label=devflow.demo=startup --label=devflow.agent=none)
+  [ -z "$DEVFLOW_TARGET" ] || create_args+=("--target=$DEVFLOW_TARGET")
+  # Arm cleanup before create: a failed request may still have created the sandbox.
+  trap demo_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  step "creating ${demo_parent}…"
+  started="$(python3 -c 'import time; print(time.monotonic())')" || exit 1
+  dt_quiet "${create_args[@]}" || die "startup sandbox creation failed"
+  wait_for_state "$demo_parent" started 120
+  created="$(python3 -c 'import time; print(time.monotonic())')" || exit 1
+  ok "sandbox started; running first command…"
+  if ! output="$(dt_run "$demo_parent" 'printf "%s\n" "hello from a fresh sandbox"' 30 2>&1)"; then
+    printf '%s\n' "$output" >&2
+    die "startup command failed"
+  fi
+  finished="$(python3 -c 'import time; print(time.monotonic())')" || exit 1
+  # Keep routine CLI warnings out of the successful result, but require the receipt.
+  printf '%s\n' "$output" | grep -Fxq 'hello from a fresh sandbox' || die "startup command returned unexpected output: $output"
+  printf '\n  hello from a fresh sandbox\n\n'
+  python3 -c 'import sys; start, ready, end = map(float, sys.argv[1:]); print("  Sandbox creation   %.2f s\n  First command      %.2f s\n  Total to output    %.2f s" % (ready-start, end-ready, end-start))' "$started" "$created" "$finished" || exit 1
+  printf '\n%s\n%s\n' \
+    'Measured from this computer, including CLI/network overhead and exec probing.' \
+    'Uses a prebuilt snapshot; excludes login checks, confirmation, and cleanup.'
+)
 
 demo_cleanup() { # only names created for this invocation
   local rc="$?" failed=0 name deletion_error
@@ -3668,23 +3865,28 @@ cmd_demo() (
   for arg in "$@"; do
     case "$arg" in --help|-h) usage_demo; return 0 ;; --plain) DV_PLAIN=1 ;; --yes|-y) yes=1 ;; esac
   done
-  case "${1:-}" in linked|fix|desktop|rl|windows) mode="$1"; shift ;; esac
+  case "${1:-}" in startup|linked|fix|desktop|rl|windows) mode="$1"; shift ;; esac
   if [ -z "$mode" ]; then
     if [ "$yes" = 1 ]; then mode=linked
     else
       [ -t 0 ] || die "choose a demo and use --yes when stdin is not a terminal"
-      action="$(console_choose 'Choose a sandbox demo' 'Linked workers' 'Computer use · LibreOffice' 'RL eval · Harbor' 'Windows · Tier 3+' 'Fix a broken app' Exit)" || return 0
+      action="$(console_choose 'Choose a sandbox demo' 'Linked workers' 'Computer use · LibreOffice' 'RL eval · Harbor' 'Windows · Tier 3+' 'Fix a broken app' 'Startup speed' Exit)" || return 0
       case "$action" in
         'Linked workers') mode=linked ;;
         'Computer use · LibreOffice') mode=desktop ;;
         'RL eval · Harbor') mode=rl ;;
         'Windows · Tier 3+') mode=windows ;;
         'Fix a broken app') mode=fix ;;
+        'Startup speed') mode=startup ;;
         *) return 0 ;;
       esac
     fi
   else
     args=("$@")
+  fi
+  if [ "$mode" = startup ]; then
+    if [ "${#args[@]}" -gt 0 ]; then cmd_demo_startup "${args[@]}"; else cmd_demo_startup; fi
+    return
   fi
   if [ "$mode" = fix ]; then
     if [ "${#args[@]}" -gt 0 ]; then cmd_demo_fix "${args[@]}"; else cmd_demo_fix; fi
@@ -4011,7 +4213,7 @@ cmd_demo_fix() (
   printf '%s' "$result" | jq -e '.passed == 2 and .total == 5' >/dev/null || die "fixture did not produce its expected 3 failures"
   printf '%s' "$result" | jq -r '.tests[] | "  \(if .passed then "PASS" else "FAIL" end) \(.test): expected \(.expected), got \(.actual)"'
   step "3/5 · fixer: installing tools and applying selected subscription auth"
-  upload_provisioner "$demo_parent" 1 || exit 1
+  upload_provisioner "$demo_parent" 1 "$agent" || exit 1
   run_phase_clean "$demo_parent" tools "$agent" '' '' '' core || die "fixer tools failed"
   run_phase_clean "$demo_parent" auth "$agent" '' '' '' core || die "fixer auth failed"
   dt_run "$demo_parent" 'umask 077; export PATH="$HOME/.local/bin:$PATH"; [ ! -f "$HOME/.devflow/env" ] || . "$HOME/.devflow/env"; nohup python3 /tmp/.dv-bugfix.py agent '"$agent $timeout"' >"$HOME/.devflow/bugfix/runner.log" 2>&1 </dev/null &' 30 || exit 1
@@ -4543,6 +4745,12 @@ cmd_token() {
 
 cmd_config() {
   case "${1:-list}" in
+    get|set)
+      case "${2:-}" in ''|*[!A-Z0-9_]*) die "invalid config key" ;; esac
+      case " $_CONFIG_KEYS " in *" ${2:-__missing__} "*) ;; *) die "unknown or secret config key; use devflow setup for credentials" ;; esac
+      ;;
+  esac
+  case "${1:-list}" in
     list)
       say "config file: $CONFIG_FILE"
       if [ -f "$CONFIG_FILE" ]; then sed 's/^/  /' "$CONFIG_FILE"; else echo "  (defaults — nothing set)"; fi
@@ -4626,6 +4834,13 @@ cmd_doctor() {
   # shellcheck disable=SC2088  # display text, not a path
   if [ -n "$CODEX_AUTH_B64" ]; then check_row "codex (chatgpt)" ok "~/.codex/auth.json present"
   else check_row "codex (chatgpt)" warn "none — run 'codex' locally, sign in with ChatGPT"; fi
+  local api_agent prefix key model
+  for api_agent in opencode pi; do
+    case "$api_agent" in opencode) prefix=DEVFLOW_OPENCODE ;; pi) prefix=DEVFLOW_PI ;; esac
+    eval "key=\${${prefix}_API_KEY}; model=\${${prefix}_MODEL}"
+    if [ -n "$key" ] && [ -n "$model" ]; then check_row "$api_agent (API)" ok 'key/model configured; provider usage billed separately'
+    else check_row "$api_agent (API)" warn "optional — devflow setup $api_agent"; fi
+  done
   echo
   printf '%s\n' "${C_BOLD}defaults${C_RESET}"
   check_row "agent" ok "$DEVFLOW_AGENT"
@@ -4639,8 +4854,82 @@ cmd_doctor() {
   say "ready? try:  ${C_BOLD}devflow up${C_RESET}"
 }
 
+setup_api_agent() { # opencode | pi
+  [ -t 0 ] || die "API-key setup needs an interactive terminal (or set DEVFLOW_OPENCODE_* / DEVFLOW_PI_* environment variables)"
+  local agent="$1" prefix provider model key old_provider old_key
+  case "$agent" in opencode) prefix=DEVFLOW_OPENCODE ;; pi) prefix=DEVFLOW_PI ;; esac
+  eval "old_provider=\${${prefix}_PROVIDER}; old_key=\${${prefix}_API_KEY}"
+  provider="$(console_choose "Provider for $agent (API usage is billed separately)" anthropic openai openrouter Cancel)" || return 0
+  [ "$provider" != Cancel ] || return 0
+  printf 'Model ID from %s (without the provider prefix): ' "$provider"
+  IFS= read -r model || return 1
+  case "$model" in ''|-*|*[!a-zA-Z0-9_./:@+-]*) die "enter a model ID, not a URL or command" ;; esac
+  printf 'API key (hidden; blank keeps the saved key for this provider): '
+  IFS= read -rs key || return 1
+  printf '\n'
+  if [ -z "$key" ] && [ "$old_provider" = "$provider" ]; then key="$old_key"; fi
+  [ -n "$key" ] || die "no API key supplied; settings unchanged"
+  config_set "$SECRETS_FILE" "${prefix}_API_KEY" "$key"
+  config_set "$CONFIG_FILE" "${prefix}_PROVIDER" "$provider"
+  config_set "$CONFIG_FILE" "${prefix}_MODEL" "$model"
+  config_set "$CONFIG_FILE" DEVFLOW_AGENT "$agent"
+  config_set "$CONFIG_FILE" DEVFLOW_HARNESS auto
+  ok "$agent configured; key stored privately (600). Provider/model availability is checked when the agent connects."
+  say "New sandbox: devflow up --agent $agent; refresh an existing $agent sandbox: devflow sync NAME"
+}
+
+setup_github() {
+  need_cmd gh "brew install gh"
+  [ -t 0 ] || die "GitHub setup needs a terminal; for automation set GH_TOKEN before devflow up"
+  local choice token
+  choice="$(console_choose 'GitHub access (only grant the repositories you need)' 'Browser login' 'Paste token' 'Check access' Cancel)" || return 0
+  case "$choice" in
+    'Browser login') gh auth login --hostname github.com --git-protocol https --web || die "GitHub login failed" ;;
+    'Paste token')
+      printf 'GitHub token (hidden): '
+      IFS= read -rs token || return 1; printf '\n'
+      [ -n "$token" ] || die "no token entered"
+      printf '%s' "$token" | gh auth login --hostname github.com --git-protocol https --with-token || die "GitHub token was rejected"
+      unset token ;;
+    'Check access') ;;
+    *) return 0 ;;
+  esac
+  gh auth status --hostname github.com || die "GitHub authentication is not ready"
+  gh auth setup-git --hostname github.com || die "could not configure GitHub HTTPS credentials"
+  ok "GitHub ready. devflow forwards this access for clone/push; use devflow sync NAME after changing it."
+  say 'For fine-grained tokens, grant selected repos Contents read/write; PR creation also needs Pull requests read/write.'
+}
+
+setup_agent() {
+  [ -t 0 ] || die "agent setup needs a terminal"
+  local agent
+  agent="$(console_choose 'Default agent' claude codex opencode pi both Cancel)" || return 0
+  case "$agent" in
+    opencode|pi) setup_api_agent "$agent"; return ;;
+    Cancel) return 0 ;;
+    claude|codex|both) config_set "$CONFIG_FILE" DEVFLOW_AGENT "$agent" ;;
+  esac
+  harvest_all
+  case "$agent" in claude|both)
+    if [ "$CLAUDE_MODE" = none ]; then warn "no Claude sign-in found"; fi
+    if have_cmd claude && confirm "configure a dedicated Claude subscription token?"; then cmd_token; fi
+    ;; esac
+  case "$agent" in codex|both)
+    [ -n "$CODEX_AUTH_B64" ] || warn "run codex locally and sign in with ChatGPT, then retry"
+    ;; esac
+  ok "default agent: $agent"
+}
+
 cmd_setup() {
-  say "$DEVFLOW_VERSION setup — cloud agent sessions on your subscriptions"
+  case "${1:-}" in
+    opencode|pi) setup_api_agent "$1"; return ;;
+    agent) setup_agent; return ;;
+    github) setup_github; return ;;
+    --help|-h) printf 'devflow setup [agent|opencode|pi|github]\nProvider API keys are read with hidden input and stored privately.\n'; return ;;
+    '') ;;
+    *) die "usage: devflow setup [agent|opencode|pi|github]" ;;
+  esac
+  say "$DEVFLOW_VERSION setup — cloud agent sessions"
   mkdir -p "$CONFIG_DIR"; chmod 700 "$CONFIG_DIR"
   echo
 
@@ -4677,7 +4966,7 @@ cmd_setup() {
     warn "Daytona still needs an update — run: curl -fsSL https://devflow.sh/install | sh"
   fi
 
-  step "2/5 Daytona account (sandbox cloud — \$200 free compute for new accounts)…"
+  step "2/5 Daytona account…"
   if have_cmd daytona && dt_auth_check; then
     ok "already logged in to Daytona"
   else
@@ -4689,40 +4978,13 @@ cmd_setup() {
     fi
   fi
 
-  step "3/5 Claude Code subscription auth…"
-  harvest_all
-  case "$CLAUDE_MODE" in
-    token) ok "long-lived token already configured" ;;
-    creds)
-      ok "local subscription credentials detected — they'll be copied into sandboxes"
-      say "recommended: a dedicated 1-year token avoids login races between laptop and sandbox."
-      if confirm "create one now with 'claude setup-token'?"; then cmd_token; fi
-      ;;
-    *)
-      warn "no Claude credentials found"
-      if have_cmd claude && confirm "run 'claude setup-token' now (needs Pro/Max subscription)?"; then cmd_token; fi
-      ;;
-  esac
-
-  step "4/5 Codex (ChatGPT) auth…"
-  if [ -n "${CODEX_AUTH_B64:-}" ]; then
-    # shellcheck disable=SC2088  # display text, not a path
-    ok "~/.codex/auth.json found — it'll be copied into sandboxes"
-  else
-    warn "not signed in to Codex — run 'codex', pick 'Sign in with ChatGPT', then re-run setup"
-  fi
-
-  step "5/5 GitHub + defaults…"
-  if have_cmd gh && gh auth status >/dev/null 2>&1; then
-    ok "gh authenticated"
-  else
-    if have_cmd gh && confirm "run 'gh auth login' now?"; then gh auth login; fi
-  fi
-  if [ -t 0 ]; then
-    printf 'default agent [claude/codex/both] (claude): '
-    local a; read -r a || true
-    case "$a" in codex|both) config_set "$CONFIG_FILE" DEVFLOW_AGENT "$a"; ok "default agent: $a" ;; *) ;; esac
-  fi
+  step "3/5 agent + credentials…"
+  setup_agent || return 1
+  step "4/5 GitHub…"
+  setup_github || return 1
+  step "5/5 phone access…"
+  say 'After devflow up, run devflow mobile NAME --browser for a private browser QR.'
+  say 'Or devflow mobile NAME for an SSH QR (Termius/Blink). Both join the live session.'
   echo
   ok "setup complete — verify with ${C_BOLD}devflow doctor${C_RESET}, then run ${C_BOLD}devflow up${C_RESET}"
 }
@@ -4843,7 +5105,7 @@ ${C_BOLD}devflow up${C_RESET} [REPO] [flags] — create (or reattach to) a cloud
   REPO                owner/name or GitHub URL; omit to use the current repo,
                       or get a picker of your GitHub repos
 
-  -a, --agent A       claude | codex | both | none     (default: $DEVFLOW_AGENT)
+  -a, --agent A       claude | codex | opencode | pi | both | none (default: $DEVFLOW_AGENT)
   -H, --harness H     multi-agent harness: auto | omc | omx | both | core (none≡core)
                       (default: $DEVFLOW_HARNESS — auto matches the agent:
                       oh-my-claudecode for claude, oh-my-codex for codex;
@@ -4885,12 +5147,12 @@ EOF
 
 usage() {
 cat <<EOF
-${C_CYAN}${C_BOLD}devflow${C_RESET} $DEVFLOW_VERSION — agentic cloud dev sessions on Daytona, powered by your subscriptions
+${C_CYAN}${C_BOLD}devflow${C_RESET} $DEVFLOW_VERSION — agentic cloud dev sessions on Daytona
 
 ${C_BOLD}start here${C_RESET}
-  devflow setup                 one-time: accounts + auth (no API keys needed)
-  devflow demo                  linked workers, desktop recording, Harbor eval, Windows
-  devflow up [REPO]             spin up Claude Code / Codex on a repo & attach
+  devflow setup                 accounts, agent choice, subscription/API auth, GitHub
+  devflow demo                  startup speed, linked workers, desktop, Harbor, Windows
+  devflow up [REPO]             start your selected coding agent on a repo & attach
   devflow up -m "fix bug X" --detach       fire-and-forget, close your laptop
   devflow team up [REPO] --task "build X"  run a multi-agent workflow in one
                                            sandbox; add --mode linked --agents 3

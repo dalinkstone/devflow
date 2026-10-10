@@ -22,7 +22,10 @@ pickers). Both install commands add the required tools. Then run `dv setup`.
 ## One-time setup
 
 ```bash
-devflow setup     # guided: deps → daytona login → claude auth → codex auth → gh
+devflow setup     # deps → Daytona → agent + credentials → GitHub → phone
+devflow setup opencode  # provider, model, hidden API key
+devflow setup pi        # provider, model, hidden API key
+devflow setup github    # browser login, paste token, or check access
 devflow doctor    # read-only check of everything, with fix hints
 ```
 
@@ -30,14 +33,39 @@ What each account needs:
 
 | Account | What setup does | Manual equivalent |
 |---|---|---|
-| Daytona | browser sign-in (new accounts get $200 free compute) | `daytona login` or `daytona login --api-key KEY` (keys: app.daytona.io/dashboard/keys) |
+| Daytona | browser sign-in | `daytona login` or `daytona login --api-key KEY` (keys: app.daytona.io/dashboard/keys) |
 | Claude (Pro/Max) | detects local login; offers `devflow token` | `devflow token` runs `claude setup-token` (1-year subscription token, stored 0600 in `~/.config/devflow/secrets`) |
 | Codex (ChatGPT) | detects `~/.codex/auth.json` | run `codex` locally once, pick "Sign in with ChatGPT" |
-| GitHub | detects gh login | `gh auth login` |
+| OpenCode / Pi | select Anthropic, OpenAI, or OpenRouter; enter model ID and API key | `dv setup opencode` / `dv setup pi` |
+| GitHub | browser/device login or hidden token input via `gh` | `dv setup github` |
 
-No Anthropic/OpenAI API keys are used anywhere. If `ANTHROPIC_API_KEY` is set
-in your environment, Claude Code would silently prefer it and bill API usage —
-devflow never sets it and sandboxes never receive it.
+Claude/Codex keep their subscription flow. OpenCode/Pi use separately billed
+provider API keys, stored in `~/.config/devflow/secrets` (0600). Only the selected
+API agent's key is forwarded; these sandboxes do not receive Claude/Codex sign-ins.
+Setup also selects that agent as your default; `--agent` overrides it for new sandboxes.
+Models are provider IDs, not display names; availability is checked by the agent
+when it connects. For automation, use `DEVFLOW_OPENCODE_PROVIDER`,
+`DEVFLOW_OPENCODE_MODEL`, `DEVFLOW_OPENCODE_API_KEY` (or `DEVFLOW_PI_*`).
+The model setting omits the provider prefix; OpenRouter IDs may still contain `/`.
+Use `dv sync NAME` to rotate credentials; restart the agent afterward to reload them.
+To switch an existing sandbox to a different API agent, use a new `--name`;
+`--fresh` also works but deletes the old sandbox and its unpushed files.
+
+GitHub uses your local `gh` sign-in (or explicit `GH_TOKEN` / `GITHUB_TOKEN`).
+Fine-grained tokens can limit access to selected repositories: Contents read/write
+for clone/push and Pull requests read/write for PRs. Organization SSO or approval
+may still be required. Tokens are never passed as command-line arguments in setup.
+
+OpenCode and Pi stay interactive in tmux, including tasks supplied with `-m`.
+`dv attach NAME` or `dv mobile NAME --browser` lets you answer questions in that
+same live session. After exiting the agent, run `dv-agent opencode` or `dv-agent pi`
+inside the sandbox to resume its project history. `peek` shows the pane, and
+`status` reports `interactive`; these are not one-shot completion jobs. A new task
+will not replace a live interactive session. Automatic harness selection is `core`
+for OpenCode/Pi (`both` still means Claude + Codex).
+
+Agent reference: [OpenCode CLI](https://opencode.ai/docs/cli/) and
+[Pi CLI](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/cli.md).
 
 ## Core workflow
 
@@ -73,7 +101,7 @@ deprecated: they still work but map to the smallest size that fits. A custom
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `-a, --agent` | `claude` \| `codex` \| `both` \| `none` | `claude` |
+| `-a, --agent` | `claude` \| `codex` \| `opencode` \| `pi` \| `both` \| `none` | `claude` |
 | `-H, --harness` | `auto` \| `omc` \| `omx` \| `both` \| `core` \| `none` | `auto` (omc for claude, omx for codex) |
 | `-m, --task "…"` | hand the agent a task immediately | — |
 | `-b, --branch B` | checkout (or create) branch B | repo default |
@@ -293,6 +321,7 @@ push the branch before handing work over. No catchup installation is required.
 
 ```bash
 dv demo                            # choose with Gum or numbered menus
+dv demo startup                    # time creation + first command, then delete
 dv demo linked --text "Your sample text"
 dv demo desktop                    # Calc, spreadsheet, MP4 recording
 dv demo desktop --view terminal     # sampled desktop frames (chafa)
@@ -301,6 +330,15 @@ dv demo windows                    # explicit Tier 3+ confirmation
 dv demo windows --yes --tier3       # noninteractive acknowledgement
 dv demo desktop --yes --view none --output ./demo-results
 ```
+
+`dv demo startup` prints creation time, first-command time, and total time to
+verified output from one fresh `daytona-small` sandbox. Needs Daytona login,
+jq, and Python 3; no agent, SDK, or provisioner. Add `--yes` to skip confirmation.
+Timings include local CLI/network overhead and any exec-style probe, not just
+server boot time; login checks, confirmation, and deletion are excluded.
+It uses a prebuilt snapshot, respects your configured target, and always deletes
+the sandbox on success, failure, or Ctrl-C (no `--keep`). Normal compute charges
+apply; if cleanup fails, run the printed removal command.
 
 The linked demo creates two small sandboxes: a dispatcher and a linked Python worker.
 It writes the same path in each to prove filesystem isolation, sends a text
@@ -414,6 +452,19 @@ References: [Computer Use](https://www.daytona.io/docs/en/computer-use/),
 [Harbor environments](https://docs.harborframework.com/core-concepts/sandboxes/pre-integrated-sandboxes).
 
 ## Access
+
+```bash
+dv mobile NAME --browser          # scan a private browser-terminal QR
+dv mobile NAME --browser --open   # also open locally
+dv web NAME --native --port 3000  # signed app link on your own Daytona account
+```
+
+Browser links expire after 15 minutes (`--expires MIN`, up to 1440). Anyone with
+the link can access that port; a terminal link permits full sandbox control.
+Keep links/QRs private. No Cloudflare account is needed and sandboxes are not
+made public. Generate another link after expiry. The terminal auto-attaches to
+tmux; if you see a shell, run `tmux attach -t dv`. Phone SSH remains available
+with `dv mobile NAME`. Link expiry does not stop compute billing.
 
 ```bash
 devflow attach NAME        # daytona ssh + tmux auto-attach (primary)

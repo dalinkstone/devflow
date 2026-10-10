@@ -138,6 +138,10 @@ case "$cmd" in
       > "$(sbx_file "$name")"
     echo "Sandbox $name created"
     echo "Open the Web Terminal: https://22222-${name}.daytonaproxy01.net"
+    if [ "${FAKE_STARTUP_MODE:-}" = create-fail ]; then
+      echo "simulated lost create response" >&2
+      exit 1
+    fi
     exit 0
     ;;
 
@@ -276,6 +280,15 @@ case "$cmd" in
     fi
 
     case "$script" in
+      *'hello from a fresh sandbox'*|*'hello\ from\ a\ fresh\ sandbox'*)
+        echo 'WARN routine Daytona version warning' >&2
+        case "${FAKE_STARTUP_MODE:-}" in
+          exec-fail) echo 'simulated exec failure' >&2; exit 1 ;;
+          wrong-output) echo 'wrong output'; exit 0 ;;
+          interrupt) echo STARTUP_BLOCKED >> "$FAKE_LOG"; sleep 30 ;;
+        esac
+        echo 'hello from a fresh sandbox'; exit 0 ;;
+      *'cat "$HOME/.devflow/agent"'*) jq -r '.labels["devflow.agent"] // "claude"' "$(sbx_file "$name")"; exit 0 ;;
       *'bugfix/status.json'*) echo '{"state":"'"${FAKE_FIX_STATE:-completed}"'"}'; exit 0 ;;
       *'/tmp/.dv-bugfix.py'*evaluate*) echo '{"passed":2,"total":5,"tests":[{"test":"basket","passed":false,"expected":8600,"actual":20}]}'; exit 0 ;;
       *'/tmp/.dv-bugfix.py'*verify*) echo '{"passed":'"${FAKE_FIX_PASSED:-5}"',"total":5,"tests":[{"test":"basket","passed":true,"expected":8600,"actual":8600}]}'; exit 0 ;;
@@ -293,7 +306,7 @@ case "$cmd" in
         [ "${FAKE_AGENT_STATE:-running}" = completed ] || exit 1
         printf '# Agent handoff\nOriginal task: build feature\nLatest result: ready\n'; exit 0 ;;
       *".devflow/provisioned"*)
-        [ "${FAKE_UNPROVISIONED:-0}" = "1" ] || echo "5"
+        [ "${FAKE_UNPROVISIONED:-0}" = "1" ] || echo "6"
         exit 0 ;;
       *'while [ "$i" -lt 30 ]'*)
         echo "${FAKE_AGENT_STATE:-running}"

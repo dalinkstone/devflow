@@ -239,6 +239,20 @@ signed app previews are private local artifacts, never printed in the log.
 
 ## Subscription auth model
 
+OpenCode/Pi are opt-in API agents, installed only when selected (pinned npm
+packages `opencode-ai` and `@earendil-works/pi-coding-agent`). Their chosen
+provider key/model travels through the existing staged bundle into private
+`~/.devflow/provider.env`; the auth phase shreds the staged bundle. No API keys
+are put in generated command lines or config-list output. Those bundles exclude
+Claude/Codex sign-ins. Their interactive tmux launchers keep a status PID and
+resume project history; task replacement refuses both running and interactive
+sessions. Pi requires Node 22.19+, upgraded through nvm when necessary.
+
+`mobile --browser` uses Daytona's signed port-22222 preview (15-minute default),
+not the personal proxy. The bearer link grants terminal control until expiry;
+the sandbox remains private. QR/clipboard transport is explicit user output.
+`web --native` offers the same signed-preview path for other ports.
+
 | Credential | Harvested from | Lands in sandbox as |
 |---|---|---|
 | Claude token (preferred) | `DEVFLOW_CLAUDE_TOKEN` in `~/.config/devflow/secrets` (via `devflow token`) | `export CLAUDE_CODE_OAUTH_TOKEN=…` in `~/.devflow/env` |
