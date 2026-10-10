@@ -3,10 +3,10 @@
 #   brew install dalinkstone/devflow/devflow
 #
 class Devflow < Formula
-  desc "Run Claude Code and Codex in Daytona cloud sandboxes"
+  desc "Run Claude, Codex, OpenCode, and Pi in Daytona sandboxes"
   homepage "https://github.com/dalinkstone/devflow"
-  url "https://github.com/dalinkstone/devflow/archive/refs/tags/v0.9.0.tar.gz"
-  sha256 "9d9d5b866d53a6fee8377ef9cbf04caead3737b15ad6b42537c932026fe8e799"
+  url "https://github.com/dalinkstone/devflow/archive/refs/tags/v0.10.0.tar.gz"
+  sha256 "8be9ea8008993066353f1aa58e9e82ea86a156c3cc43f7e79af97290eeefed98"
   license "MIT"
   head "https://github.com/dalinkstone/devflow.git", branch: "main"
 
