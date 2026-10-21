@@ -4,6 +4,33 @@ How devflow works internally. Read this before modifying `bin/devflow`.
 
 ## Layers
 
+### Managed sessions (`new`)
+
+`emit_session_runtime` embeds a Python-stdlib supervisor/client in the single
+CLI. The tools/auth phases are reused, but the legacy workspace phase (tmux and
+permission-bypass defaults) is not. A managed sandbox has `devflow.session=1`.
+`new` uploads the payload, creates a feature-branch checkout, and starts a
+detached process using Python `start_new_session`, with stdin closed and logs
+redirected. Auto-stop/delete are disabled explicitly.
+
+`~/.devflow/session/session.db` is the durable source of truth: metadata,
+provider conversation ID, pending requests, queued prompts, numbered events,
+and deduplicated input receipts. A 0600 Unix socket handles short request/reply
+calls through `dt_run`; there is no network listener. A process lock prevents
+duplicate supervisors; orphaned process groups prevent unsafe recovery after
+SIGKILL. Provider failures require explicit recovery. Restart never blindly
+replays uncertain external side effects.
+
+Codex uses stdio app-server JSON-RPC; Claude uses its official Python SDK in an
+isolated venv. The Codex home excludes permissive snapshot configs; Claude
+does not load filesystem settings. Approvals are durable but bound to the live
+provider process; restart invalidates them without accepting them. Terminal
+curses rendering runs only locally, with short exec polls and durable cursors
+and per-request outbox files. Generated agent commands never execute locally.
+
+`dv up` and other legacy workflows below remain independent. See
+[session usage and limitations](sessions.md).
+
 ```
 user ──▶ bin/devflow (bash, single file)
               │  orchestrates via subprocess

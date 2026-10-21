@@ -69,6 +69,12 @@ Agent reference: [OpenCode CLI](https://opencode.ai/docs/cli/) and
 
 ## Core workflow
 
+Bare `dv` opens the session picker. `dv new --repo OWNER/REPO --agent codex`
+creates a persistent structured session; use `--agent claude` for the official
+Claude Agent SDK. See [persistent sessions](sessions.md) for approvals, replay,
+GitHub PRs, credentials, and stop/recovery semantics. `new` is no longer an alias
+for the older tmux `up` command; the commands below remain available unchanged.
+
 ```bash
 devflow up [REPO] [flags]      # create, recover, or submit work to a session
 devflow attach [NAME]          # rejoin from anywhere; restarts stopped sandboxes

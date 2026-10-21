@@ -34,7 +34,7 @@ _CONFIG_KEYS="$_CONFIG_KEYS DEVFLOW_OPENCODE_PROVIDER DEVFLOW_OPENCODE_MODEL DEV
 load_config() {
   # 1) preserve values that came from the caller's environment
   local k v _envsaved=""
-  for k in $_CONFIG_KEYS DEVFLOW_CLAUDE_TOKEN DEVFLOW_DAYTONA_SANDBOX_KEY DEVFLOW_OPENCODE_API_KEY DEVFLOW_PI_API_KEY; do
+  for k in $_CONFIG_KEYS DEVFLOW_CLAUDE_TOKEN DEVFLOW_DAYTONA_SANDBOX_KEY DEVFLOW_OPENCODE_API_KEY DEVFLOW_PI_API_KEY DEVFLOW_CODEX_API_KEY DEVFLOW_ANTHROPIC_API_KEY; do
     eval "v=\${$k-__devflow_unset__}"
     if [ "$v" != "__devflow_unset__" ]; then
       _envsaved="$_envsaved $k=$(printf '%q' "$v")"
@@ -555,6 +555,22 @@ build_secrets_bundle() { # [AGENT] stdout: env file consumed by the sandbox prov
   harvest_all
   local selected="${1:-$DEVFLOW_AGENT}" provider_env=""
   local CLAUDE_MODE="$CLAUDE_MODE" CLAUDE_TOKEN="$CLAUDE_TOKEN" CLAUDE_CREDS_B64="$CLAUDE_CREDS_B64" CODEX_AUTH_B64="$CODEX_AUTH_B64"
+  if [ "${DEVFLOW_MANAGED_SESSION:-0}" = 1 ]; then
+    case "$selected" in
+      codex)
+        CLAUDE_MODE=none; CLAUDE_TOKEN=""; CLAUDE_CREDS_B64=""
+        if [ -n "${DEVFLOW_CODEX_API_KEY:-${OPENAI_API_KEY:-}}" ]; then
+          provider_env="$(printf 'export OPENAI_API_KEY=%q\n' "${DEVFLOW_CODEX_API_KEY:-$OPENAI_API_KEY}")"
+          CODEX_AUTH_B64=""
+        fi ;;
+      claude)
+        CODEX_AUTH_B64=""
+        if [ -n "${DEVFLOW_ANTHROPIC_API_KEY:-${ANTHROPIC_API_KEY:-}}" ]; then
+          provider_env="$(printf 'export ANTHROPIC_API_KEY=%q\n' "${DEVFLOW_ANTHROPIC_API_KEY:-$ANTHROPIC_API_KEY}")"
+          CLAUDE_MODE=none; CLAUDE_TOKEN=""; CLAUDE_CREDS_B64=""
+        fi ;;
+    esac
+  fi
   case "$selected" in opencode|pi)
     api_agent_settings "$selected" || return 1
     provider_env="$(printf 'export %s=%q\nexport DEVFLOW_SESSION_MODEL=%q\n' "$API_ENV_NAME" "$API_KEY" "$API_PROVIDER/$API_MODEL")"
@@ -1941,8 +1957,14 @@ set_forwarding_options() { # AWS_PROFILE SECRET_ENV_NAMES ALLOW_STATIC ENV_ITEMS
 
 refresh_forwarded_auth() { # NAME [RUN_TOOLS]
   local name="$1" run_tools="${2:-0}" selected
+  local DEVFLOW_MANAGED_SESSION=0
   ensure_running "$name"
-  selected="$(dt_run "$name" 'cat "$HOME/.devflow/agent"' 30)" || die "could not read sandbox agent"
+  if is_managed_session "$name"; then
+    DEVFLOW_MANAGED_SESSION=1
+    selected="$(dt_info_json "$name" | jq -r '.labels["devflow.agent"]')"
+  else
+    selected="$(dt_run "$name" 'cat "$HOME/.devflow/agent"' 30)" || die "could not read sandbox agent"
+  fi
   case "$selected" in claude|codex|opencode|pi|both|none) ;; *) die "sandbox agent is unknown; run devflow up first" ;; esac
   step "re-syncing auth and explicitly forwarded credentials into '$name'…"
   upload_provisioner "$name" 1 "$selected" || die "could not upload credentials"
@@ -1953,6 +1975,10 @@ refresh_forwarded_auth() { # NAME [RUN_TOOLS]
   run_phase "$name" auth "" "" "" "" "core" \
     || die "sandbox auth phase failed"
   ok "auth refreshed in '$name'"
+  if [ "$DEVFLOW_MANAGED_SESSION" = 1 ]; then
+    dt_run "$name" 'umask 077; [ ! -f "$HOME/.codex/auth.json" ] || cp "$HOME/.codex/auth.json" "$HOME/.devflow/session/codex/auth.json"' 30 >/dev/null || true
+    say "Stop and reattach to reload provider credentials: devflow stop $name; devflow attach $name"
+  fi
 }
 
 create_linked_sandbox() { # NAME PARENT AUTO_STOP SNAPSHOT AGENT HARNESS REPO TEAM ROLE MODE
@@ -2226,6 +2252,12 @@ cmd_attach() {
   name="$(resolve_name "${1:-}")" || exit 1
   [ -n "$name" ] || exit 1
   ensure_running "$name"
+  if is_managed_session "$name"; then
+    session_launch "$name" || return 1
+    if [ -t 0 ] && [ -t 1 ]; then session_client "$name" tui
+    else session_client "$name" status; fi
+    return
+  fi
   # if the sandbox restarted, this recreates the tmux session + resumes the agent
   dt_run "$name" '"$HOME/.devflow/bin/dv-ensure" 2>/dev/null || true' 60 >/dev/null 2>&1 || true
   say "attaching to ${C_BOLD}$name${C_RESET} ${C_DIM}(detach: Ctrl-b d — the session keeps running)${C_RESET}"
@@ -2822,6 +2854,10 @@ cmd_status() {
   name="$(resolve_name "$name")" || exit 1
   local st details agent_state agent alive tmux_state started completed exit_code
   st="$(sandbox_state "$name")"
+  if [ "$st" = started ] && is_managed_session "$name"; then
+    session_client "$name" status
+    return
+  fi
   if [ "$raw" = 1 ]; then printf 'sandbox_state=%s\n' "$st"
   else ui_title "$name"; ui_row "sandbox" "$(ui_state_value "$st")"; fi
   [ "$st" = "started" ] || return 0
@@ -2894,6 +2930,7 @@ cmd_stop() {
   local name
   name="$(resolve_name "${1:-}")" || exit 1
   dt_quiet stop "$name" || die "could not stop '$name'"
+  if is_managed_session "$name"; then wait_for_state "$name" stopped 120; fi
   ok "stopped '$name' — disk preserved; 'devflow attach $name' restarts and resumes the agent"
 }
 
@@ -4922,10 +4959,11 @@ setup_agent() {
 
 cmd_setup() {
   case "${1:-}" in
+    codex|claude) setup_managed_agent "$1"; return ;;
     opencode|pi) setup_api_agent "$1"; return ;;
     agent) setup_agent; return ;;
     github) setup_github; return ;;
-    --help|-h) printf 'devflow setup [agent|opencode|pi|github]\nProvider API keys are read with hidden input and stored privately.\n'; return ;;
+    --help|-h) printf 'devflow setup [agent|codex|claude|opencode|pi|github]\nProvider API keys are read with hidden input and stored privately.\n'; return ;;
     '') ;;
     *) die "usage: devflow setup [agent|opencode|pi|github]" ;;
   esac
@@ -5150,6 +5188,13 @@ cat <<EOF
 ${C_CYAN}${C_BOLD}devflow${C_RESET} $DEVFLOW_VERSION — agentic cloud dev sessions on Daytona
 
 ${C_BOLD}start here${C_RESET}
+  devflow                       session picker (interactive terminal)
+  devflow new --repo OWNER/REPO --agent codex|claude [-m TASK] [--detach]
+                                persistent structured agent, approvals and replay
+  devflow sessions              list managed sessions
+  devflow send SESSION "TASK"    follow-up in the same conversation
+  devflow interrupt SESSION     cancel the turn, not the sandbox
+  devflow pr SESSION "TITLE"     commit all changes, push, create a draft PR
   devflow setup                 accounts, agent choice, subscription/API auth, GitHub
   devflow demo                  startup speed, linked workers, desktop, Harbor, Windows
   devflow up [REPO]             start your selected coding agent on a repo & attach
@@ -5199,15 +5244,1071 @@ EOF
 }
 
 # ----------------------------------------------------------------------------
+# Persistent sessions (transport stays behind authenticated Daytona exec)
+# ----------------------------------------------------------------------------
+setup_managed_agent() {
+  [ -t 0 ] || die "setup needs a terminal; alternatively export OPENAI_API_KEY or ANTHROPIC_API_KEY"
+  local provider="$1" choice key config_key
+  choice="$(console_choose "$provider authentication" 'Existing sign-in' 'API key' Cancel)" || return
+  case "$choice" in
+    'Existing sign-in')
+      if [ "$provider" = codex ]; then
+        need_cmd codex "install Codex CLI"; codex login --device-auth || return 1
+        config_set "$SECRETS_FILE" DEVFLOW_CODEX_API_KEY ""
+      else
+        cmd_token || return 1
+        config_set "$SECRETS_FILE" DEVFLOW_ANTHROPIC_API_KEY ""
+      fi ;;
+    'API key')
+      printf 'API key (hidden; API usage billed separately): '
+      IFS= read -rs key || return 1; printf '\n'
+      [ -n "$key" ] || die "no key supplied"
+      config_key=DEVFLOW_CODEX_API_KEY
+      [ "$provider" != claude ] || config_key=DEVFLOW_ANTHROPIC_API_KEY
+      config_set "$SECRETS_FILE" "$config_key" "$key" ;;
+    *) return ;;
+  esac
+  ok "$provider authentication configured"
+}
+
+session_rpc() { # NAME BASE64_JSON
+  case "$2" in *[!A-Za-z0-9+/=]*) die "invalid session request" ;; esac
+  dt_run "$1" 'export PATH="$HOME/.local/bin:$PATH"; python3 "$HOME/.devflow/session/runtime.py" rpc '"'$2'" 30
+}
+
+session_launch() {
+  dt_run "$1" 'export PATH="$HOME/.local/bin:$PATH"; [ ! -f "$HOME/.devflow/env" ] || . "$HOME/.devflow/env"; p=python3; [ ! -x "$HOME/.devflow/session/venv/bin/python" ] || p="$HOME/.devflow/session/venv/bin/python"; "$p" "$HOME/.devflow/session/runtime.py" launch' 30
+}
+
+install_session_runtime() {
+  emit_session_runtime | dt_push_file "$1" /tmp/.dv-session.py || return 1
+  dt_run "$1" 'umask 077; mkdir -p "$HOME/.devflow/session"; mv /tmp/.dv-session.py "$HOME/.devflow/session/runtime.py"' 60 >/dev/null
+}
+
+is_managed_session() {
+  dt_info_json "$1" | jq -e '.labels["devflow.session"] == "1"' >/dev/null 2>&1
+}
+
+session_client() { # NAME MODE [ARGS]
+  need_cmd python3 "install Python 3.10+"
+  local payload rc
+  payload="$(mktemp)" || return 1
+  emit_session_runtime > "$payload"
+  python3 "$payload" client "$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" "$CONFIG_DIR" "$@"
+  rc=$?; rm -f "$payload"; return "$rc"
+}
+
+cmd_sessions() {
+  require_daytona_cli; need_cmd jq "brew install jq"
+  local sessions
+  sessions="$(devflow_sandboxes_json)" || die "cannot reach Daytona; check login/network"
+  printf 'SESSION                       SANDBOX     PROVIDER  REPOSITORY\n'
+  printf '%s' "$sessions" | jq -r '.[] | select(.labels["devflow.session"] == "1") | [.name, .state, .labels["devflow.agent"], .labels["devflow.repo"]] | @tsv'
+}
+
+cmd_session_home() {
+  [ -t 0 ] && [ -t 1 ] || { usage; return; }
+  local choice name
+  while :; do
+    choice="$(console_choose 'devflow · remote coding sessions' 'New session' 'Attach session' 'List sessions' Setup Quit)" || return
+    case "$choice" in
+      'New session') cmd_new ;;
+      'Attach session')
+        cmd_sessions || continue
+        printf 'Session: '; IFS= read -r name || return
+        [ -z "$name" ] || cmd_attach "$name" ;;
+      'List sessions') cmd_sessions ;;
+      Setup) cmd_setup ;;
+      *) return ;;
+    esac
+  done
+}
+
+cmd_new() {
+  local repo="" agent="" branch="" prompt="" detach=0 size=medium name config sandbox_id
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) need_val "$1" "${2:-}"; repo="$2"; shift 2 ;;
+      --agent|-a) need_val "$1" "${2:-}"; agent="$2"; shift 2 ;;
+      --branch|-b) need_val "$1" "${2:-}"; branch="$2"; shift 2 ;;
+      --task|-m) need_val "$1" "${2:-}"; prompt="$2"; shift 2 ;;
+      --size|-s) need_val "$1" "${2:-}"; size="$2"; shift 2 ;;
+      --detach) detach=1; shift ;;
+      --help|-h) printf 'devflow new --repo OWNER/REPO --agent codex|claude [-b BRANCH] [-m PROMPT] [--detach] [--size medium]\n'; return ;;
+      *) die "unknown argument: $1 (see devflow new --help)" ;;
+    esac
+  done
+  require_daytona_cli; need_cmd jq "brew install jq"; need_cmd python3 "install Python 3.10+"
+  if [ -z "$agent" ] && [ -t 0 ]; then agent="$(console_choose Provider codex claude Cancel)" || return; fi
+  [ "$agent" != Cancel ] || return
+  case "$agent" in codex|claude) ;; *) die "--agent must be codex or claude" ;; esac
+  if [ -z "$repo" ] && [ -t 0 ]; then pick_repo; repo="$REPO_PICKED"; fi
+  repo="$(repo_from_arg "$repo")"
+  case "$repo" in ''|*[!A-Za-z0-9_./-]*) die "--repo OWNER/REPO is required" ;; esac
+  case "$size" in small|medium|large) ;; *) die "invalid size" ;; esac
+  if [ -z "$prompt" ] && [ -t 0 ]; then
+    if [ -z "$branch" ]; then
+      printf 'Branch (blank creates a feature branch): '; IFS= read -r branch || return
+    fi
+    printf 'Task: '; IFS= read -r prompt || return
+  fi
+  harvest_all
+  [ -n "$GH_TOKEN_VAL" ] || die "GitHub access required — run: devflow setup github"
+  if [ "$agent" = codex ]; then
+    [ -n "$CODEX_AUTH_B64${DEVFLOW_CODEX_API_KEY:-}${OPENAI_API_KEY:-}" ] || die "sign in with codex or run: devflow setup codex"
+  else
+    [ "$CLAUDE_MODE" != none ] || [ -n "${DEVFLOW_ANTHROPIC_API_KEY:-}${ANTHROPIC_API_KEY:-}" ] || die "run: devflow setup claude"
+  fi
+  dt_auth_check || die "run: daytona login"
+  name="dv-session-$(python3 -c 'import uuid; print(uuid.uuid4().hex[:12])')"
+  [ -n "$branch" ] || branch="devflow/${name#dv-session-}"
+  git check-ref-format --branch "$branch" >/dev/null 2>&1 || die "invalid branch"
+  step "creating $name · $agent · $repo · auto-stop disabled"
+  local args=(create "--name=$name" "--snapshot=daytona-$size" --auto-stop=0 --auto-delete=-1 --auto-archive=10080 --label=devflow=1 --label=devflow.session=1 "--label=devflow.agent=$agent" "--label=devflow.repo=$repo")
+  [ -z "$DEVFLOW_TARGET" ] || args+=("--target=$DEVFLOW_TARGET")
+  dt_quiet "${args[@]}" || die "sandbox create failed"
+  wait_for_state "$name" started 300
+  step "disk is retained on failure; cleanup: devflow rm $name"
+  sandbox_id="$(dt_info_json "$name" | jq -r '.id')"
+  local DEVFLOW_MANAGED_SESSION=1
+  upload_provisioner "$name" 1 "$agent" || die "auth upload failed; remove unused sandbox: devflow rm $name"
+  run_phase_clean "$name" tools "$agent" "" "" "" core || die "tool installation failed; inspect or remove $name"
+  run_phase_clean "$name" auth "$agent" "" "" "" core || die "auth failed; inspect or remove $name"
+  install_session_runtime "$name" || die "runtime upload failed"
+  config="$(jq -nc --arg id "$name" --arg sandbox_id "$sandbox_id" --arg provider "$agent" --arg repo "$repo" --arg branch "$branch" --arg prompt "$prompt" '{id:$id,sandbox_id:$sandbox_id,provider:$provider,repo:$repo,branch:$branch,initial_prompt:$prompt}')"
+  printf '%s' "$config" | dt_push_file "$name" /tmp/.dv-session.json || die "config upload failed"
+  dt_run "$name" 'umask 077; mv /tmp/.dv-session.json "$HOME/.devflow/session/config.json"' 60 >/dev/null || die "session setup failed"
+  if [ "$agent" = claude ]; then
+    step 'installing official Claude Agent SDK…'
+    dt_run "$name" 'export PATH="$HOME/.local/bin:$PATH"; python3 -m venv "$HOME/.devflow/session/venv" 2>/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq python3-venv && python3 -m venv "$HOME/.devflow/session/venv"; }; "$HOME/.devflow/session/venv/bin/pip" install --disable-pip-version-check -q claude-agent-sdk==0.2.169' 300 >/dev/null || die "Claude SDK install failed; inspect or remove $name"
+  fi
+  session_launch "$name" || die "supervisor failed; inspect: devflow status $name"
+  ok "session: $name (compute runs until devflow stop $name)"
+  if [ "$detach" = 0 ] && [ -t 0 ]; then session_client "$name" tui
+  else say "attach: devflow attach $name"; fi
+}
+
+cmd_session_action() { # OP NAME [TEXT]
+  local action="$1" name="${2:-}"
+  [ -n "$name" ] || die "usage: devflow $action SESSION [TEXT]"
+  is_managed_session "$name" || die "not a managed session: $name"
+  [ "$(sandbox_state "$name")" = started ] || die "sandbox is not running; devflow attach $name"
+  shift 2
+  session_client "$name" "$action" "$@"
+}
+
+emit_session_runtime() {
+cat <<'DV_SESSION_PY'
+#!/usr/bin/env python3
+"""Self-contained remote supervisor and local terminal client. No TCP listener."""
+import asyncio
+import base64
+import contextlib
+import dataclasses
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import queue
+import re
+import signal
+import socket
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import uuid
+
+ROOT = Path.home() / '.devflow/session'
+LIMIT = 8 * 1024 * 1024
+
+
+def credential_values():
+    values = {v for k, v in os.environ.items() if any(x in k.upper() for x in ('TOKEN', 'SECRET', 'API_KEY')) and len(v) >= 12}
+    def collect(value, key=''):
+        if isinstance(value, dict):
+            for k, v in value.items():
+                collect(v, k)
+        elif isinstance(value, str) and any(x in key.lower() for x in ('token', 'key')) and len(value) >= 12:
+            values.add(value)
+    for path in (Path.home() / '.codex/auth.json', ROOT / 'codex/auth.json', Path.home() / '.claude/.credentials.json'):
+        try:
+            collect(json.loads(path.read_text()))
+        except (OSError, ValueError):
+            pass
+    try:
+        for value in re.findall(r'oauth_token:\s*(\S+)', (Path.home() / '.config/gh/hosts.yml').read_text()):
+            values.add(value.strip('"\''))
+    except OSError:
+        pass
+    return values
+
+
+def redact(value, secrets):
+    if isinstance(value, dict):
+        return {k: redact(v, secrets) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact(v, secrets) for v in value]
+    if isinstance(value, str):
+        for secret in secrets:
+            value = value.replace(secret, '[redacted]')
+    return value
+
+
+def now():
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+
+def private_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_name(path.name + '.' + uuid.uuid4().hex)
+    with open(tmp, 'x', opener=lambda p, f: os.open(p, f, 0o600)) as out:
+        json.dump(value, out)
+        out.flush()
+        os.fsync(out.fileno())
+    os.replace(tmp, path)
+
+
+class Store:
+    def __init__(self, root):
+        self.root = root
+        self.secrets = credential_values()
+        self.db = sqlite3.connect(root / 'session.db')
+        self.db.execute('PRAGMA journal_mode=WAL')
+        self.db.executescript('CREATE TABLE IF NOT EXISTS state (id INTEGER PRIMARY KEY, value TEXT);'
+                             'CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT);'
+                             'CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, body TEXT, result TEXT);')
+        row = self.db.execute('SELECT value FROM state WHERE id=1').fetchone()
+        self.meta = json.loads(row[0]) if row else {}
+
+    def save(self, **values):
+        self.meta.update(values, updated_at=now())
+        self.db.execute('INSERT OR REPLACE INTO state VALUES (1,?)', (json.dumps(self.meta),))
+        self.db.commit()
+
+    def event(self, kind, data):
+        value = dict(kind=kind, data=redact(data, self.secrets), time=now())
+        self.db.execute('INSERT INTO events(value) VALUES (?)', (json.dumps(value),))
+        self.db.commit()
+
+    def read(self, after=0):
+        events = [dict(seq=r[0], **json.loads(r[1])) for r in self.db.execute(
+            'SELECT seq,value FROM events WHERE seq>? ORDER BY seq LIMIT 300', (max(0, int(after)),))]
+        return dict(state=redact(self.meta, self.secrets), events=events, cursor=events[-1]['seq'] if events else after)
+
+
+class Codex:
+    def __init__(self, supervisor):
+        self.s = supervisor
+        self.requests = {}
+        self.seq = 0
+        self.proc = None
+        self.reader = None
+
+    async def start(self):
+        env = dict(os.environ, CODEX_HOME=str(ROOT / 'codex'))
+        home = Path(env['CODEX_HOME'])
+        home.mkdir(exist_ok=True, mode=0o700)
+        # Isolate from snapshot/laptop configs that could bypass approvals.
+        auth = Path.home() / '.codex/auth.json'
+        if auth.exists() and not (home / 'auth.json').exists():
+            private_json(home / 'auth.json', json.loads(auth.read_text()))
+        self.proc = await asyncio.create_subprocess_exec(
+            'codex', 'app-server', '--listen', 'stdio://', cwd=self.s.store.meta['cwd'], env=env,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL, limit=LIMIT,
+            pass_fds=(self.s.lock.fileno(),))
+        self.reader = asyncio.create_task(self.read())
+        await self.call('initialize', {'clientInfo': {'name': 'devflow', 'title': 'devflow', 'version': '0.10.0'},
+                                       'capabilities': {'experimentalApi': True}})
+        await self.write({'method': 'initialized', 'params': {}})
+        if os.environ.get('OPENAI_API_KEY'):
+            await self.call('account/login/start', {'type': 'apiKey', 'apiKey': os.environ['OPENAI_API_KEY']})
+        thread = self.s.store.meta.get('thread_id')
+        params = dict(cwd=self.s.store.meta['cwd'], approvalPolicy='untrusted', sandbox='workspace-write')
+        if thread:
+            params['threadId'] = thread
+        result = await self.call('thread/resume' if thread else 'thread/start', params)
+        self.s.store.save(thread_id=result['thread']['id'])
+
+    async def write(self, value):
+        self.proc.stdin.write((json.dumps(value) + '\n').encode())
+        await self.proc.stdin.drain()
+
+    async def call(self, method, params):
+        self.seq += 1
+        ident = 'dv-' + str(self.seq)
+        future = asyncio.get_running_loop().create_future()
+        self.requests[ident] = future
+        await self.write(dict(id=ident, method=method, params=params))
+        try:
+            return await asyncio.wait_for(future, 90)
+        finally:
+            self.requests.pop(ident, None)
+
+    async def read(self):
+        try:
+            while line := await self.proc.stdout.readline():
+                event = json.loads(line)
+                if 'method' not in event:
+                    future = self.requests.get(event.get('id'))
+                    if future and not future.done():
+                        if 'error' in event:
+                            future.set_exception(RuntimeError(event['error'].get('message', 'Codex request failed')))
+                        else:
+                            future.set_result(event.get('result', {}))
+                    continue
+                method, params = event['method'], event.get('params', {})
+                if 'id' in event:
+                    # Provider IDs can repeat after restart. A UI reply must be
+                    # bound to this exact interaction, never a later approval.
+                    self.s.pending(uuid.uuid4().hex[:12], dict(provider_id=event['id'], method=method, params=params))
+                else:
+                    self.s.event(method, params)
+                    if method == 'turn/started':
+                        self.s.store.save(turn_id=params['turn']['id'], status='running')
+                    elif method == 'turn/completed':
+                        self.s.complete(params['turn']['status'])
+                    elif method == 'serverRequest/resolved':
+                        for ident, pending in list(self.s.store.meta.get('pending', {}).items()):
+                            if pending.get('provider_id') == params['requestId']:
+                                self.s.resolve(ident)
+            if not self.s.closing:
+                self.s.fail('Codex process exited; use /recover to resume the saved thread. No task was replayed.')
+        except Exception as exc:
+            if not self.s.closing:
+                self.s.fail(str(exc))
+        finally:
+            for future in self.requests.values():
+                if not future.done():
+                    future.set_exception(RuntimeError('Codex connection closed'))
+
+    async def prompt(self, text):
+        result = await self.call('turn/start', dict(threadId=self.s.store.meta['thread_id'],
+            input=[dict(type='text', text=text)], approvalPolicy='untrusted',
+            sandboxPolicy=dict(type='workspaceWrite', writableRoots=[self.s.store.meta['cwd']], networkAccess=True)))
+        self.s.store.save(turn_id=result['turn']['id'])
+
+    async def answer(self, ident, reply):
+        pending = self.s.store.meta['pending'][ident]
+        method = pending['method']
+        if method in ('item/commandExecution/requestApproval', 'item/fileChange/requestApproval'):
+            decisions = pending['params'].get('availableDecisions', ['accept', 'decline'])
+            result = {'decision': 'accept' if reply.get('allow') is True else 'decline' if 'decline' in decisions else 'cancel'}
+        elif method == 'item/tool/requestUserInput':
+            answers = reply.get('answers', {})
+            questions = pending['params']['questions']
+            if any(q['id'] not in answers for q in questions):
+                raise ValueError('answer every question before submitting')
+            result = {'answers': {q['id']: {'answers': answers[q['id']] if isinstance(answers[q['id']], list)
+                                          else [str(answers[q['id']])]} for q in questions}}
+        else:
+            # Unknown protocol requests cannot accidentally grant permissions.
+            await self.write({'id': pending['provider_id'], 'error': {'code': -32601, 'message': 'Unsupported client request'}})
+            return
+        await self.write({'id': pending['provider_id'], 'result': result})
+
+    async def interrupt(self):
+        turn = self.s.store.meta.get('turn_id')
+        if turn:
+            await self.call('turn/interrupt', {'threadId': self.s.store.meta['thread_id'], 'turnId': turn})
+
+    async def close(self):
+        if self.proc and self.proc.returncode is None:
+            self.proc.terminate()
+            try:
+                await asyncio.wait_for(self.proc.wait(), 5)
+            except asyncio.TimeoutError:
+                self.proc.kill()
+                await self.proc.wait()
+        if self.reader:
+            await self.reader
+
+
+class Claude:
+    def __init__(self, supervisor):
+        self.s = supervisor
+        self.client = None
+        self.task = None
+        self.answers = {}
+
+    async def start(self):
+        from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
+        options = ClaudeAgentOptions(cwd=self.s.store.meta['cwd'], permission_mode='default',
+            setting_sources=[], can_use_tool=self.permission, include_partial_messages=True,
+            resume=self.s.store.meta.get('thread_id'))
+        self.client = ClaudeSDKClient(options=options)
+        await self.client.connect()
+
+    async def permission(self, tool, data, context):
+        from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+        ident = uuid.uuid4().hex[:12]
+        future = asyncio.get_running_loop().create_future()
+        self.answers[ident] = future
+        self.s.pending(ident, dict(method=tool, params=data))
+        try:
+            result = await future
+            if tool == 'AskUserQuestion':
+                if result.get('allow') is False:
+                    return PermissionResultDeny(message='User interrupted')
+                return PermissionResultAllow(updated_input={**data, 'answers': result['answers']})
+            if result.get('allow') is True:
+                return PermissionResultAllow(updated_input=data)
+            return PermissionResultDeny(message='User declined')
+        finally:
+            self.answers.pop(ident, None)
+            self.s.resolve(ident)
+
+    async def prompt(self, text):
+        await self.client.query(text)
+        self.task = asyncio.create_task(self.read())
+
+    async def read(self):
+        from claude_agent_sdk import ResultMessage, SystemMessage
+        try:
+            async for message in self.client.receive_response():
+                value = dataclasses.asdict(message)
+                self.s.event(type(message).__name__, value)
+                if isinstance(message, SystemMessage) and message.subtype == 'init':
+                    self.s.store.save(thread_id=message.data['session_id'])
+                if isinstance(message, ResultMessage):
+                    self.s.clear_pending('turn ended')
+                    self.s.store.save(thread_id=message.session_id,
+                                      status='failed' if message.is_error else 'completed',
+                                      error=getattr(message, 'result', None) if message.is_error else None)
+            self.s.complete(self.s.store.meta['status'])
+        except Exception as exc:
+            if not self.s.closing:
+                self.s.fail(str(exc))
+
+    async def answer(self, ident, reply):
+        pending = self.s.store.meta['pending'][ident]
+        if pending['method'] == 'AskUserQuestion':
+            if any(q['question'] not in reply.get('answers', {}) for q in pending['params']['questions']):
+                raise ValueError('answer every question before submitting')
+        self.answers[ident].set_result(reply)
+
+    async def interrupt(self):
+        for future in self.answers.values():
+            if not future.done():
+                future.set_result({'allow': False})
+        await self.client.interrupt()
+
+    async def close(self):
+        if self.client:
+            await self.client.disconnect()
+        if self.task:
+            self.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.task
+
+
+class Supervisor:
+    def __init__(self, root, lock):
+        self.root, self.lock = root, lock
+        self.store = Store(root)
+        self.provider = None
+        self.closing = False
+        self.action_lock = asyncio.Lock()
+        self.tasks = set()
+
+    def spawn(self, coro):
+        task = asyncio.create_task(coro)
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+
+    def event(self, kind, data):
+        self.store.event(kind, data)
+
+    def pending(self, ident, request):
+        pending = dict(self.store.meta.get('pending', {}))
+        pending[ident] = request
+        self.store.save(pending=pending, status='waiting')
+        self.event('interaction', dict(id=ident, **request))
+
+    def resolve(self, ident):
+        pending = dict(self.store.meta.get('pending', {}))
+        if pending.pop(ident, None) is not None:
+            self.store.save(pending=pending, status='waiting' if pending else 'running')
+
+    def clear_pending(self, reason):
+        if self.store.meta.get('pending'):
+            self.event('interactions/cleared', {'reason': reason})
+        self.store.save(pending={})
+
+    def fail(self, message):
+        self.clear_pending('provider unavailable; old requests cannot be approved')
+        self.store.save(status='failed', error=message)
+        self.event('error', {'message': message})
+
+    def complete(self, status):
+        self.clear_pending('turn ended')
+        self.store.save(status=status, turn_id=None)
+        queued = list(self.store.meta.get('queued', []))
+        if status == 'completed' and queued:
+            request = queued.pop(0)
+            self.store.save(queued=queued, status='running')
+            self.spawn(self.work(request))
+
+    async def run_command(self, *argv, cwd=None):
+        proc = await asyncio.create_subprocess_exec(*argv, cwd=cwd, stdout=asyncio.subprocess.PIPE,
+                                                   stderr=asyncio.subprocess.PIPE)
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), 180)
+        except asyncio.TimeoutError:
+            proc.kill(); await proc.wait()
+            raise RuntimeError(argv[0] + ' timed out') from None
+        if proc.returncode:
+            # Git/gh can print credential-bearing URLs. Do not persist stderr.
+            raise RuntimeError(f'{argv[0]} {argv[1]} failed (exit {proc.returncode}); check GitHub auth, branch and git identity')
+        return out.decode(errors='replace').strip()
+
+    async def workspace(self):
+        m = self.store.meta
+        cwd = Path(m['cwd'])
+        cwd.parent.mkdir(parents=True, exist_ok=True)
+        if not (cwd / '.git').is_dir():
+            await self.run_command('git', 'clone', '--', 'https://github.com/' + m['repo'] + '.git', str(cwd))
+        base = await self.run_command('git', 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD', cwd=cwd)
+        base = base.removeprefix('origin/')
+        if m['branch'] == base:
+            raise ValueError('choose a feature branch, not the repository default branch')
+        await self.run_command('git', 'check-ref-format', '--branch', m['branch'], cwd=cwd)
+        try:
+            await self.run_command('git', 'checkout', m['branch'], cwd=cwd)
+        except RuntimeError:
+            await self.run_command('git', 'checkout', '-b', m['branch'], cwd=cwd)
+        self.store.save(base_branch=base)
+        try:
+            existing = json.loads(await self.run_command('gh', 'pr', 'list', '--repo', m['repo'],
+                                                        '--head', m['branch'], '--json', 'url', cwd=cwd))
+            if existing:
+                self.store.save(pr=existing[0]['url'])
+        except RuntimeError:
+            pass  # Cloning is still useful with a read-only GitHub credential.
+
+    async def boot(self):
+        fresh = not self.store.meta
+        if fresh:
+            config = json.loads((self.root / 'config.json').read_text())
+            self.store.save(**config, cwd=str(Path.home() / 'work' / config['repo'].split('/')[-1]),
+                            created_at=now(), status='starting', pending={}, thread_id=None, pr=None)
+        else:
+            self.clear_pending('supervisor restarted; previous turn interrupted, not replayed')
+            self.event('recovered', {'message': 'Conversation restored. Interrupted work was not replayed; send a follow-up.'})
+            if self.store.meta.get('queued'):
+                self.event('queue/cancelled', {'message': 'Queued prompts cancelled after runtime restart; resend explicitly.'})
+                self.store.save(queued=[])
+        self.store.save(pid=os.getpid(), status='starting', error=None)
+        try:
+            if fresh:
+                await self.workspace()
+            self.provider = (Codex if self.store.meta['provider'] == 'codex' else Claude)(self)
+            await self.provider.start()
+            self.store.save(status='idle')
+            prompt = self.store.meta.pop('initial_prompt', '')
+            self.store.save()
+            if fresh and prompt:
+                await self.action({'id': 'initial', 'op': 'prompt', 'text': prompt})
+        except Exception as exc:
+            self.fail(str(exc))
+
+    async def perform(self, request):
+        op = request['op']
+        if op == 'prompt':
+            await self.provider.prompt(request['text'])
+        elif op == 'pr':
+            m = self.store.meta
+            cwd = m['cwd']
+            actual = await self.run_command('git', 'branch', '--show-current', cwd=cwd)
+            if actual != m['branch'] or actual == m['base_branch']:
+                raise ValueError('workspace branch changed; refusing to publish an unexpected branch')
+            title = request.get('text') or 'Devflow: ' + m['branch']
+            # Publication is explicit. Agent edits remain reviewable until /pr.
+            await self.run_command('git', 'add', '--all', cwd=cwd)
+            if await self.run_command('git', 'diff', '--cached', '--name-only', cwd=cwd):
+                await self.run_command('git', 'commit', '-m', title, cwd=cwd)
+            await self.run_command('git', 'push', '--set-upstream', 'origin', m['branch'], cwd=cwd)
+            prs = await self.run_command('gh', 'pr', 'list', '--repo', m['repo'], '--head', m['branch'], '--json', 'url', cwd=cwd)
+            existing = json.loads(prs)
+            url = existing[0]['url'] if existing else await self.run_command(
+                'gh', 'pr', 'create', '--draft', '--repo', m['repo'], '--base', m['base_branch'],
+                '--head', m['branch'], '--title', title, '--body', 'Created from a persistent Devflow sandbox session.', cwd=cwd)
+            self.store.save(pr=url, status='completed')
+            self.event('pr', {'url': url})
+        elif op == 'recover':
+            self.closing = True
+            if self.provider:
+                await self.provider.close()
+            self.closing = False
+            self.provider = (Codex if self.store.meta['provider'] == 'codex' else Claude)(self)
+            await self.provider.start()
+            self.store.save(status='idle', error=None)
+
+    async def work(self, request):
+        try:
+            await self.perform(request)
+        except Exception as exc:
+            self.fail(str(exc))
+
+    async def action(self, request):
+        async with self.action_lock:
+            ident, op = request['id'], request['op']
+            if not isinstance(ident, str) or not 1 <= len(ident) <= 100:
+                raise ValueError('invalid request ID')
+            body = json.dumps(request, sort_keys=True)
+            old = self.store.db.execute('SELECT body,result FROM requests WHERE id=?', (ident,)).fetchone()
+            if old:
+                if old[0] != body:
+                    raise ValueError('request ID was reused with different content')
+                return json.loads(old[1])
+            status = self.store.meta.get('status')
+            queue_prompt = op == 'prompt' and status in ('running', 'waiting')
+            if op in ('prompt', 'pr') and not queue_prompt and status not in ('idle', 'completed', 'interrupted'):
+                raise ValueError(f'session is {status}; answer pending input, interrupt, or recover first')
+            if op == 'prompt' and not request.get('text', '').strip():
+                raise ValueError('prompt is empty')
+            if len(request.get('text', '')) > 32000:
+                raise ValueError('message is too long (maximum 32000 characters)')
+            if op == 'answer' and request.get('interaction') not in self.store.meta.get('pending', {}):
+                raise ValueError('interaction is no longer pending')
+            if op == 'recover' and status != 'failed':
+                raise ValueError('recover is only for a failed provider')
+            if op not in ('prompt', 'answer', 'interrupt', 'pr', 'recover'):
+                raise ValueError('unknown action')
+            if op == 'answer':
+                await self.provider.answer(request['interaction'], request.get('reply', {}))
+                self.resolve(request['interaction'])
+            elif op == 'interrupt':
+                self.store.save(queued=[])
+                await self.provider.interrupt()
+                self.clear_pending('user interrupted')
+                self.store.save(queued=[])
+            result = {'accepted': ident}
+            # Persist receipt before dispatch; uncertain work is never auto-replayed after a crash.
+            self.store.db.execute('INSERT INTO requests VALUES (?,?,?)', (ident, body, json.dumps(result)))
+            self.store.db.commit()
+            self.event('action', {k: v for k, v in request.items() if k != 'reply'})
+            if queue_prompt:
+                self.store.save(queued=self.store.meta.get('queued', []) + [request])
+                self.event('queued', {'message': 'Follow-up saved; it runs after the current turn completes.'})
+            elif op in ('prompt', 'pr', 'recover'):
+                self.store.save(status='starting' if op == 'recover' else 'publishing' if op == 'pr' else 'running')
+                self.spawn(self.work(request))
+            return result
+
+    async def connection(self, reader, writer):
+        try:
+            request = json.loads(await asyncio.wait_for(reader.readline(), 10))
+            if request.get('op') == 'read':
+                result = self.store.read(request.get('after', 0))
+            else:
+                result = await self.action(request)
+        except Exception as exc:
+            result = {'error': str(exc)}
+        writer.write((json.dumps(result) + '\n').encode())
+        with contextlib.suppress(ConnectionError):
+            await writer.drain()
+        writer.close()
+
+    async def serve(self):
+        sock = self.root / 'control.sock'
+        sock.unlink(missing_ok=True)
+        server = await asyncio.start_unix_server(self.connection, path=str(sock), limit=LIMIT)
+        os.chmod(sock, 0o600)
+        self.spawn(self.boot())
+        try:
+            async with server:
+                await server.serve_forever()
+        finally:
+            self.closing = True
+            for task in list(self.tasks):
+                task.cancel()
+            if self.provider:
+                await self.provider.close()
+
+
+def rpc(request):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+        conn.settimeout(15)
+        try:
+            conn.connect(str(ROOT / 'control.sock'))
+            conn.sendall((json.dumps(request) + '\n').encode())
+            data = conn.makefile('rb').readline(LIMIT)
+            return json.loads(data)
+        except (OSError, ValueError):
+            if request.get('op') == 'read' and (ROOT / 'session.db').exists():
+                store = Store(ROOT)
+                value = store.read(request.get('after', 0))
+                value['state'] = dict(value['state'], status='unavailable',
+                                      error='Supervisor unavailable. Attach to restart; interrupted work is not replayed.')
+                store.db.close()
+                return value
+            raise RuntimeError('supervisor unavailable; run devflow attach SESSION') from None
+
+
+def remote_main(mode):
+    os.umask(0o077)
+    ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if mode == 'rpc':
+        print(json.dumps(rpc(json.loads(base64.b64decode(sys.argv[2])))))
+    elif mode == 'launch':
+        # A detached process owns all agent children; local EOF/SIGINT cannot reach it.
+        with open(ROOT / 'supervisor.log', 'ab') as log:
+            subprocess.Popen([sys.executable, __file__, 'serve'], stdin=subprocess.DEVNULL,
+                             stdout=log, stderr=log, start_new_session=True)
+        print('supervisor requested')
+    elif mode == 'serve':
+        with open(ROOT / 'supervisor.lock', 'a') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return
+            # SDK subprocesses may outlive a SIGKILL of their supervisor. Never
+            # start a second provider alongside an orphaned process group.
+            if (ROOT / 'session.db').exists():
+                store = Store(ROOT)
+                previous = store.meta.get('pid')
+                store.db.close()
+                if previous and previous != os.getpid():
+                    try:
+                        os.killpg(previous, 0)
+                    except ProcessLookupError:
+                        pass
+                    else:
+                        raise RuntimeError('orphaned runtime still exists; stop the sandbox, then attach to recover safely')
+            asyncio.run(Supervisor(ROOT, lock).serve())
+
+
+def clean(text):
+    # Never execute agent-supplied terminal control sequences (including OSC52).
+    text = re.sub(r'\x1b\][^\x07]*(?:\x07|\x1b\\)', '', str(text))
+    text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', text)
+    return ''.join(c for c in text if c in '\n\t' or (ord(c) >= 32 and ord(c) != 127))
+
+
+def render(event):
+    kind, data = event['kind'], event['data']
+    if kind == 'item/agentMessage/delta':
+        return data.get('delta', '')
+    if kind == 'StreamEvent':
+        delta = data.get('event', {}).get('delta', {})
+        return delta.get('text', '')
+    if kind == 'AssistantMessage':
+        if data.get('error'):
+            return '\nerror: ' + '\n'.join(b.get('text', '') for b in data.get('content', [])) + '\n'
+        return '\n'.join('tool: ' + b['name'] + ' ' + json.dumps(b.get('input', {}), ensure_ascii=False)
+                         for b in data.get('content', []) if 'name' in b)
+    if kind in ('item/started', 'item/completed'):
+        item = data.get('item', {})
+        if item.get('type') in ('agentMessage', 'userMessage', 'reasoning'):
+            return ''
+        if item.get('type') == 'commandExecution':
+            return '\n$ ' + item.get('command', '') + ('\nexit: ' + str(item.get('exitCode')) if kind.endswith('completed') else '') + '\n'
+        if item.get('type') == 'fileChange':
+            return '\nfiles: ' + ', '.join(c.get('path', '?') for c in item.get('changes', [])) + '\n'
+        return '\n' + item.get('type', kind) + '\n'
+    if kind == 'interaction':
+        params = data['params']
+        description = params.get('command') or params.get('reason') or params.get('file_path') or data['method']
+        questions = params.get('questions', [])
+        return '\ninput needed [' + data['id'] + '] ' + description + '\n' + '\n'.join(q['question'] for q in questions) + '\nTab to answer; nothing is approved while detached.\n'
+    if kind == 'action':
+        return '\n> ' + data.get('text', data.get('op', '')) + '\n'
+    if kind == 'turn/completed':
+        turn = data['turn']
+        return '\nturn ' + turn['status'] + (' · ' + str(turn['error']) if turn.get('error') else '') + '\n'
+    if kind == 'ResultMessage':
+        return '\nturn ' + ('failed: ' + str(data.get('result') or data.get('errors')) if data.get('is_error') else 'completed') + '\n'
+    if kind == 'turn/diff/updated':
+        return '\n' + data.get('diff', '') + '\n'
+    if kind.endswith('/delta'):
+        if 'reasoning' in kind.lower():
+            return ''  # Only provider summaries, never raw reasoning deltas.
+        return data.get('delta', '')
+    if kind in ('action', 'error', 'pr', 'recovered', 'interaction', 'turn/completed',
+                'turn/diff/updated', 'turn/plan/updated', 'ResultMessage'):
+        return '\n' + kind + ' · ' + json.dumps(data, ensure_ascii=False) + '\n'
+    return ''
+
+
+class Client:
+    def __init__(self, cli, config, name):
+        self.cli, self.name = cli, name
+        self.cache = Path(config) / 'sessions' / (hashlib.sha256(name.encode()).hexdigest() + '.json')
+        self.cache.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.cache.parent.chmod(0o700)
+        self.saved = json.loads(self.cache.read_text()) if self.cache.exists() else {'cursor': 0, 'text': ''}
+        self.outbox = self.cache.with_suffix('.outbox')
+        self.outbox.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.lock = threading.Lock()
+        self.state = {}
+        self.notice = 'connecting…'
+        self.closed = threading.Event()
+
+    def call(self, request):
+        encoded = base64.b64encode(json.dumps(request).encode()).decode()
+        result = subprocess.run([self.cli, '__session-rpc', self.name, encoded],
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=40)
+        if result.returncode:
+            raise ConnectionError('Daytona unavailable: check network/login or dv status ' + self.name)
+        try:
+            response = json.loads(result.stdout)
+        except ValueError:
+            raise ConnectionError('invalid Daytona response; check CLI compatibility') from None
+        if 'error' in response:
+            raise ValueError(response['error'])
+        return response
+
+    def enqueue(self, op, **args):
+        request = dict(id=uuid.uuid4().hex, op=op, **args)
+        private_json(self.outbox / (request['id'] + '.json'), request)
+        return request
+
+    def poll(self):
+        while not self.closed.is_set():
+            try:
+                with self.lock:
+                    after = self.saved['cursor']
+                for path in sorted(self.outbox.glob('*.json'), key=lambda p: p.stat().st_mtime):
+                    try:
+                        action = json.loads(path.read_text())
+                    except FileNotFoundError:
+                        continue
+                    try:
+                        self.call(action)
+                    except ValueError as exc:
+                        with self.lock:
+                            self.saved['text'] += '\nrequest rejected: ' + clean(str(exc)) + '\n'
+                    path.unlink(missing_ok=True)
+                result = self.call({'op': 'read', 'after': after})
+                with self.lock:
+                    self.state = result['state']
+                    sandbox = self.state.get('sandbox_id')
+                    if self.saved.get('sandbox_id') not in (None, sandbox):
+                        self.saved.update(cursor=0, text='', sandbox_id=sandbox)
+                        continue
+                    self.saved['sandbox_id'] = sandbox
+                    for event in result['events']:
+                        if event['seq'] > self.saved['cursor']:
+                            self.saved['text'] += clean(render(event))
+                            self.saved['cursor'] = event['seq']
+                    self.saved['text'] = self.saved['text'][-150000:]
+                    private_json(self.cache, self.saved)
+                self.notice = 'connected · remote compute stays on when you detach'
+                if len(result['events']) == 300:
+                    continue
+            except (ConnectionError, subprocess.TimeoutExpired, OSError) as exc:
+                self.notice = str(exc) + ' · retrying; remote work is not cancelled'
+            except ValueError as exc:
+                self.notice = str(exc)
+            self.closed.wait(0.7)
+
+    def command(self, line):
+        if line == '/detach':
+            return False
+        if line == '/interrupt':
+            self.enqueue('interrupt')
+        elif line == '/recover':
+            self.enqueue('recover')
+        elif line.startswith('/pr '):
+            self.enqueue('pr', text=line[4:])
+        elif line.startswith(('/approve ', '/deny ')):
+            op, ident = line.split(' ', 1)
+            self.enqueue('answer', interaction=ident, reply={'allow': op == '/approve'})
+        elif line.startswith('/answer '):
+            _, ident, answers = line.split(' ', 2)
+            self.enqueue('answer', interaction=ident, reply={'answers': json.loads(answers)})
+        elif line.startswith('/'):
+            raise ValueError('/detach · /interrupt · /recover · /approve ID · /deny ID · /answer ID {"question-id":"answer"} · /pr TITLE')
+        elif line.strip():
+            self.enqueue('prompt', text=line)
+        return True
+
+    def tui(self, screen):
+        import curses
+        import textwrap
+        curses.raw()  # Ctrl-C is a turn action; never signal the remote process.
+        curses.curs_set(1)
+        screen.timeout(100)
+        text = ''; scroll = 0; notice = ''; answering = None
+        thread = threading.Thread(target=self.poll, daemon=True)
+        thread.start()
+        try:
+            while True:
+                h, w = screen.getmaxyx()
+                if h < 10 or w < 35:
+                    screen.erase()
+                    with contextlib.suppress(curses.error):
+                        screen.addstr(0, 0, 'Resize terminal (35×10 minimum)')
+                    if screen.getch() in (4, 27):
+                        break
+                    continue
+                with self.lock:
+                    state = dict(self.state)
+                    output = self.saved['text']
+                screen.erase()
+                def row(y, value, attr=0):
+                    with contextlib.suppress(curses.error):
+                        screen.addnstr(y, 0, clean(value), w - 1, attr)
+                row(0, f"{self.name} · {state.get('provider', '?')} · {state.get('status', 'connecting')}", curses.A_BOLD)
+                row(1, f"{state.get('repo', '')}  {state.get('branch', '')}  {state.get('pr') or ''}")
+                lines = []
+                for line in output.splitlines():
+                    lines.extend(textwrap.wrap(line, max(1, w - 1), replace_whitespace=False) or [''])
+                end = max(0, len(lines) - scroll)
+                for i, line in enumerate(lines[max(0, end - (h - 7)):end]):
+                    row(i + 3, line)
+                pending = state.get('pending', {})
+                row(h - 4, 'pending: ' + ', '.join(pending) + ' · Tab to answer' if pending else 'PgUp/PgDn history · Ctrl-D detach · Ctrl-C interrupt turn')
+                connection_notice = self.notice if not self.notice.startswith('connected') else ''
+                row(h - 3, connection_notice or notice or state.get('error') or self.notice, curses.A_DIM)
+                row(h - 2, '/approve ID  /deny ID  /answer ID JSON  /pr TITLE  /recover')
+                if answering:
+                    questions = answering['questions']
+                    question = questions[answering['index']]
+                    description = [question['question']]
+                    description.extend(f"{i + 1}. {o['label']} — {o.get('description', '')}"
+                                       for i, o in enumerate(question.get('options') or []))
+                    description.append('Type a number or your own answer; comma-separated numbers for multi-select. Esc cancels.')
+                    panel = []
+                    for line in description:
+                        panel.extend(textwrap.wrap(line, w - 2))
+                    for y in range(3, h - 1):
+                        row(y, ' ' * (w - 1))
+                    panel_start = answering.get('scroll', 0)
+                    for y, line in enumerate(panel[panel_start:panel_start + h - 6], 3):
+                        row(y, line, curses.A_BOLD if y == 3 else 0)
+                    row(h - 2, 'PgUp/PgDn: full details · Enter: submit · Esc: leave pending')
+                row(h - 1, '> ' + text[-max(1, w - 4):])
+                screen.refresh()
+                try:
+                    key = screen.get_wch()
+                except curses.error:
+                    continue
+                if key == '\x04':
+                    break
+                if key == '\x1b':
+                    answering = None; text = ''; continue
+                if key == '\t' and pending:
+                    ident = next(iter(pending))
+                    request = pending[ident]
+                    questions = request.get('params', {}).get('questions')
+                    if not questions:
+                        detail = request.get('params', {})
+                        description = detail.get('command') or detail.get('file_path') or detail.get('reason') or json.dumps(detail, ensure_ascii=False)
+                        questions = [{'id': 'approval', 'question': 'Allow ' + request['method'] + '?\n' + description,
+                                      'options': [{'label': 'Deny'}, {'label': 'Approve once'}]}]
+                    answering = {'id': ident, 'questions': questions, 'index': 0, 'answers': {},
+                                 'approval': not bool(request.get('params', {}).get('questions'))}
+                    text = ''; continue
+                if key == '\x03':
+                    self.enqueue('interrupt'); notice = 'interrupt requested'; continue
+                if key == curses.KEY_PPAGE:
+                    if answering:
+                        answering['scroll'] = max(0, answering.get('scroll', 0) - h + 6)
+                    else:
+                        scroll += max(1, h - 7)
+                    continue
+                if key == curses.KEY_NPAGE:
+                    if answering:
+                        answering['scroll'] = min(max(0, len(panel) - h + 6), answering.get('scroll', 0) + h - 6)
+                    else:
+                        scroll = max(0, scroll - h + 7)
+                    continue
+                if key in ('\n', '\r', curses.KEY_ENTER):
+                    try:
+                        if answering:
+                            question = answering['questions'][answering['index']]
+                            options = question.get('options') or []
+                            selections = text.strip().split(',')
+                            if all(s.strip().isdigit() and 1 <= int(s.strip()) <= len(options) for s in selections):
+                                values = [options[int(s.strip()) - 1]['label'] for s in selections]
+                                answer = values if question.get('multiSelect') else values[0]
+                            else:
+                                answer = text.strip()
+                            if not answer:
+                                raise ValueError('enter an answer (Esc leaves it pending)')
+                            if answering['approval']:
+                                if answer not in ('Deny', 'Approve once'):
+                                    raise ValueError('enter 1 to deny or 2 to approve once')
+                                reply = {'allow': answer == 'Approve once'}
+                            else:
+                                answering['answers'][question.get('id', question['question'])] = answer
+                                answering['index'] += 1
+                                if answering['index'] < len(answering['questions']):
+                                    text = ''; continue
+                                reply = {'answers': answering['answers']}
+                            self.enqueue('answer', interaction=answering['id'], reply=reply)
+                            answering = None; text = ''; continue
+                        if not self.command(text):
+                            break
+                        notice = ''; text = ''; scroll = 0
+                    except (ValueError, KeyError) as exc:
+                        notice = str(exc)
+                elif key in ('\x7f', '\b', curses.KEY_BACKSPACE):
+                    text = text[:-1]
+                elif isinstance(key, str) and key.isprintable():
+                    text += key
+        finally:
+            self.closed.set()
+
+
+def client_main():
+    cli, config, name, mode, *args = sys.argv[2:]
+    client = Client(cli, config, name)
+    if mode == 'tui':
+        import curses
+        curses.wrapper(client.tui)
+        print('Detached. Remote work continues. Reattach: devflow attach ' + name)
+    elif mode == 'status':
+        print(json.dumps(client.call({'op': 'read', 'after': 0})['state'], indent=2))
+    elif mode == 'events':
+        after = int(args[0]) if args else 0
+        print(json.dumps(client.call({'op': 'read', 'after': after})))
+    else:
+        op = 'prompt' if mode == 'send' else mode
+        request = client.enqueue(op, text=' '.join(args))
+        try:
+            result = client.call(request)
+        except ValueError:
+            (client.outbox / (request['id'] + '.json')).unlink(missing_ok=True)
+            raise
+        (client.outbox / (request['id'] + '.json')).unlink(missing_ok=True)
+        print(json.dumps(result))
+
+
+if __name__ == '__main__':
+    try:
+        if sys.argv[1] == 'client':
+            client_main()
+        else:
+            remote_main(sys.argv[1])
+    except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as exc:
+        print('devflow: ' + str(exc), file=sys.stderr)
+        sys.exit(1)
+DV_SESSION_PY
+}
+
+# ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 main() {
-  local cmd="${1:-help}"
+  local cmd="${1:-home}"
   [ $# -gt 0 ] && shift
   load_config
 
   case "$cmd" in
-    up|start|new)         cmd_up "$@" ;;
+    home)                 cmd_session_home ;;
+    up|start)             cmd_up "$@" ;;
+    new)                  cmd_new "$@" ;;
+    sessions)             cmd_sessions ;;
+    send|pr|interrupt|recover|events) cmd_session_action "$cmd" "$@" ;;
+    __session-runtime)    emit_session_runtime ;;
+    __session-install)    install_session_runtime "$@" ;;
+    __session-rpc)        session_rpc "$@" ;;
     attach|a|open)        cmd_attach "$@" ;;
     ssh)                  cmd_ssh "$@" ;;
     web|url|preview)      cmd_web "$@" ;;

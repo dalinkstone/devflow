@@ -14,6 +14,19 @@ Use `dv setup opencode` or `dv setup pi` for API keys; `dv setup github` for rep
 ## Run
 
 ```sh
+dv                         # session picker
+dv new --repo org/repo --agent codex -m "fix it"
+dv sessions
+dv attach SESSION          # replay + continue; Ctrl-D detaches
+dv pr SESSION "Fix it"      # commit, push, draft PR
+```
+
+Use `--agent claude` for Claude. Tab answers approvals/questions; nothing is
+auto-approved while detached. [Persistent sessions](docs/sessions.md).
+
+Existing tmux sessions and demos:
+
+```sh
 dv up org/repo
 dv up org/repo --agent pi
 dv up org/repo -m "fix it" --detach

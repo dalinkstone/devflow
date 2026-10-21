@@ -126,6 +126,15 @@ where applicable, and verify release assets exist before bumping.
 
 ## Test harness anatomy
 
+`tests/test_sessions.py` extracts the actual embedded supervisor and runs real
+Unix-socket/subprocess tests with a clearly labelled Codex protocol fixture.
+It tests replay, explicit approvals, request deduplication, failed-provider
+recovery, stop/restart, and prevention of duplicate supervisors. These tests
+do not prove model inference; live acceptance evidence is recorded separately.
+`tests/fake_session_provider.py` must never be used as the production provider.
+The actual curses client is exercised with a PTY in `test_session_console.py`.
+See [session acceptance checks](session-testing.md) for live results and commands.
+
 `tests/run-tests.sh` runs devflow with `env -i`, a temp `$HOME`, temp
 `DEVFLOW_CONFIG_DIR`, and `tests/fakebin` prepended to PATH. The fakes:
 

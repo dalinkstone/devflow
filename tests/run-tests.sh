@@ -32,7 +32,7 @@ assert_eq() {
   if [ "$2" = "$3" ]; then t_ok "$1"; else t_fail "$1" "got '$2' want '$3'"; fi
 }
 assert_rc() { # NAME GOT WANT
-  if [ "$2" = "$3" ]; then t_ok "$1"; else t_fail "$1" "exit code $2, want $3"; fi
+  if [ "$2" = "$3" ]; then t_ok "$1"; else t_fail "$1" "exit code $2, want $3; output: $(printf '%s' "${OUT:-}" | tail -8)"; fi
 }
 
 # ---------------------------------------------------------------------------
