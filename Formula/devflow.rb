@@ -5,8 +5,8 @@
 class Devflow < Formula
   desc "Run Claude, Codex, OpenCode, and Pi in Daytona sandboxes"
   homepage "https://github.com/dalinkstone/devflow"
-  url "https://github.com/dalinkstone/devflow/archive/refs/tags/v0.10.0.tar.gz"
-  sha256 "8be9ea8008993066353f1aa58e9e82ea86a156c3cc43f7e79af97290eeefed98"
+  url "https://github.com/dalinkstone/devflow/archive/refs/tags/v0.11.0.tar.gz"
+  sha256 "79b17b62605cfeec4372373b0a6972cab5fa1a87ded16ef81000c732a26319fa"
   license "MIT"
   head "https://github.com/dalinkstone/devflow.git", branch: "main"
 
