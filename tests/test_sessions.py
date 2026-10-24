@@ -106,6 +106,53 @@ class Sessions(unittest.TestCase):
         self.assertEqual(self.read()['state']['thread_id'], 'fixture-thread')
         self.assertEqual((self.cwd / 'turns.log').read_text().splitlines(), ['long task', 'followup'])
 
+    def test_reported_metrics_are_durable_and_not_double_counted(self):
+        s = self.runtime.Supervisor(self.root, None)
+        usage = {'tokenUsage': {'total': {'inputTokens': 900, 'outputTokens': 45, 'cachedInputTokens': 300},
+                               'last': {'totalTokens': 200}, 'modelContextWindow': 10000}}
+        s.telemetry('thread/tokenUsage/updated', usage)
+        s.telemetry('thread/tokenUsage/updated', usage)
+        self.assertEqual(s.store.meta['tokens']['inputTokens'], 900)
+        self.assertEqual(s.store.meta['context_tokens'], 200)
+        self.assertNotIn('cost_usd', s.store.meta)
+        s.telemetry('model/rerouted', {'toModel': 'actual-model'})
+        self.assertEqual(s.store.meta['model'], 'actual-model')
+        s.telemetry('ResultMessage', {'total_cost_usd': .12, 'usage': {'input_tokens': 200, 'output_tokens': 20}})
+        s.telemetry('ResultMessage', {'total_cost_usd': .20})
+        self.assertEqual(s.store.meta['cost_usd'], .20)  # Cumulative, not .32.
+        s.telemetry('ResultMessage', {'total_cost_usd': None})
+        self.assertEqual(s.store.meta['cost_usd'], .20)
+        saved = self.runtime.Store(self.root)
+        self.assertEqual(saved.meta['cost_usd'], .20)
+        saved.db.close()
+        s.store.db.close()
+
+    def test_title_and_timer_follow_executed_prompt(self):
+        self.start()
+        self.action('prompt', text='Build a table')
+        state = self.wait(lambda s: s['state']['status'] == 'completed')['state']
+        self.assertEqual(state['title'], 'Build a table')
+        self.assertGreaterEqual(state['turn_finished_at'], state['turn_started_at'])
+        self.action('prompt', text='Now add tests')
+        state = self.wait(lambda s: s['state']['status'] == 'completed')['state']
+        self.assertEqual(state['title'], 'Build a table')
+
+    def test_model_and_effort_are_passed_to_codex(self):
+        async def run():
+            s = self.runtime.Supervisor(self.root, None)
+            s.store.save(requested_effort='high')
+            p = self.runtime.Codex(s)
+            calls = []
+            async def call(method, params):
+                calls.append((method, params))
+                return {'turn': {'id': 'turn'}}
+            p.call = call
+            await p.prompt('hello')
+            self.assertEqual(calls[0][1]['effort'], 'high')
+            self.assertEqual(s.store.meta['effort'], 'high')
+            s.store.db.close()
+        asyncio.run(run())
+
     def test_dropped_ack_retries_do_not_duplicate_prompt(self):
         self.start()
         first = self.action('prompt', ident='fixed', text='one')

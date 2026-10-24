@@ -1,7 +1,7 @@
 # Persistent session acceptance checks
 
-Use the source checkout until this feature is released: replace `dv` below with
-`./bin/devflow`, or run `make install` to install your checked-out version.
+Use v0.11.0 or later. For checkout testing, run `make tui`, then replace `dv`
+below with `./bin/devflow`, or run `make install` to install the checkout.
 
 ## Automated
 
@@ -15,9 +15,14 @@ lost acknowledgements/deduplication, queued follow-ups, persistent approvals,
 freeform answers, stale replies, interruption, provider crashes, process locks,
 credential redaction, local outbox recovery, Claude SDK callback/resume/error
 contracts, and real Git branch/commit/push against a temporary bare repository.
-`test_session_console.py` drives the real curses UI in a pseudo-terminal:
+`test_session_console.py` drives both the fallback and native UI in a pseudo-terminal:
 multiple-choice answer, Ctrl-C turn interruption, network outage/recovery,
-and Ctrl-D detach. Model behavior and hosted GitHub are not mocked into a
+and Ctrl-D detach, including prompt durability immediately before detach.
+The Go suite covers layout at 35–160 columns, long scrollback, terminal escape
+sanitization, input review, unknown cost, timers and metadata, and runs with the
+race detector. Provider tests cover usage replacement (not double-counting),
+persisted spend, effort propagation, title and turn timestamps.
+Model behavior and hosted GitHub are not mocked into a
 claim of successful live execution.
 
 ## Live results (2026-10-20 local time)

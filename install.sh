@@ -58,6 +58,36 @@ chmod +x "$INSTALL_DIR/devflow"
 ln -sf "$INSTALL_DIR/devflow" "$INSTALL_DIR/dv"
 ok "devflow → $INSTALL_DIR/devflow (alias: dv)"
 
+# Optional native session renderer. The standalone Bash CLI always retains its
+# Python fallback. Download only the matching release, verify before installing.
+install_tui() {
+  local version asset tmp expected actual
+  version="$(sed -n 's/^DEVFLOW_VERSION="\(.*\)"/\1/p' "$INSTALL_DIR/devflow")"
+  if [ -x "$SCRIPT_DIR/bin/devflow-tui" ] && [ "$("$SCRIPT_DIR/bin/devflow-tui" --version)" = "devflow-tui $version" ]; then
+    cp "$SCRIPT_DIR/bin/devflow-tui" "$INSTALL_DIR/devflow-tui"
+    return
+  fi
+  asset="devflow-tui-$OS-$ARCH"
+  tmp="$(mktemp -d)" || return 1
+  if curl -fsSL "https://github.com/$REPO/releases/download/v$version/$asset" -o "$tmp/$asset" \
+    && curl -fsSL "https://github.com/$REPO/releases/download/v$version/checksums.txt" -o "$tmp/checksums.txt"; then
+    expected="$(awk -v name="$asset" '$2 == name { print $1 }' "$tmp/checksums.txt")"
+    if have shasum; then actual="$(shasum -a 256 "$tmp/$asset" | cut -d' ' -f1)"
+    elif have sha256sum; then actual="$(sha256sum "$tmp/$asset" | cut -d' ' -f1)"
+    else actual=""; fi
+    if [ -n "$expected" ] && [ "$actual" = "$expected" ]; then
+      chmod +x "$tmp/$asset"
+      mv "$tmp/$asset" "$INSTALL_DIR/devflow-tui"
+      rm -rf "$tmp"
+      return 0
+    fi
+  fi
+  rm -rf "$tmp"
+  return 1
+}
+if install_tui; then ok "native session TUI installed"
+else warn "native TUI unavailable; using the built-in terminal view (retry installer later)"; fi
+
 # --- dependencies -----------------------------------------------------------
 install_daytona() {
   if have brew; then

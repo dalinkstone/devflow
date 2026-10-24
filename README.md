@@ -23,6 +23,8 @@ dv pr SESSION "Fix it"      # commit, push, draft PR
 
 Use `--agent claude` for Claude. Tab answers approvals/questions; nothing is
 auto-approved while detached. [Persistent sessions](docs/sessions.md).
+The native Charm TUI shows activity, model/effort, tokens, time, and reported
+spend estimates. Add `--title "Fix login" --model MODEL --effort high` to `dv new`.
 
 Existing tmux sessions and demos:
 

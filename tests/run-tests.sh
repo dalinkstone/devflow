@@ -1098,6 +1098,19 @@ assert_contains "installer reports the repaired Daytona version" "$INSTALL_OUT" 
 assert_eq "installer points the shadow at Homebrew's stable opt path" \
   "$(readlink "$INSTALL_BIN/daytona")" "$INSTALL_OPT/bin/daytona"
 
+fresh_env argv
+run_devflow new --repo tester/session --agent codex --title 'Fix login' --model test-model --effort high --detach
+assert_rc "managed session accepts title/model/effort" "$RC" 0
+SESSION_CONFIG="$(extract_pushed_file /tmp/.dv-session.json)"
+assert_eq "managed title forwarded" "$(printf '%s' "$SESSION_CONFIG" | jq -r .title)" 'Fix login'
+assert_eq "managed model forwarded" "$(printf '%s' "$SESSION_CONFIG" | jq -r .requested_model)" test-model
+assert_eq "managed effort forwarded" "$(printf '%s' "$SESSION_CONFIG" | jq -r .requested_effort)" high
+assert_file_contains "managed session is labelled" "$T_LOG" '--label=devflow.session=1'
+run_devflow new --repo tester/session --agent codex --effort nonsense --detach
+assert_rc "invalid effort rejected" "$RC" 1
+run_devflow new --repo tester/session --agent claude --effort xhigh --detach
+assert_rc "unsupported Claude effort rejected" "$RC" 1
+
 # ===========================================================================
 printf '\n# results: %d passed, %d failed, %d total\n' "$PASS" "$FAIL" "$TESTN"
 [ "$FAIL" = 0 ] || exit 1

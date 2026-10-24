@@ -7,6 +7,8 @@ follow the checklists literally.
 
 ```
 bin/devflow                     the entire CLI (one self-contained file)
+cmd/devflow-tui/                 optional native Charm session renderer
+go.mod / go.sum                  pinned native UI dependencies (Go 1.26+)
 i                               short POSIX curl bootstrap
 install.sh                      curl|bash installer (also works from checkout)
 Formula/devflow.rb              Homebrew formula (this repo doubles as the tap)
@@ -132,7 +134,12 @@ It tests replay, explicit approvals, request deduplication, failed-provider
 recovery, stop/restart, and prevention of duplicate supervisors. These tests
 do not prove model inference; live acceptance evidence is recorded separately.
 `tests/fake_session_provider.py` must never be used as the production provider.
-The actual curses client is exercised with a PTY in `test_session_console.py`.
+Both the curses fallback and native Charm client are exercised with a PTY in
+`test_session_console.py` (set `DEVFLOW_TEST_CHARM=1` for native). `make test`
+also builds the native helper, runs Go race tests and vet, and tests the native
+view. `go test ./cmd/devflow-tui -bench . -benchmem` measures idle rendering with
+a long transcript. `make tui` builds the helper for checkout use; `make install`
+installs it beside the Bash CLI. The Python bridge remains the only transport.
 See [session acceptance checks](session-testing.md) for live results and commands.
 
 `tests/run-tests.sh` runs devflow with `env -i`, a temp `$HOME`, temp

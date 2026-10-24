@@ -13,7 +13,7 @@
 set -u
 set -o pipefail
 
-DEVFLOW_VERSION="0.10.0"
+DEVFLOW_VERSION="0.11.0"
 
 # ----------------------------------------------------------------------------
 # Config (precedence: environment > config file > built-in default)
@@ -5291,10 +5291,16 @@ is_managed_session() {
 
 session_client() { # NAME MODE [ARGS]
   need_cmd python3 "install Python 3.10+"
-  local payload rc
+  local payload rc ui cli
   payload="$(mktemp)" || return 1
   emit_session_runtime > "$payload"
-  python3 "$payload" client "$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" "$CONFIG_DIR" "$@"
+  cli="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+  ui="${DEVFLOW_TUI_BIN:-$(dirname "$cli")/devflow-tui}"
+  if [ "${2:-}" = tui ] && [ "${DEVFLOW_TUI:-}" != plain ] && [ -x "$ui" ]; then
+    "$ui" python3 "$payload" client "$cli" "$CONFIG_DIR" "$1" bridge
+  else
+    python3 "$payload" client "$cli" "$CONFIG_DIR" "$@"
+  fi
   rc=$?; rm -f "$payload"; return "$rc"
 }
 
@@ -5325,16 +5331,19 @@ cmd_session_home() {
 }
 
 cmd_new() {
-  local repo="" agent="" branch="" prompt="" detach=0 size=medium name config sandbox_id
+  local repo="" agent="" branch="" prompt="" detach=0 size=medium name config sandbox_id title="" model="" effort=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --repo) need_val "$1" "${2:-}"; repo="$2"; shift 2 ;;
       --agent|-a) need_val "$1" "${2:-}"; agent="$2"; shift 2 ;;
       --branch|-b) need_val "$1" "${2:-}"; branch="$2"; shift 2 ;;
       --task|-m) need_val "$1" "${2:-}"; prompt="$2"; shift 2 ;;
+      --title) need_val "$1" "${2:-}"; title="$2"; shift 2 ;;
+      --model) need_val "$1" "${2:-}"; model="$2"; shift 2 ;;
+      --effort) need_val "$1" "${2:-}"; effort="$2"; shift 2 ;;
       --size|-s) need_val "$1" "${2:-}"; size="$2"; shift 2 ;;
       --detach) detach=1; shift ;;
-      --help|-h) printf 'devflow new --repo OWNER/REPO --agent codex|claude [-b BRANCH] [-m PROMPT] [--detach] [--size medium]\n'; return ;;
+      --help|-h) printf 'devflow new --repo OWNER/REPO --agent codex|claude [-b BRANCH] [-m PROMPT] [--title NAME] [--model MODEL] [--effort LEVEL] [--detach] [--size medium]\n'; return ;;
       *) die "unknown argument: $1 (see devflow new --help)" ;;
     esac
   done
@@ -5342,6 +5351,10 @@ cmd_new() {
   if [ -z "$agent" ] && [ -t 0 ]; then agent="$(console_choose Provider codex claude Cancel)" || return; fi
   [ "$agent" != Cancel ] || return
   case "$agent" in codex|claude) ;; *) die "--agent must be codex or claude" ;; esac
+  case "$effort" in ''|none|minimal|low|medium|high|xhigh|max) ;; *) die "invalid effort level" ;; esac
+  if [ "$agent" = claude ]; then
+    case "$effort" in ''|low|medium|high|max) ;; *) die "Claude effort must be low, medium, high, or max" ;; esac
+  fi
   if [ -z "$repo" ] && [ -t 0 ]; then pick_repo; repo="$REPO_PICKED"; fi
   repo="$(repo_from_arg "$repo")"
   case "$repo" in ''|*[!A-Za-z0-9_./-]*) die "--repo OWNER/REPO is required" ;; esac
@@ -5375,7 +5388,7 @@ cmd_new() {
   run_phase_clean "$name" tools "$agent" "" "" "" core || die "tool installation failed; inspect or remove $name"
   run_phase_clean "$name" auth "$agent" "" "" "" core || die "auth failed; inspect or remove $name"
   install_session_runtime "$name" || die "runtime upload failed"
-  config="$(jq -nc --arg id "$name" --arg sandbox_id "$sandbox_id" --arg provider "$agent" --arg repo "$repo" --arg branch "$branch" --arg prompt "$prompt" '{id:$id,sandbox_id:$sandbox_id,provider:$provider,repo:$repo,branch:$branch,initial_prompt:$prompt}')"
+  config="$(jq -nc --arg id "$name" --arg sandbox_id "$sandbox_id" --arg provider "$agent" --arg repo "$repo" --arg branch "$branch" --arg prompt "$prompt" --arg title "$title" --arg model "$model" --arg effort "$effort" '{id:$id,sandbox_id:$sandbox_id,provider:$provider,repo:$repo,branch:$branch,initial_prompt:$prompt,title:$title,requested_model:$model,requested_effort:$effort}')"
   printf '%s' "$config" | dt_push_file "$name" /tmp/.dv-session.json || die "config upload failed"
   dt_run "$name" 'umask 077; mv /tmp/.dv-session.json "$HOME/.devflow/session/config.json"' 60 >/dev/null || die "session setup failed"
   if [ "$agent" = claude ]; then
@@ -5521,17 +5534,20 @@ class Codex:
             stderr=asyncio.subprocess.DEVNULL, limit=LIMIT,
             pass_fds=(self.s.lock.fileno(),))
         self.reader = asyncio.create_task(self.read())
-        await self.call('initialize', {'clientInfo': {'name': 'devflow', 'title': 'devflow', 'version': '0.10.0'},
+        await self.call('initialize', {'clientInfo': {'name': 'devflow', 'title': 'devflow', 'version': '0.11.0'},
                                        'capabilities': {'experimentalApi': True}})
         await self.write({'method': 'initialized', 'params': {}})
         if os.environ.get('OPENAI_API_KEY'):
             await self.call('account/login/start', {'type': 'apiKey', 'apiKey': os.environ['OPENAI_API_KEY']})
         thread = self.s.store.meta.get('thread_id')
         params = dict(cwd=self.s.store.meta['cwd'], approvalPolicy='untrusted', sandbox='workspace-write')
+        if self.s.store.meta.get('requested_model'):
+            params['model'] = self.s.store.meta['requested_model']
         if thread:
             params['threadId'] = thread
         result = await self.call('thread/resume' if thread else 'thread/start', params)
-        self.s.store.save(thread_id=result['thread']['id'])
+        self.s.store.save(thread_id=result['thread']['id'], model=result.get('model'),
+                          effort=result.get('reasoningEffort'))
 
     async def write(self, value):
         self.proc.stdin.write((json.dumps(value) + '\n').encode())
@@ -5586,9 +5602,15 @@ class Codex:
                     future.set_exception(RuntimeError('Codex connection closed'))
 
     async def prompt(self, text):
-        result = await self.call('turn/start', dict(threadId=self.s.store.meta['thread_id'],
+        params = dict(threadId=self.s.store.meta['thread_id'],
             input=[dict(type='text', text=text)], approvalPolicy='untrusted',
-            sandboxPolicy=dict(type='workspaceWrite', writableRoots=[self.s.store.meta['cwd']], networkAccess=True)))
+            sandboxPolicy=dict(type='workspaceWrite', writableRoots=[self.s.store.meta['cwd']], networkAccess=True))
+        effort = self.s.store.meta.get('requested_effort')
+        if effort:
+            params['effort'] = effort
+        result = await self.call('turn/start', params)
+        if effort:
+            self.s.store.save(effort=effort)
         self.s.store.save(turn_id=result['turn']['id'])
 
     async def answer(self, ident, reply):
@@ -5639,6 +5661,11 @@ class Claude:
         options = ClaudeAgentOptions(cwd=self.s.store.meta['cwd'], permission_mode='default',
             setting_sources=[], can_use_tool=self.permission, include_partial_messages=True,
             resume=self.s.store.meta.get('thread_id'))
+        if self.s.store.meta.get('requested_model'):
+            options.model = self.s.store.meta['requested_model']
+        if self.s.store.meta.get('requested_effort'):
+            options.effort = self.s.store.meta['requested_effort']
+            self.s.store.save(effort=options.effort)
         self.client = ClaudeSDKClient(options=options)
         await self.client.connect()
 
@@ -5721,6 +5748,46 @@ class Supervisor:
 
     def event(self, kind, data):
         self.store.event(kind, data)
+        self.telemetry(kind, data)
+
+    def telemetry(self, kind, data):
+        # Only provider-reported metadata. Never derive dollars from token counts.
+        values = {}
+        if kind == 'thread/tokenUsage/updated':
+            usage = data.get('tokenUsage', {})
+            values.update(tokens=usage.get('total'), token_scope='thread',
+                          context_tokens=usage.get('last', {}).get('totalTokens'),
+                          context_window=usage.get('modelContextWindow'))
+        elif kind == 'model/rerouted':
+            values['model'] = data.get('toModel')
+        elif kind == 'SystemMessage' and data.get('subtype') == 'init':
+            values['model'] = data.get('data', {}).get('model')
+        elif kind == 'AssistantMessage':
+            if data.get('model'):
+                values['model'] = data['model']
+            tools = [b['name'] for b in data.get('content', []) if b.get('name')]
+            values['activity'] = ', '.join(tools) if tools else 'Responding'
+        elif kind == 'ResultMessage':
+            # Streaming SDK result cost is cumulative; adding results double-counts.
+            if data.get('total_cost_usd') is not None:
+                values.update(cost_usd=data['total_cost_usd'], cost_scope='SDK estimate')
+            usage = data.get('usage') or {}
+            if usage:
+                values.update(tokens=dict(inputTokens=usage.get('input_tokens', 0),
+                    outputTokens=usage.get('output_tokens', 0),
+                    cachedInputTokens=usage.get('cache_read_input_tokens', 0)), token_scope='last turn')
+        elif kind == 'item/started':
+            item = data.get('item', {})
+            values['activity'] = item.get('command') or item.get('tool') or {
+                'agentMessage': 'Responding', 'reasoning': 'Thinking',
+                'fileChange': 'Editing files', 'webSearch': 'Searching the web',
+            }.get(item.get('type'), item.get('type', 'Working'))
+        elif kind == 'turn/plan/updated':
+            active = [p.get('step') for p in data.get('plan', []) if p.get('status') == 'inProgress']
+            if active:
+                values['activity'] = active[0]
+        if values:
+            self.store.save(**redact(values, self.store.secrets))
 
     def pending(self, ident, request):
         pending = dict(self.store.meta.get('pending', {}))
@@ -5740,12 +5807,12 @@ class Supervisor:
 
     def fail(self, message):
         self.clear_pending('provider unavailable; old requests cannot be approved')
-        self.store.save(status='failed', error=message)
+        self.store.save(status='failed', error=message, activity='failed', turn_finished_at=now())
         self.event('error', {'message': message})
 
     def complete(self, status):
         self.clear_pending('turn ended')
-        self.store.save(status=status, turn_id=None)
+        self.store.save(status=status, turn_id=None, turn_finished_at=now(), activity=status)
         queued = list(self.store.meta.get('queued', []))
         if status == 'completed' and queued:
             request = queued.pop(0)
@@ -5796,6 +5863,9 @@ class Supervisor:
             self.store.save(**config, cwd=str(Path.home() / 'work' / config['repo'].split('/')[-1]),
                             created_at=now(), status='starting', pending={}, thread_id=None, pr=None)
         else:
+            if self.store.meta.get('status') in ('running', 'waiting', 'starting'):
+                # An interrupted process has no trustworthy completion time.
+                self.store.save(turn_started_at=None, turn_finished_at=None)
             self.clear_pending('supervisor restarted; previous turn interrupted, not replayed')
             self.event('recovered', {'message': 'Conversation restored. Interrupted work was not replayed; send a follow-up.'})
             if self.store.meta.get('queued'):
@@ -5807,7 +5877,7 @@ class Supervisor:
                 await self.workspace()
             self.provider = (Codex if self.store.meta['provider'] == 'codex' else Claude)(self)
             await self.provider.start()
-            self.store.save(status='idle')
+            self.store.save(status='idle', activity='idle')
             prompt = self.store.meta.pop('initial_prompt', '')
             self.store.save()
             if fresh and prompt:
@@ -5818,6 +5888,8 @@ class Supervisor:
     async def perform(self, request):
         op = request['op']
         if op == 'prompt':
+            self.store.save(turn_started_at=now(), turn_finished_at=None, activity='Working',
+                            title=self.store.meta.get('title') or request['text'].splitlines()[0][:80])
             await self.provider.prompt(request['text'])
         elif op == 'pr':
             m = self.store.meta
@@ -6072,6 +6144,7 @@ class Client:
             try:
                 with self.lock:
                     after = self.saved['cursor']
+                    before = dict(self.saved)
                 for path in sorted(self.outbox.glob('*.json'), key=lambda p: p.stat().st_mtime):
                     try:
                         action = json.loads(path.read_text())
@@ -6096,7 +6169,8 @@ class Client:
                             self.saved['text'] += clean(render(event))
                             self.saved['cursor'] = event['seq']
                     self.saved['text'] = self.saved['text'][-150000:]
-                    private_json(self.cache, self.saved)
+                    if self.saved != before:
+                        private_json(self.cache, self.saved)
                 self.notice = 'connected · remote compute stays on when you detach'
                 if len(result['events']) == 300:
                     continue
@@ -6105,6 +6179,47 @@ class Client:
             except ValueError as exc:
                 self.notice = str(exc)
             self.closed.wait(0.7)
+
+    def bridge(self):
+        # NDJSON local-only transport for the Charm renderer. The durable outbox
+        # and Daytona RPC remain in this client, shared with the fallback UI.
+        output_lock = threading.Lock()
+        def emit(value):
+            with output_lock:
+                print(json.dumps(value, ensure_ascii=True), flush=True)
+        def updates():
+            previous = None
+            previous_text = None
+            while not self.closed.is_set():
+                with self.lock:
+                    state, text = dict(self.state), self.saved['text']
+                snapshot = dict(state=state, notice=self.notice)
+                if snapshot != previous or text != previous_text:
+                    message = dict(snapshot)
+                    if text != previous_text:
+                        message['text'] = text
+                    emit(message)
+                    previous, previous_text = snapshot, text
+                self.closed.wait(.1)
+        threading.Thread(target=self.poll, daemon=True).start()
+        threading.Thread(target=updates, daemon=True).start()
+        try:
+            for line in sys.stdin:
+                request = {}
+                try:
+                    request = json.loads(line)
+                    if request.get('op') == 'answer':
+                        self.enqueue('answer', interaction=request['interaction'], reply=request['reply'])
+                    elif request.get('op') == 'command':
+                        if not self.command(request['text']):
+                            break
+                    else:
+                        raise ValueError('unknown local command')
+                    emit({'ack': request.get('local_id')})
+                except (ValueError, KeyError) as exc:
+                    emit({'error': clean(str(exc)), 'ack': request.get('local_id')})
+        finally:
+            self.closed.set()
 
     def command(self, line):
         if line == '/detach':
@@ -6263,6 +6378,8 @@ def client_main():
         import curses
         curses.wrapper(client.tui)
         print('Detached. Remote work continues. Reattach: devflow attach ' + name)
+    elif mode == 'bridge':
+        client.bridge()
     elif mode == 'status':
         print(json.dumps(client.call({'op': 'read', 'after': 0})['state'], indent=2))
     elif mode == 'events':

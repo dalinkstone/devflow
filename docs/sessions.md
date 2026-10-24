@@ -7,8 +7,11 @@ Cloudflare configuration is needed.
 ## Setup
 
 Install Python 3.10+ locally, plus the usual Daytona CLI, jq, git and gh.
-Optional Charm Gum improves the launch picker; the live view uses Python curses
-(included with macOS and normal Linux Python installs).
+Optional Charm Gum improves the launch picker. The live view uses a native
+Bubble Tea v2, Bubbles, and Lip Gloss TUI, installed by Homebrew or the curl
+installer. From a checkout, run `make tui` (Go 1.26+) before `./bin/devflow`.
+The CLI stays self-contained: if the helper is missing, or `DEVFLOW_TUI=plain`,
+it uses the built-in Python curses view. No runtime Go installation is needed.
 
 ```sh
 dv init
@@ -43,6 +46,7 @@ reliably. No Daytona account credential is copied to the sandbox.
 
 ```sh
 dv new --repo owner/repo --agent codex -m "fix the failing test"
+dv new --repo owner/repo --agent codex --title "Fix login" --model MODEL --effort high
 dv new --repo owner/repo --agent claude --branch devflow/my-feature --detach
 dv sessions
 dv attach dv-session-EXAMPLE
@@ -62,6 +66,12 @@ Use flags plus `--detach` for scripting. Session ID and sandbox name are the sam
 You can reconnect from a second machine with Devflow and your Daytona login;
 no provider/GitHub login on that second machine is required.
 
+`--title` sets the display name (otherwise the first task supplies it).
+`--model` and `--effort` select provider settings; omitted values keep the
+provider defaults. Supported efforts depend on the selected model. Unsupported
+settings fail visibly, without silently choosing another model. The sandbox ID
+printed at creation remains the identifier for attach, stop, and other commands.
+
 ## Live view
 
 Output arrives through short authenticated Daytona exec polls (typically a
@@ -69,14 +79,36 @@ second or two, depending on your region/network), not a direct provider stream
 to your laptop. Commands, output, file changes, plans and status are displayed.
 Only public agent messages/summaries are shown, not hidden reasoning.
 
+The header shows the session title, current activity, provider/model/effort,
+reported tokens, turn duration, session age, branch, pending inputs, and queue.
+Codex also reports context usage. Model/effort fields use provider metadata when
+available; an unreported default is explicitly labelled, not guessed.
+
+Spend is the latest **SDK-reported estimate**, not an invoice. Claude reports a
+cumulative estimate; Devflow does not sum repeated totals. Codex currently
+reports tokens but not dollars, so its spend reads `not reported`, not `$0`.
+Claude token counts are labelled `last turn` and exclude subagents; Codex token
+counts are labelled `thread`. Figures can lag until the provider emits usage.
+No fixed model price table is used. Daytona compute/storage and subscriptions
+are excluded. Session age includes stopped time; it is not billed runtime.
+
+Rendering is event-driven, with cached transcript wrapping and a one-second
+clock. Typing does not wait for a remote poll; idle polls no longer rewrite the
+local transcript cache. Scrolling up pauses tail-follow until you return to the
+bottom (`Ctrl-End`). The view inherits terminal colors, needs 35×14 or larger,
+and uses text labels rather than color alone. The local queue is persisted
+before Ctrl-D completes, and retries retain their original request IDs.
+
 | Control | Action |
 | --- | --- |
 | Type text, Enter | Send prompt; while busy, queue a follow-up for the same thread |
-| Tab | Answer the oldest pending approval/question; select numbers or type text |
+| Tab | Review a pending approval/question; select numbers or type text |
 | Esc in question | Leave it pending |
 | Ctrl-D or `/detach` | Close this client only |
 | Ctrl-C or `/interrupt` | Interrupt current turn and clear queued follow-ups |
 | Page Up / Page Down | Scroll history |
+| Ctrl-End | Return to live output |
+| `/help` | Show commands |
 | `/approve ID`, `/deny ID` | Approve once or deny one specific operation |
 | `/answer ID {"question-id":"answer"}` | Structured/freeform answer; Claude uses question text as the key |
 | `/recover` | Restart a failed provider using its saved conversation ID |

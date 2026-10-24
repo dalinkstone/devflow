@@ -25,8 +25,14 @@ Codex uses stdio app-server JSON-RPC; Claude uses its official Python SDK in an
 isolated venv. The Codex home excludes permissive snapshot configs; Claude
 does not load filesystem settings. Approvals are durable but bound to the live
 provider process; restart invalidates them without accepting them. Terminal
-curses rendering runs only locally, with short exec polls and durable cursors
-and per-request outbox files. Generated agent commands never execute locally.
+rendering runs only locally. The optional native `devflow-tui` helper uses
+Bubble Tea v2, Bubbles, and Lip Gloss; a local NDJSON pipe connects it to the
+embedded Python client's short exec polls, durable cursors and per-request
+outbox files. There is still no network control listener. The self-contained
+CLI retains a curses fallback. Generated agent commands never execute locally.
+The renderer caches wrapped scrollback, only processes transcript changes,
+and updates its clock once per second. Provider-reported model, effort, token,
+activity, and cost metadata persist in the remote SQLite state.
 
 `dv up` and other legacy workflows below remain independent. See
 [session usage and limitations](sessions.md).

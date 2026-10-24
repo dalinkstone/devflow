@@ -38,7 +38,11 @@ else: print(json.dumps({'accepted':request['id']}))
             fake.chmod(0o700)
             master, slave = pty.openpty()
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 90, 0, 0))
-            proc = subprocess.Popen(['python3', str(runtime), 'client', str(fake), str(root / 'config'), 'test', 'tui'],
+            charm = os.environ.get('DEVFLOW_TEST_CHARM') == '1'
+            command = ['python3', str(runtime), 'client', str(fake), str(root / 'config'), 'test', 'bridge' if charm else 'tui']
+            if charm:
+                command.insert(0, str(ROOT / 'bin/devflow-tui'))
+            proc = subprocess.Popen(command,
                                     stdin=slave, stdout=slave, stderr=slave, env=dict(os.environ, TERM='xterm-256color'),
                                     start_new_session=True)
             os.close(slave)
@@ -51,6 +55,10 @@ else: print(json.dumps({'accepted':request['id']}))
                         try:
                             output += os.read(master, 65536)
                         except OSError:
+                            # Linux PTYs can report EIO just before waitpid sees
+                            # process exit. Don't fail a successful detach race.
+                            if proc.wait(timeout=5) == 0 and predicate():
+                                return
                             break
                     if predicate():
                         return
@@ -59,7 +67,7 @@ else: print(json.dumps({'accepted':request['id']}))
                 path = root / 'requests'
                 return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
             try:
-                until(lambda: b'question-1' in output)
+                until(lambda: (b'input needed' if charm else b'question-1') in output)
                 os.write(master, b'\t')
                 until(lambda: b'Which transport?' in output)
                 os.write(master, b'2\n')
@@ -74,10 +82,19 @@ else: print(json.dumps({'accepted':request['id']}))
                 (root / 'offline').unlink()
                 count = len(requests())
                 until(lambda: len(requests()) > count)
-                os.write(master, b'\x04')
+                if charm:
+                    # A prompt followed immediately by detach must reach the
+                    # durable outbox before the renderer terminates its bridge.
+                    (root / 'offline').touch()
+                    os.write(master, b'keep working\r\x04')
+                else:
+                    os.write(master, b'\x04')
                 until(lambda: proc.poll() is not None)
                 proc.wait(timeout=5)
                 self.assertEqual(proc.returncode, 0)
+                if charm:
+                    saved = [json.loads(p.read_text()) for p in (root / 'config/sessions').glob('*.outbox/*.json')]
+                    self.assertTrue(any(r.get('text') == 'keep working' for r in saved))
                 self.assertFalse(any(r['op'] in ('stop', 'delete') for r in requests()))
             finally:
                 if proc.poll() is None:

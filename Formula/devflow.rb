@@ -14,9 +14,13 @@ class Devflow < Formula
   depends_on "gh"
   depends_on "jq"
   depends_on "qrencode"
+  depends_on "go" => :build
+  depends_on "python@3.13"
 
   def install
+    system "make", "tui"
     bin.install "bin/devflow"
+    bin.install "bin/devflow-tui"
     bin.install_symlink "devflow" => "dv"
   end
 
@@ -30,5 +34,6 @@ class Devflow < Formula
 
   test do
     assert_match "devflow", shell_output("#{bin}/devflow version")
+    assert_match "devflow-tui", shell_output("#{bin}/devflow-tui --version")
   end
 end

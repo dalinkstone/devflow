@@ -11,6 +11,7 @@ source of truth is `DEVFLOW_VERSION` in `bin/devflow`.
 
 ```bash
 make lint && make test && make test-docker
+make release-assets         # native helper: macOS/Linux, arm64/amd64 + checksums
 git status --short          # clean tree, on main, synced with origin
 ```
 
@@ -44,7 +45,7 @@ git -C "$TAP_DIR" push origin main
 
 # 5. GitHub release (notes: what changed + upgrade line)
 gh release create vX.Y.Z --repo dalinkstone/devflow \
-  --title "devflow vX.Y.Z" --notes "…"
+  --title "devflow vX.Y.Z" --notes "…" dist/devflow-tui-* dist/checksums.txt
 
 # 6. verify the real user paths
 brew update && brew upgrade dalinkstone/devflow/devflow && devflow version
@@ -85,3 +86,8 @@ A release is not done until the release commits are green.
    (bootstraps install.sh, which installs devflow + `dv` and dependencies)
 2. `brew install dalinkstone/devflow/devflow` (formula test: `devflow version`)
 3. `make install` from a checkout
+
+Homebrew builds the native helper from the tagged source. Curl installs the
+matching release asset only after SHA-256 verification (or falls back to the
+self-contained Python view when unavailable). Verify `devflow-tui --version`
+alongside `devflow version`; `make release-assets` must run after the version bump.
